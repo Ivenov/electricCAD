@@ -8,10 +8,18 @@ interface ExportModalProps {
   onImportProject: (imported: CadProject) => void;
   onOpenDstuAlbum?: () => void;
   onOpen3DView?: () => void;
+  onOpenDxfImport?: () => void;
   onClose: () => void;
 }
 
-export const ExportModal: React.FC<ExportModalProps> = ({ project, onImportProject, onOpenDstuAlbum, onOpen3DView, onClose }) => {
+export const ExportModal: React.FC<ExportModalProps> = ({
+  project,
+  onImportProject,
+  onOpenDstuAlbum,
+  onOpen3DView,
+  onOpenDxfImport,
+  onClose,
+}) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 1. Export as JSON
@@ -151,7 +159,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ project, onImportProje
             </button>
           )}
 
-          {/* AutoCAD DXF */}
+          {/* AutoCAD DXF Export */}
           <button
             onClick={() => downloadDxfFile(project)}
             className="w-full p-3.5 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800 hover:border-neutral-700 flex items-center gap-3.5 text-left transition-colors group"
@@ -171,6 +179,32 @@ export const ExportModal: React.FC<ExportModalProps> = ({ project, onImportProje
               </div>
             </div>
           </button>
+
+          {/* AutoCAD DXF Import (Two-way architectural import) */}
+          {onOpenDxfImport && (
+            <button
+              onClick={() => {
+                onClose();
+                onOpenDxfImport();
+              }}
+              className="w-full p-3.5 rounded-xl border border-emerald-500/40 bg-emerald-950/20 hover:bg-emerald-950/40 hover:border-emerald-400 flex items-center gap-3.5 text-left transition-colors group shadow-sm"
+            >
+              <div className="w-9 h-9 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 shrink-0">
+                <FileCode className="w-4 h-4" />
+              </div>
+              <div className="flex-1">
+                <div className="text-xs font-bold text-neutral-100 group-hover:text-emerald-300 transition-colors flex items-center gap-2">
+                  <span>Двосторонній імпорт архітектурного DXF (.dxf)</span>
+                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-mono">
+                    Імпорт стін
+                  </span>
+                </div>
+                <div className="text-[11px] text-neutral-400">
+                  Розпізнавання стін, перегородок, дверей та вікон з креслень AutoCAD / ArchiCAD / Revit
+                </div>
+              </div>
+            </button>
+          )}
 
           {/* SVG Vector */}
           <button

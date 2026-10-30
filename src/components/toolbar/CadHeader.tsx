@@ -1,5 +1,5 @@
 import React from 'react';
-import { Download, Layers, Cpu, FileText, CheckCircle2, BatteryCharging, BookOpen, Box } from 'lucide-react';
+import { Download, Layers, Cpu, FileText, CheckCircle2, BatteryCharging, BookOpen, Box, FileCode } from 'lucide-react';
 
 interface CadHeaderProps {
   currentTab: 'canvas' | 'circuits' | 'bom' | 'audit';
@@ -9,6 +9,7 @@ interface CadHeaderProps {
   onOpenBackupModal: () => void;
   onOpenDstuAlbum: () => void;
   onOpen3DView: () => void;
+  onOpenDxfImport?: () => void;
   auditIssueCount: number;
 }
 
@@ -20,6 +21,7 @@ export const CadHeader: React.FC<CadHeaderProps> = ({
   onOpenBackupModal,
   onOpenDstuAlbum,
   onOpen3DView,
+  onOpenDxfImport,
   auditIssueCount,
 }) => {
   return (
@@ -122,8 +124,19 @@ export const CadHeader: React.FC<CadHeaderProps> = ({
         </button>
       </nav>
 
-      {/* Zone 3: 1 primary action button */}
+      {/* Zone 3: Action buttons */}
       <div className="flex items-center gap-2 shrink-0">
+        {onOpenDxfImport && (
+          <button
+            onClick={onOpenDxfImport}
+            className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-emerald-300 hover:text-emerald-100 bg-emerald-950/40 hover:bg-emerald-900/60 rounded-lg border border-emerald-500/40 transition-colors whitespace-nowrap shadow-sm"
+            title="Двосторонній імпорт архітектурного креслення DXF (AutoCAD, ArchiCAD)"
+          >
+            <FileCode className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Імпорт DXF</span>
+          </button>
+        )}
+
         <button
           onClick={onOpenExportModal}
           className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-neutral-950 bg-sky-400 hover:bg-sky-300 rounded-lg transition-colors whitespace-nowrap shadow-sm shadow-sky-500/20 shrink-0"

@@ -23,6 +23,7 @@ import { BlueprintUploadModal } from './components/panels/BlueprintUploadModal';
 import { BackupPowerModal } from './components/panels/BackupPowerModal';
 import { DstuDrawingAlbumModal } from './components/panels/DstuDrawingAlbumModal';
 import { ThreeDViewModal } from './components/panels/ThreeDViewModal';
+import { DxfImportModal } from './components/panels/DxfImportModal';
 import {
   autoRouteProjectCables,
   autoNumberCircuitsAndCables,
@@ -30,7 +31,7 @@ import {
   linkSwitchToLuminaires,
 } from './utils/autoRouting';
 import { BackupSystemConfig } from './types/cad';
-import { Code2, Image as ImageIcon, Zap, CheckCircle2 } from 'lucide-react';
+import { Code2, Image as ImageIcon, Zap, CheckCircle2, FileCode } from 'lucide-react';
 
 export default function App() {
   // Main Project State initialized with the rich Euro 2-Room apartment template
@@ -68,7 +69,7 @@ export default function App() {
 
   // Active Overlay Modal
   const [activeModal, setActiveModal] = useState<
-    'none' | 'circuits' | 'bom' | 'audit' | 'templates' | 'export' | 'json' | 'blueprint' | 'backup' | 'dstu' | '3d'
+    'none' | 'circuits' | 'bom' | 'audit' | 'templates' | 'export' | 'json' | 'blueprint' | 'backup' | 'dstu' | '3d' | 'dxf_import'
   >('none');
 
   // Helper to commit changes to history stack
@@ -275,6 +276,26 @@ export default function App() {
     setSelectedOpeningId(null);
   }, [project, updateProjectWithHistory]);
 
+  // DXF Architectural Import handler
+  const handleImportDxfWalls = useCallback((newWalls: Wall[], newOpenings: WallOpening[], replace: boolean) => {
+    if (replace) {
+      updateProjectWithHistory({
+        ...project,
+        walls: newWalls,
+        openings: newOpenings,
+      });
+      setToastMessage(`Імпортовано ${newWalls.length} стін та ${newOpenings.length} отворів із DXF (заміна)`);
+    } else {
+      updateProjectWithHistory({
+        ...project,
+        walls: [...project.walls, ...newWalls],
+        openings: [...project.openings, ...newOpenings],
+      });
+      setToastMessage(`Додано ${newWalls.length} стін та ${newOpenings.length} отворів із DXF`);
+    }
+    setTimeout(() => setToastMessage(null), 4000);
+  }, [project, updateProjectWithHistory]);
+
   // Wire actions
   const handleAddWire = useCallback((wire: WireRoute) => {
     updateProjectWithHistory({
@@ -422,6 +443,7 @@ export default function App() {
         onOpenBackupModal={() => setActiveModal('backup')}
         onOpenDstuAlbum={() => setActiveModal('dstu')}
         onOpen3DView={() => setActiveModal('3d')}
+        onOpenDxfImport={() => setActiveModal('dxf_import')}
         auditIssueCount={auditIssueCount}
       />
 
@@ -471,7 +493,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* Quick Database, Auto-route & Blueprint Tools */}
+        {/* Quick Database, Auto-route, DXF & Blueprint Tools */}
         <div className="flex items-center gap-2">
           {/* Auto-routing Action Button */}
           <button
@@ -481,6 +503,15 @@ export default function App() {
           >
             <Zap className="w-3.5 h-3.5 text-amber-400" />
             <span className="hidden md:inline">Автотрасування ПУЕ</span>
+          </button>
+
+          <button
+            onClick={() => setActiveModal('dxf_import')}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border border-emerald-500/40 bg-emerald-950/30 text-emerald-300 hover:bg-emerald-950/50 hover:border-emerald-400 transition-colors shadow-sm"
+            title="Імпорт архітектурного креслення DXF (AutoCAD, ArchiCAD, Revit)"
+          >
+            <FileCode className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden md:inline">Імпорт DXF</span>
           </button>
 
           <button
@@ -742,6 +773,7 @@ export default function App() {
           onImportProject={handleSelectTemplate}
           onOpenDstuAlbum={() => setActiveModal('dstu')}
           onOpen3DView={() => setActiveModal('3d')}
+          onOpenDxfImport={() => setActiveModal('dxf_import')}
           onClose={() => setActiveModal('none')}
         />
       )}
@@ -781,6 +813,14 @@ export default function App() {
       {activeModal === '3d' && (
         <ThreeDViewModal
           project={project}
+          onClose={() => setActiveModal('none')}
+        />
+      )}
+
+      {activeModal === 'dxf_import' && (
+        <DxfImportModal
+          project={project}
+          onImportWalls={handleImportDxfWalls}
           onClose={() => setActiveModal('none')}
         />
       )}

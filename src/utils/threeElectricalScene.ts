@@ -592,143 +592,448 @@ export class ThreeElectricalSceneBuilder {
   }
 
   // Distribution Board / Panel 3D Model (ВРП / ЩРН металевий щит)
+  // Distribution Board / Panel 3D Model (Schneider Electric Resi9 / Prisma or Hager Volta/Golf)
   private buildPanel3D(el: ElectricalElement, pos: THREE.Vector3, rotY: number) {
     const group = new THREE.Group();
     group.position.copy(pos);
     group.rotation.y = rotY;
 
-    // Metal cabinet enclosure (450mm x 600mm x 140mm)
-    const bodyGeo = new THREE.BoxGeometry(0.45, 0.60, 0.14);
-    const bodyMat = new THREE.MeshStandardMaterial({
-      color: 0x334155, // Light industrial grey powder coat
-      roughness: 0.35,
-      metalness: 0.7,
-    });
-    const body = new THREE.Mesh(bodyGeo, bodyMat);
-    group.add(body);
+    const lowerName = (el.name || '').toLowerCase();
+    const isHager = lowerName.includes('hager') || lowerName.includes('volta') || lowerName.includes('golf');
 
-    // Smoked transparent acrylic door
-    const doorGeo = new THREE.BoxGeometry(0.43, 0.58, 0.01);
-    const doorMat = new THREE.MeshPhysicalMaterial({
-      color: 0x0f172a,
-      roughness: 0.1,
-      metalness: 0.1,
-      transparent: true,
-      opacity: 0.65,
-      transmission: 0.5,
-    });
-    const door = new THREE.Mesh(doorGeo, doorMat);
-    door.position.z = 0.075;
-    group.add(door);
+    if (isHager) {
+      // ----------------- HAGER VOLTA / GOLF ENCLOSURE -----------------
+      // White powder-coated sheet metal cabinet (480mm x 630mm x 95mm flush)
+      const bodyGeo = new THREE.BoxGeometry(0.48, 0.63, 0.11);
+      const bodyMat = new THREE.MeshStandardMaterial({
+        color: 0xf1f5f9, // Hager Signal White RAL9016
+        roughness: 0.35,
+        metalness: 0.2,
+      });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      group.add(body);
 
-    // Internal DIN rails with modular circuit breakers
-    for (let row = -1; row <= 1; row++) {
-      const rail = new THREE.Mesh(
-        new THREE.BoxGeometry(0.38, 0.015, 0.005),
-        new THREE.MeshStandardMaterial({ color: 0xd4d4d8, metalness: 0.9 })
+      // Hager sheet steel door with recessed ergonomic handle
+      const doorGeo = new THREE.BoxGeometry(0.46, 0.61, 0.015);
+      const doorMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.25, metalness: 0.1 });
+      const door = new THREE.Mesh(doorGeo, doorMat);
+      door.position.z = 0.06;
+      group.add(door);
+
+      // Recessed ergonomic handle pocket
+      const handlePocket = new THREE.Mesh(
+        new THREE.BoxGeometry(0.025, 0.09, 0.008),
+        new THREE.MeshStandardMaterial({ color: 0x005ca9, roughness: 0.3 }) // Hager blue accent
       );
-      rail.position.set(0, row * 0.16, 0.01);
-      group.add(rail);
+      handlePocket.position.set(0.19, 0, 0.068);
+      group.add(handlePocket);
 
-      // Miniature circuit breakers on rail
-      for (let m = -5; m <= 5; m++) {
-        const mcbGeo = new THREE.BoxGeometry(0.018, 0.08, 0.05);
-        const mcbMat = new THREE.MeshStandardMaterial({
-          color: m === 0 ? 0xdc2626 : (m === -5 ? 0x0284c7 : 0xe2e8f0),
-          roughness: 0.4,
-        });
-        const mcb = new THREE.Mesh(mcbGeo, mcbMat);
-        mcb.position.set(m * 0.022, row * 0.16, 0.035);
-        group.add(mcb);
+      // Hager Blue Brand Logo Badge
+      const logoBadge = new THREE.Mesh(
+        new THREE.BoxGeometry(0.065, 0.022, 0.003),
+        new THREE.MeshStandardMaterial({ color: 0x005ca9, roughness: 0.2 })
+      );
+      logoBadge.position.set(-0.16, 0.26, 0.069);
+      group.add(logoBadge);
+
+      // Hager circuit schedule transparent window pocket
+      const cardSlot = new THREE.Mesh(
+        new THREE.BoxGeometry(0.32, 0.045, 0.002),
+        new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.5 })
+      );
+      cardSlot.position.set(0, -0.22, 0.068);
+      group.add(cardSlot);
+
+      // Hager QuickConnect N / PE terminal blocks at top
+      const nTerm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.02, 0.02),
+        new THREE.MeshStandardMaterial({ color: 0x0284c7 }) // Blue N
+      );
+      nTerm.position.set(-0.10, 0.27, 0.02);
+      group.add(nTerm);
+
+      const peTerm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.02, 0.02),
+        new THREE.MeshStandardMaterial({ color: 0x65a30d }) // Yellow/Green PE
+      );
+      peTerm.position.set(0.10, 0.27, 0.02);
+      group.add(peTerm);
+
+      // 3 DIN rails with Hager modular circuit breakers (Blue / Black toggles)
+      for (let row = -1; row <= 1; row++) {
+        const rail = new THREE.Mesh(
+          new THREE.BoxGeometry(0.40, 0.015, 0.005),
+          new THREE.MeshStandardMaterial({ color: 0xd4d4d8, metalness: 0.9 })
+        );
+        rail.position.set(0, row * 0.15, 0.01);
+        group.add(rail);
+
+        for (let m = -6; m <= 6; m++) {
+          const mcb = new THREE.Mesh(
+            new THREE.BoxGeometry(0.0175, 0.078, 0.05),
+            new THREE.MeshStandardMaterial({
+              color: m === 0 ? 0x005ca9 : m === -6 ? 0xdc2626 : 0xf8fafc,
+              roughness: 0.35,
+            })
+          );
+          mcb.position.set(m * 0.021, row * 0.15, 0.035);
+          group.add(mcb);
+        }
       }
+
+      body.userData = {
+        id: el.id,
+        type: 'element',
+        name: el.name || 'Розподільчий щит Hager Volta 36M',
+        categoryName: 'Електрощит Hager Volta (Німеччина)',
+        heightMm: el.mountingHeightMm,
+        notes: 'Металеві дверцята, самозатискні клеми QuickConnect N/PE, захист IP30/IP40',
+      };
+      this.interactiveObjects.push(body);
+    } else {
+      // ----------------- SCHNEIDER ELECTRIC RESI9 / PRISMA -----------------
+      // White industrial enclosure with signature Schneider Emerald Green stripe
+      const bodyGeo = new THREE.BoxGeometry(0.46, 0.62, 0.13);
+      const bodyMat = new THREE.MeshStandardMaterial({
+        color: 0xf8fafc, // Pure white RAL9003
+        roughness: 0.3,
+        metalness: 0.15,
+      });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      group.add(body);
+
+      // Signature Schneider Emerald Green Horizontal Line Accent
+      const greenStripe = new THREE.Mesh(
+        new THREE.BoxGeometry(0.462, 0.012, 0.003),
+        new THREE.MeshStandardMaterial({ color: 0x16a34a, roughness: 0.2 }) // Schneider Green
+      );
+      greenStripe.position.set(0, 0.28, 0.066);
+      group.add(greenStripe);
+
+      // Smoked transparent acrylic swing door (Resi9 style)
+      const doorGeo = new THREE.BoxGeometry(0.42, 0.54, 0.01);
+      const doorMat = new THREE.MeshPhysicalMaterial({
+        color: 0x0f172a,
+        roughness: 0.08,
+        metalness: 0.1,
+        transparent: true,
+        opacity: 0.65,
+        transmission: 0.6,
+      });
+      const door = new THREE.Mesh(doorGeo, doorMat);
+      door.position.set(0, -0.01, 0.07);
+      group.add(door);
+
+      // Chrome Keylock / latch cylinder
+      const lockMesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.01, 0.01, 0.008, 16),
+        new THREE.MeshStandardMaterial({ color: 0xd4d4d8, metalness: 0.95, roughness: 0.1 })
+      );
+      lockMesh.rotation.x = Math.PI / 2;
+      lockMesh.position.set(0.18, -0.01, 0.076);
+      group.add(lockMesh);
+
+      // Schneider Electric Brand badge
+      const schneiderBadge = new THREE.Mesh(
+        new THREE.BoxGeometry(0.09, 0.018, 0.002),
+        new THREE.MeshStandardMaterial({ color: 0x16a34a })
+      );
+      schneiderBadge.position.set(-0.13, 0.24, 0.067);
+      group.add(schneiderBadge);
+
+      // Internal DIN rails with Schneider Acti9 / Resi9 modular circuit breakers
+      for (let row = -1; row <= 1; row++) {
+        const rail = new THREE.Mesh(
+          new THREE.BoxGeometry(0.38, 0.015, 0.005),
+          new THREE.MeshStandardMaterial({ color: 0xd4d4d8, metalness: 0.9 })
+        );
+        rail.position.set(0, row * 0.15 - 0.01, 0.01);
+        group.add(rail);
+
+        // Schneider Breakers with bright orange Acti9/Resi9 toggle levers
+        for (let m = -5; m <= 5; m++) {
+          const mcbBody = new THREE.Mesh(
+            new THREE.BoxGeometry(0.018, 0.08, 0.05),
+            new THREE.MeshStandardMaterial({ color: 0xf1f5f9, roughness: 0.35 })
+          );
+          mcbBody.position.set(m * 0.022, row * 0.15 - 0.01, 0.035);
+          group.add(mcbBody);
+
+          // Orange Acti9 toggle lever
+          const toggle = new THREE.Mesh(
+            new THREE.BoxGeometry(0.008, 0.018, 0.01),
+            new THREE.MeshStandardMaterial({ color: 0xf97316, roughness: 0.2 }) // Schneider Orange
+          );
+          toggle.position.set(m * 0.022, row * 0.15 - 0.01, 0.062);
+          group.add(toggle);
+        }
+      }
+
+      // Digital Voltage Relay (ZUBR D2-63 red LED 7-segment 232V display)
+      const ledDisp = new THREE.Mesh(
+        new THREE.BoxGeometry(0.035, 0.025, 0.01),
+        new THREE.MeshBasicMaterial({ color: 0xef4444 })
+      );
+      ledDisp.position.set(-0.12, 0.14, 0.062);
+      group.add(ledDisp);
+
+      body.userData = {
+        id: el.id,
+        type: 'element',
+        name: el.name || 'Щит Schneider Electric Resi9 36M',
+        categoryName: 'Електрощит Schneider Electric (Франція)',
+        heightMm: el.mountingHeightMm,
+        notes: `Ввідний автомат: ${this.project.mainBreakerRatingA || 40}A, реле напруги ZUBR, ПЗВ 30мА`,
+      };
+      this.interactiveObjects.push(body);
     }
 
-    // Digital Voltage Relay (ZUBR style LED 228V)
-    const ledDisp = new THREE.Mesh(
-      new THREE.BoxGeometry(0.035, 0.025, 0.01),
-      new THREE.MeshBasicMaterial({ color: 0xef4444 })
-    );
-    ledDisp.position.set(-0.12, 0.16, 0.065);
-    group.add(ledDisp);
-
-    body.userData = {
-      id: el.id,
-      type: 'element',
-      name: el.name || 'Головний розподільчий щит ВРП',
-      categoryName: 'Електрощитове обладнання',
-      heightMm: el.mountingHeightMm,
-      notes: `Ввідний автомат: ${this.project.mainBreakerRatingA || 40}A, Фазність: ${this.project.supplyPhase}`,
-    };
-    this.interactiveObjects.push(body);
     this.elementsGroup.add(group);
   }
 
-  // Backup Device 3D (Гібридний інвертор, LiFePO4 акумулятор, зарядна станція)
+  // Backup Device 3D (Deye Hybrid Inverter, Victron MultiPlus-II, LiFePO4 Rack, Generator)
   private buildBackupDevice3D(el: ElectricalElement, pos: THREE.Vector3, rotY: number) {
     const group = new THREE.Group();
     group.position.copy(pos);
     group.rotation.y = rotY;
 
+    const lowerName = (el.name || '').toLowerCase();
+    const isVictron = lowerName.includes('victron') || lowerName.includes('multiplus');
+
     if (el.type === 'backup_inverter') {
-      // Hybrid inverter (Deye / Victron 5kW wall mounted)
-      const invGeo = new THREE.BoxGeometry(0.42, 0.65, 0.22);
-      const invMat = new THREE.MeshStandardMaterial({
-        color: 0x0f172a,
-        roughness: 0.3,
-        metalness: 0.5,
-      });
-      const inv = new THREE.Mesh(invGeo, invMat);
-      group.add(inv);
+      if (isVictron) {
+        // ----------------- VICTRON ENERGY MULTIPLUS-II 5kVA / 48V -----------------
+        // Iconic Victron Blue powder coated chassis (0.42m x 0.65m x 0.22m)
+        const victronBlue = 0x004795;
+        const mainBodyGeo = new THREE.BoxGeometry(0.40, 0.62, 0.21);
+        const mainBodyMat = new THREE.MeshStandardMaterial({
+          color: victronBlue,
+          roughness: 0.35,
+          metalness: 0.45,
+        });
+        const mainBody = new THREE.Mesh(mainBodyGeo, mainBodyMat);
+        group.add(mainBody);
 
-      // White front panel
-      const faceGeo = new THREE.BoxGeometry(0.40, 0.62, 0.01);
-      const faceMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.2 });
-      const face = new THREE.Mesh(faceGeo, faceMat);
-      face.position.z = 0.115;
-      group.add(face);
+        // Lower detachable black terminal cover
+        const lowerCoverGeo = new THREE.BoxGeometry(0.395, 0.16, 0.215);
+        const lowerCoverMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.6, metalness: 0.3 });
+        const lowerCover = new THREE.Mesh(lowerCoverGeo, lowerCoverMat);
+        lowerCover.position.set(0, -0.22, 0.003);
+        group.add(lowerCover);
 
-      // LCD display
-      const screenGeo = new THREE.BoxGeometry(0.14, 0.10, 0.005);
-      const screenMat = new THREE.MeshBasicMaterial({ color: 0x059669 }); // Emerald status screen
-      const screen = new THREE.Mesh(screenGeo, screenMat);
-      screen.position.set(0, 0.08, 0.122);
-      group.add(screen);
+        // Victron logo plate
+        const logoPlate = new THREE.Mesh(
+          new THREE.BoxGeometry(0.18, 0.045, 0.003),
+          new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.2 })
+        );
+        logoPlate.position.set(0, 0.20, 0.107);
+        group.add(logoPlate);
 
-      inv.userData = {
-        id: el.id,
-        type: 'element',
-        name: el.name || 'Гібридний інвертор 5 кВт',
-        categoryName: 'Резервне живлення (ДБЖ)',
-        heightMm: el.mountingHeightMm,
-        isBackupPriority: true,
-        notes: 'Автоматичне перемикання < 10 мс при зникненні міської мережі',
-      };
-      this.interactiveObjects.push(inv);
+        // 8-LED Vertical Status Bank (Mains On, Bulk, Absorption, Float, Inverter, Overload, Low Bat, Temp)
+        const ledBankX = -0.12;
+        const ledStartY = 0.10;
+        for (let i = 0; i < 8; i++) {
+          const led = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.004, 0.004, 0.004, 12),
+            new THREE.MeshBasicMaterial({ color: i === 0 || i === 4 ? 0x10b981 : (i >= 5 ? 0xef4444 : 0xf59e0b) })
+          );
+          led.rotation.x = Math.PI / 2;
+          led.position.set(ledBankX, ledStartY - i * 0.022, 0.107);
+          group.add(led);
+        }
+
+        // Top ventilation louver slots
+        for (let v = 0; v < 4; v++) {
+          const louver = new THREE.Mesh(
+            new THREE.BoxGeometry(0.26, 0.006, 0.003),
+            new THREE.MeshStandardMaterial({ color: 0x0f172a })
+          );
+          louver.position.set(0, 0.28 - v * 0.014, 0.106);
+          group.add(louver);
+        }
+
+        // Bottom heavy-duty battery connection gland studs (M8)
+        const glandMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.4 });
+        for (let g = -1; g <= 1; g++) {
+          const gland = new THREE.Mesh(new THREE.CylinderGeometry(0.016, 0.016, 0.035, 12), glandMat);
+          gland.position.set(g * 0.10, -0.32, 0);
+          group.add(gland);
+        }
+
+        mainBody.userData = {
+          id: el.id,
+          type: 'element',
+          name: el.name || 'Інвертор Victron MultiPlus-II 48/5000',
+          categoryName: 'Гібридний інвертор Victron Energy (Нідерланди)',
+          heightMm: el.mountingHeightMm,
+          isBackupPriority: true,
+          notes: 'Чистий синус 5 кВА, вбудований зарядний пристрій 70А, швидкість перемикання < 20 мс',
+        };
+        this.interactiveObjects.push(mainBody);
+      } else {
+        // ----------------- DEYE SUN-5K/8K/12K-SG04LP3 HYBRID INVERTER -----------------
+        // High-grade white/light grey chassis (0.42m x 0.65m x 0.22m)
+        const invGeo = new THREE.BoxGeometry(0.42, 0.66, 0.22);
+        const invMat = new THREE.MeshStandardMaterial({
+          color: 0xf8fafc,
+          roughness: 0.25,
+          metalness: 0.2,
+        });
+        const inv = new THREE.Mesh(invGeo, invMat);
+        group.add(inv);
+
+        // Extruded dark aluminum heat-sink cooling fins on both left & right sides
+        const finMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.85, roughness: 0.3 });
+        for (const side of [-1, 1]) {
+          const finBlock = new THREE.Mesh(
+            new THREE.BoxGeometry(0.025, 0.62, 0.19),
+            finMat
+          );
+          finBlock.position.set(side * 0.22, 0, -0.01);
+          group.add(finBlock);
+        }
+
+        // Circular Touchscreen LCD (Deye's signature circular display)
+        const bezelGeo = new THREE.CylinderGeometry(0.085, 0.085, 0.008, 32);
+        const bezelMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.2, metalness: 0.7 });
+        const bezel = new THREE.Mesh(bezelGeo, bezelMat);
+        bezel.rotation.x = Math.PI / 2;
+        bezel.position.set(0, 0.10, 0.114);
+        group.add(bezel);
+
+        // LCD animated energy flow screen (emerald green glow)
+        const screenGeo = new THREE.CylinderGeometry(0.075, 0.075, 0.009, 32);
+        const screenMat = new THREE.MeshBasicMaterial({ color: 0x059669 }); // Emerald display
+        const screen = new THREE.Mesh(screenGeo, screenMat);
+        screen.rotation.x = Math.PI / 2;
+        screen.position.set(0, 0.10, 0.116);
+        group.add(screen);
+
+        // Center animated power flow ring
+        const ringGeo = new THREE.TorusGeometry(0.045, 0.004, 12, 32);
+        const ringMat = new THREE.MeshBasicMaterial({ color: 0x34d399 });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.position.set(0, 0.10, 0.122);
+        group.add(ring);
+
+        // Left Side DC Isolator Rotary Switch (Red & Yellow)
+        const swBase = new THREE.Mesh(
+          new THREE.BoxGeometry(0.012, 0.07, 0.07),
+          new THREE.MeshStandardMaterial({ color: 0xeab308, roughness: 0.3 }) // Yellow plate
+        );
+        swBase.position.set(-0.218, 0.18, 0.04);
+        group.add(swBase);
+
+        const swKnob = new THREE.Mesh(
+          new THREE.BoxGeometry(0.02, 0.02, 0.05),
+          new THREE.MeshStandardMaterial({ color: 0xdc2626, roughness: 0.2 }) // Red knob
+        );
+        swKnob.position.set(-0.23, 0.18, 0.04);
+        group.add(swKnob);
+
+        // Bottom connection manifold: Dual MC4 solar inputs, Battery studs, AC Grid & EPS Backup glands
+        const glandMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.3 });
+        for (let g = -3; g <= 3; g++) {
+          const gland = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.035, 12), glandMat);
+          gland.position.set(g * 0.045, -0.34, 0.02);
+          group.add(gland);
+        }
+
+        // Wi-Fi / 4G Datalogger stick on bottom
+        const wifiDongle = new THREE.Mesh(
+          new THREE.BoxGeometry(0.025, 0.08, 0.025),
+          new THREE.MeshStandardMaterial({ color: 0x0284c7 }) // Blue dongle
+        );
+        wifiDongle.position.set(0.16, -0.36, -0.04);
+        group.add(wifiDongle);
+
+        const wifiLed = new THREE.Mesh(
+          new THREE.BoxGeometry(0.006, 0.006, 0.002),
+          new THREE.MeshBasicMaterial({ color: 0x22c55e })
+        );
+        wifiLed.position.set(0.16, -0.34, -0.026);
+        group.add(wifiLed);
+
+        inv.userData = {
+          id: el.id,
+          type: 'element',
+          name: el.name || 'Гібридний інвертор Deye SUN-8K-SG04LP3',
+          categoryName: 'Гібридний інвертор Deye (Низьковольтний 48В)',
+          heightMm: el.mountingHeightMm,
+          isBackupPriority: true,
+          notes: 'Круглий сенсорний LCD екран, 2 MPPT контролери СЕС, резервне перемикання < 4 мс',
+        };
+        this.interactiveObjects.push(inv);
+      }
     } else if (el.type === 'backup_battery') {
-      // LiFePO4 Battery Pack (5.12 kWh server rack style)
+      // ----------------- PYLONTECH US5000 / DYNESS LiFePO4 RACK BATTERY -----------------
+      // Standard 19" 3U rack module (0.48m x 0.22m x 0.44m)
       const batGeo = new THREE.BoxGeometry(0.48, 0.22, 0.44);
-      const batMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.4, metalness: 0.8 });
+      const batMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.4, metalness: 0.8 });
       const bat = new THREE.Mesh(batGeo, batMat);
       group.add(bat);
 
-      // LED SoC bar (State of Charge 100%)
-      for (let i = 0; i < 5; i++) {
+      // Front fascia panel with side rack-mount handles
+      const frontPanel = new THREE.Mesh(
+        new THREE.BoxGeometry(0.46, 0.20, 0.01),
+        new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.35 })
+      );
+      frontPanel.position.z = 0.225;
+      group.add(frontPanel);
+
+      // Dual metal grab handles on left and right
+      for (const side of [-1, 1]) {
+        const handle = new THREE.Mesh(
+          new THREE.TorusGeometry(0.035, 0.006, 8, 16, Math.PI),
+          new THREE.MeshStandardMaterial({ color: 0xd4d4d8, metalness: 0.9 })
+        );
+        handle.position.set(side * 0.19, 0, 0.24);
+        group.add(handle);
+      }
+
+      // High-Current Amphenol SurLok Terminals (+ Red / - Black)
+      const posTerm = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.014, 0.014, 0.025, 16),
+        new THREE.MeshStandardMaterial({ color: 0xe11d48 }) // Orange/Red +
+      );
+      posTerm.rotation.x = Math.PI / 2;
+      posTerm.position.set(0.12, 0.03, 0.238);
+      group.add(posTerm);
+
+      const negTerm = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.014, 0.014, 0.025, 16),
+        new THREE.MeshStandardMaterial({ color: 0x020617 }) // Black -
+      );
+      negTerm.rotation.x = Math.PI / 2;
+      negTerm.position.set(0.12, -0.04, 0.238);
+      group.add(negTerm);
+
+      // 6-Segment Green LED SoC State of Charge Display Bar
+      for (let i = 0; i < 6; i++) {
         const socLed = new THREE.Mesh(
-          new THREE.BoxGeometry(0.012, 0.005, 0.002),
+          new THREE.BoxGeometry(0.012, 0.006, 0.002),
           new THREE.MeshBasicMaterial({ color: 0x10b981 })
         );
-        socLed.position.set(-0.15 + i * 0.018, 0.03, 0.222);
+        socLed.position.set(-0.11 + i * 0.016, 0.03, 0.232);
         group.add(socLed);
       }
+
+      // CAN / RS485 Dual RJ45 ports
+      const rj45 = new THREE.Mesh(
+        new THREE.BoxGeometry(0.025, 0.015, 0.005),
+        new THREE.MeshStandardMaterial({ color: 0x64748b })
+      );
+      rj45.position.set(-0.06, -0.04, 0.232);
+      group.add(rj45);
 
       bat.userData = {
         id: el.id,
         type: 'element',
-        name: el.name || 'АКБ LiFePO4 5.12 кВт·год',
-        categoryName: 'Акумуляторний блок',
+        name: el.name || 'АКБ Pylontech US5000 LiFePO4',
+        categoryName: 'Акумуляторний блок LiFePO4 48В',
         heightMm: el.mountingHeightMm,
         isBackupPriority: true,
-        notes: 'Ємність: 100 А·год (51.2 В). 6000 циклів заряду',
+        notes: 'Ємність 4.8 кВт·год (100А·год, 48В). BMS з CAN-шиною зв\'язку з інвертором',
       };
       this.interactiveObjects.push(bat);
     } else if (el.type === 'backup_generator') {

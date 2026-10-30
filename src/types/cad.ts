@@ -35,11 +35,14 @@ export type ElectricalElementType =
   | 'socket_triple'
   | 'socket_quad'
   | 'socket_ip44'
+  | 'socket_outdoor'
   | 'socket_cooker'
+  | 'socket_3phase'
   | 'socket_rj45'
   | 'socket_tv'
   | 'socket_usb'
   | 'socket_floor'
+  | 'cable_outlet'
   | 'thermostat'
   // Switches
   | 'switch_1g'
@@ -48,21 +51,39 @@ export type ElectricalElementType =
   | 'switch_pass'
   | 'switch_cross'
   | 'switch_dimmer'
+  | 'switch_impulse'
+  | 'switch_smart'
   | 'switch_master'
+  | 'motion_sensor'
   // Lighting
   | 'light_pendant'
   | 'light_spot'
   | 'light_sconce'
   | 'light_track'
   | 'light_led_strip'
+  | 'light_outdoor'
+  | 'light_emergency'
   | 'light_sensor'
   // Panels & Boxes
   | 'panel_cu'
+  | 'panel_multimedia'
   | 'junction_box'
+  | 'junction_box_light'
+  | 'junction_box_power'
+  | 'junction_box_waterproof'
+  | 'grounding_bus'
   | 'led_driver'
   // Heavy Appliances
   | 'ac_indoor'
   | 'water_heater'
+  | 'hob_induction'
+  | 'oven_electric'
+  | 'washing_machine'
+  | 'dryer_machine'
+  | 'dishwasher'
+  | 'vent_exhaust'
+  | 'electric_boiler'
+  | 'water_leak_valve'
   // Backup Power Systems
   | 'backup_inverter'
   | 'backup_battery'
@@ -134,6 +155,8 @@ export interface WireRoute {
   switchGroupId?: string;
   cableTag?: string; // e.g. "W1-01", "W2-03"
   calculatedLengthM: number;
+  isManual?: boolean; // If true, preserved during automatic routing
+  routingMethod?: 'trunk' | 'branch' | 'daisy' | 'radial' | 'manual';
 }
 
 export interface CircuitGroup {
@@ -206,6 +229,7 @@ export interface CadProject {
   wires: WireRoute[];
   circuits: CircuitGroup[];
   furniture: FurnitureItem[];
+  autoRoutingEnabled?: boolean;
 }
 
 export interface BomItem {
