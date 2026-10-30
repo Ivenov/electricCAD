@@ -37,7 +37,10 @@ import {
   snapAngleOrtho,
   findWallOpeningPlacement,
   WallSnapResult,
+  getCableDisplayName,
+  getCableCrossSection,
 } from '../../utils/cadMath';
+import { computeOrthogonalPath } from '../../utils/autoRouting';
 import { CatalogItem } from '../../data/electricalCatalog';
 import { OpeningCatalogItem } from '../../data/openingsCatalog';
 
@@ -49,6 +52,7 @@ interface KonvaCadCanvasProps {
   selectedWallId: string | null;
   selectedOpeningId?: string | null;
   selectedOpeningPreset?: OpeningCatalogItem | null;
+  selectedWireId?: string | null;
   viewFilter: ViewFilterMode;
   showDimensions: boolean;
   showHeights: boolean;
@@ -57,14 +61,18 @@ interface KonvaCadCanvasProps {
   onSelectElement: (id: string | null) => void;
   onSelectWall: (id: string | null) => void;
   onSelectOpening?: (id: string | null) => void;
+  onSelectWire?: (id: string | null) => void;
   onUpdateElementPosition: (id: string, newPos: Point, newRotation?: number, wallId?: string) => void;
   onAddElement: (element: ElectricalElement) => void;
   onAddWall: (wall: Wall) => void;
   onAddOpening?: (opening: WallOpening) => void;
   onDeleteOpening?: (id: string) => void;
   onAddWire: (wire: WireRoute) => void;
+  onDeleteWire?: (id: string) => void;
   onDeleteElement: (id: string) => void;
   onUpdateBackgroundImage?: (updates: Partial<NonNullable<CadProject['backgroundImage']>>) => void;
+  linkingSwitchId?: string | null;
+  onLinkSwitchToLuminaires?: (switchId: string, lightIds: string[]) => void;
 }
 
 export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
@@ -75,6 +83,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   selectedWallId,
   selectedOpeningId,
   selectedOpeningPreset,
+  selectedWireId,
   viewFilter,
   showDimensions,
   showHeights,
@@ -83,14 +92,18 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   onSelectElement,
   onSelectWall,
   onSelectOpening,
+  onSelectWire,
   onUpdateElementPosition,
   onAddElement,
   onAddWall,
   onAddOpening,
   onDeleteOpening,
   onAddWire,
+  onDeleteWire,
   onDeleteElement,
   onUpdateBackgroundImage,
+  linkingSwitchId,
+  onLinkSwitchToLuminaires,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<Konva.Stage>(null);
@@ -107,6 +120,8 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   // Tool states
   const [wallStartPoint, setWallStartPoint] = useState<Point | null>(null);
   const [wireSourceElementId, setWireSourceElementId] = useState<string | null>(null);
+  const [wireDraftPoints, setWireDraftPoints] = useState<Point[]>([]);
+  const [hoveredWireId, setHoveredWireId] = useState<string | null>(null);
   const [measureStartPoint, setMeasureStartPoint] = useState<Point | null>(null);
   const [mouseWorldPos, setMouseWorldPos] = useState<Point>({ x: 0, y: 0 });
 
@@ -152,16 +167,28 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
       } else if (e.key === 'Escape') {
         setWallStartPoint(null);
         setWireSourceElementId(null);
+        setWireDraftPoints([]);
         setMeasureStartPoint(null);
         onSelectElement(null);
         onSelectWall(null);
         onSelectOpening?.(null);
+        onSelectWire?.(null);
+      } else if (e.key === 'Backspace' && wireSourceElementId) {
+        // Step back intermediate waypoint
+        setWireDraftPoints((prev) => {
+          if (prev.length > 1) return prev.slice(0, prev.length - 1);
+          setWireSourceElementId(null);
+          return [];
+        });
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         if (!(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)) {
           if (selectedElementId) {
             onDeleteElement(selectedElementId);
           } else if (selectedOpeningId && onDeleteOpening) {
             onDeleteOpening(selectedOpeningId);
+          } else if (selectedWireId && onDeleteWire) {
+            onDeleteWire(selectedWireId);
+            onSelectWire?.(null);
           }
         }
       }
@@ -179,7 +206,19 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [selectedElementId, selectedOpeningId, onDeleteElement, onDeleteOpening, onSelectElement, onSelectWall, onSelectOpening]);
+  }, [
+    selectedElementId,
+    selectedOpeningId,
+    selectedWireId,
+    wireSourceElementId,
+    onDeleteElement,
+    onDeleteOpening,
+    onDeleteWire,
+    onSelectElement,
+    onSelectWall,
+    onSelectOpening,
+    onSelectWire,
+  ]);
 
   // Attach transformer to selected element
   useEffect(() => {
@@ -333,9 +372,16 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         return;
       }
 
+      // 2. WIRE ROUTING: Clicking empty canvas adds an intermediate corner turn (waypoint)
+      if (activeTool === 'wire' && wireSourceElementId) {
+        const nextWaypoint = gridSnapEnabled ? snapPointToGrid(worldPos, 10) : worldPos;
+        setWireDraftPoints((prev) => [...prev, nextWaypoint]);
+        return;
+      }
+
       const effectivePos = gridSnapEnabled ? snapPointToGrid(worldPos, 10) : worldPos;
 
-      // 2. MEASURE TOOL
+      // 3. MEASURE TOOL
       if (activeTool === 'measure') {
         if (!measureStartPoint) {
           setMeasureStartPoint(effectivePos);
@@ -345,7 +391,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         return;
       }
 
-      // 3. PLACING NEW ELECTRICAL ELEMENT
+      // 4. PLACING NEW ELECTRICAL ELEMENT
       if (
         ['socket', 'switch', 'light', 'panel', 'junction'].includes(activeTool) &&
         selectedCatalogItem
@@ -390,6 +436,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         onSelectElement(null);
         onSelectWall(null);
         onSelectOpening?.(null);
+        onSelectWire?.(null);
       }
     }
   };
@@ -398,10 +445,19 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   const handleElementClick = (e: Konva.KonvaEventObject<MouseEvent>, el: ElectricalElement) => {
     e.cancelBubble = true;
 
-    // WIRE ROUTING TOOL (jsPlumb / LeaderLine style connection)
+    // 0. LINKING SWITCH TO LUMINAIRE (from Inspector)
+    if (linkingSwitchId) {
+      if (el.category === 'light') {
+        onLinkSwitchToLuminaires?.(linkingSwitchId, [el.id]);
+      }
+      return;
+    }
+
+    // 1. WIRE ROUTING TOOL (supports multi-waypoint turns)
     if (activeTool === 'wire') {
       if (!wireSourceElementId) {
         setWireSourceElementId(el.id);
+        setWireDraftPoints([el.position]);
       } else if (wireSourceElementId !== el.id) {
         const fromEl = project.elements.find((item) => item.id === wireSourceElementId);
         if (fromEl) {
@@ -410,22 +466,43 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             (fromEl.category === 'light' && el.category === 'switch') ||
             (fromEl.category === 'light' && el.category === 'light');
 
+          const fullPoints = wireDraftPoints.length > 1
+            ? [...wireDraftPoints, el.position]
+            : computeOrthogonalPath(fromEl.position, el.position, project.walls);
+
           const wireLength = calculateCableLengthM(
             fromEl,
             el,
             project.ceilingHeightMm,
-            'ceiling'
+            'ceiling',
+            isLightingControl ? undefined : fullPoints
           );
+
+          const matchedCircuit = project.circuits.find(
+            (c) => c.id === (el.circuitId || fromEl.circuitId)
+          );
+
+          const circuitWiresCount = project.wires.filter(
+            (w) => w.circuitId === matchedCircuit?.id
+          ).length + 1;
+
+          const cableTag = matchedCircuit
+            ? `W${matchedCircuit.number}-${circuitWiresCount < 10 ? '0' : ''}${circuitWiresCount}`
+            : `W0-${project.wires.length + 1}`;
 
           const newWire: WireRoute = {
             id: 'wire_' + Date.now(),
             fromId: fromEl.id,
             toId: el.id,
+            points: isLightingControl ? undefined : fullPoints,
             mode: isLightingControl ? 'curve' : 'ortho',
             conduit: 'ceiling',
-            cableType: isLightingControl ? 'VVGng_3x1.5' : 'VVGng_3x2.5',
+            cableType: isLightingControl
+              ? 'VVGng_3x1.5'
+              : (matchedCircuit?.cableType || 'VVGng_3x2.5'),
             circuitId: el.circuitId || fromEl.circuitId,
             switchGroupId: fromEl.switchGroupId || el.switchGroupId,
+            cableTag,
             calculatedLengthM: wireLength,
           };
 
@@ -438,6 +515,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
           onAddWire(newWire);
         }
         setWireSourceElementId(null);
+        setWireDraftPoints([]);
       }
       return;
     }
@@ -446,6 +524,8 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     if (activeTool === 'select') {
       onSelectElement(el.id);
       onSelectWall(null);
+      onSelectOpening?.(null);
+      onSelectWire?.(null);
     }
   };
 
@@ -853,7 +933,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         </Layer>
 
         {/* ======================================================== */}
-        {/* LAYER 4: WIRING & CONNECTIONS (jsPlumb / LeaderLine)     */}
+        {/* LAYER 4: WIRING & CONNECTIONS (Orthogonal with Turns & Badges) */}
         {/* ======================================================== */}
         <Layer id="wiresConnectionsLayer">
           {filteredWires.map((wire) => {
@@ -864,8 +944,10 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             const circuit = project.circuits.find((c) => c.id === wire.circuitId);
             const wireColor = circuit?.color || (wire.mode === 'curve' ? '#fbbf24' : '#38bdf8');
             const isLighting = wire.mode === 'curve';
+            const isSelected = selectedWireId === wire.id;
+            const isHovered = hoveredWireId === wire.id;
 
-            // Calculate bezier control point or ortho path
+            // Calculate bezier control point or multi-point ortho path
             const midX = (fromEl.position.x + toEl.position.x) / 2;
             const midY = (fromEl.position.y + toEl.position.y) / 2;
             const dx = toEl.position.x - fromEl.position.x;
@@ -876,68 +958,149 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             const ctrlX = midX + nx * dist * 0.22;
             const ctrlY = midY + ny * dist * 0.22;
 
+            // Orthogonal polyline with all waypoints / turns
+            const orthoPoints =
+              wire.points && wire.points.length >= 2
+                ? wire.points
+                : computeOrthogonalPath(fromEl.position, toEl.position, project.walls);
+            const orthoFlatPoints = orthoPoints.flatMap((p) => [p.x, p.y]);
+
+            // Badge coordinates centered on middle segment
+            let badgeX = midX;
+            let badgeY = midY;
+            if (!isLighting && orthoPoints.length >= 2) {
+              const midSegIdx = Math.floor((orthoPoints.length - 1) / 2);
+              badgeX = (orthoPoints[midSegIdx].x + orthoPoints[midSegIdx + 1].x) / 2;
+              badgeY = (orthoPoints[midSegIdx].y + orthoPoints[midSegIdx + 1].y) / 2;
+            }
+
+            const cableSpec = getCableCrossSection(wire.cableType);
+            const tagPrefix = wire.cableTag ? `${wire.cableTag} ` : '';
+            const badgeText = `${tagPrefix}${cableSpec} · ${wire.calculatedLengthM} м`;
+            const badgeW = Math.max(74, badgeText.length * 6.2 + 14);
+
             return (
               <Group key={wire.id}>
-                {/* jsPlumb-style Anchor Dots at terminals */}
-                <Circle x={fromEl.position.x} y={fromEl.position.y} radius={3.5} fill={wireColor} />
-                <Circle x={toEl.position.x} y={toEl.position.y} radius={3.5} fill={wireColor} />
-
-                {/* Curved leader line / cable trace */}
-                {isLighting ? (
+                {/* Glow aura when selected or hovered */}
+                {(isSelected || isHovered) && (
                   <Line
-                    points={[
-                      fromEl.position.x,
-                      fromEl.position.y,
-                      ctrlX,
-                      ctrlY,
-                      toEl.position.x,
-                      toEl.position.y,
-                    ]}
-                    bezier
-                    stroke={wireColor}
-                    strokeWidth={2}
-                    dash={[4, 3]}
-                    lineCap="round"
-                  />
-                ) : (
-                  <Line
-                    points={[
-                      fromEl.position.x,
-                      fromEl.position.y,
-                      midX,
-                      fromEl.position.y,
-                      midX,
-                      toEl.position.y,
-                      toEl.position.x,
-                      toEl.position.y,
-                    ]}
-                    stroke={wireColor}
-                    strokeWidth={2.8}
+                    points={
+                      isLighting
+                        ? [fromEl.position.x, fromEl.position.y, ctrlX, ctrlY, toEl.position.x, toEl.position.y]
+                        : orthoFlatPoints
+                    }
+                    bezier={isLighting}
+                    stroke="#38bdf8"
+                    strokeWidth={isLighting ? 7 : 8}
+                    opacity={0.35}
                     lineCap="round"
                     lineJoin="round"
                   />
                 )}
 
-                {/* Cable length badge */}
-                <Group x={midX} y={midY - 10} listening={false}>
+                {/* Visible cable trace line */}
+                <Line
+                  points={
+                    isLighting
+                      ? [fromEl.position.x, fromEl.position.y, ctrlX, ctrlY, toEl.position.x, toEl.position.y]
+                      : orthoFlatPoints
+                  }
+                  bezier={isLighting}
+                  stroke={isSelected ? '#38bdf8' : wireColor}
+                  strokeWidth={isSelected ? 3.5 : isLighting ? 2.2 : 2.8}
+                  dash={isLighting ? [5, 3] : undefined}
+                  lineCap="round"
+                  lineJoin="round"
+                />
+
+                {/* Invisible wide hit area for easy clicking & hovering */}
+                <Line
+                  points={
+                    isLighting
+                      ? [fromEl.position.x, fromEl.position.y, ctrlX, ctrlY, toEl.position.x, toEl.position.y]
+                      : orthoFlatPoints
+                  }
+                  bezier={isLighting}
+                  stroke="transparent"
+                  strokeWidth={18}
+                  lineCap="round"
+                  lineJoin="round"
+                  onClick={(e) => {
+                    e.cancelBubble = true;
+                    onSelectWire?.(wire.id);
+                    onSelectElement(null);
+                    onSelectWall(null);
+                    onSelectOpening?.(null);
+                  }}
+                  onMouseEnter={() => setHoveredWireId(wire.id)}
+                  onMouseLeave={() => setHoveredWireId(null)}
+                />
+
+                {/* jsPlumb-style Anchor Dots at terminals */}
+                <Circle
+                  x={fromEl.position.x}
+                  y={fromEl.position.y}
+                  radius={isSelected ? 5 : 3.5}
+                  fill={wireColor}
+                  stroke="#ffffff"
+                  strokeWidth={isSelected ? 1.5 : 0.5}
+                />
+                <Circle
+                  x={toEl.position.x}
+                  y={toEl.position.y}
+                  radius={isSelected ? 5 : 3.5}
+                  fill={wireColor}
+                  stroke="#ffffff"
+                  strokeWidth={isSelected ? 1.5 : 0.5}
+                />
+
+                {/* Intermediate waypoint corner markers for complex multi-turn routes */}
+                {!isLighting &&
+                  wire.points &&
+                  wire.points.length > 2 &&
+                  wire.points.slice(1, -1).map((pt, pIdx) => (
+                    <Circle
+                      key={`turn_${pIdx}`}
+                      x={pt.x}
+                      y={pt.y}
+                      radius={2.5}
+                      fill={wireColor}
+                      opacity={0.8}
+                    />
+                  ))}
+
+                {/* Cable tag, cross-section & length callout badge */}
+                <Group
+                  x={badgeX}
+                  y={badgeY - 10}
+                  onClick={(e) => {
+                    e.cancelBubble = true;
+                    onSelectWire?.(wire.id);
+                    onSelectElement(null);
+                    onSelectWall(null);
+                    onSelectOpening?.(null);
+                  }}
+                  onMouseEnter={() => setHoveredWireId(wire.id)}
+                  onMouseLeave={() => setHoveredWireId(null)}
+                >
                   <Rect
-                    x={-28}
+                    x={-badgeW / 2}
                     y={-8}
-                    width={56}
-                    height={16}
+                    width={badgeW}
+                    height={17}
                     cornerRadius={3}
-                    fill="#0f172a"
-                    stroke={wireColor}
-                    strokeWidth={0.8}
+                    fill={isSelected ? '#0369a1' : '#0f172a'}
+                    stroke={isSelected ? '#38bdf8' : wireColor}
+                    strokeWidth={isSelected ? 1.5 : 0.9}
                   />
                   <Text
-                    x={-28}
-                    y={-5}
-                    width={56}
-                    text={`${wire.calculatedLengthM} м`}
+                    x={-badgeW / 2}
+                    y={-4.5}
+                    width={badgeW}
+                    text={badgeText}
                     fontSize={8.5}
                     fontStyle="bold"
-                    fill="#f8fafc"
+                    fill={isSelected ? '#ffffff' : '#f8fafc'}
                     fontFamily="monospace"
                     align="center"
                   />
@@ -945,32 +1108,6 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
               </Group>
             );
           })}
-
-          {/* In-progress wire connection to cursor */}
-          {wireSourceElementId &&
-            (() => {
-              const srcEl = project.elements.find((e) => e.id === wireSourceElementId);
-              if (!srcEl) return null;
-              return (
-                <Group listening={false}>
-                  <Circle x={srcEl.position.x} y={srcEl.position.y} radius={5} fill="#38bdf8" />
-                  <Line
-                    points={[
-                      srcEl.position.x,
-                      srcEl.position.y,
-                      (srcEl.position.x + mouseWorldPos.x) / 2,
-                      (srcEl.position.y + mouseWorldPos.y) / 2 - 20,
-                      mouseWorldPos.x,
-                      mouseWorldPos.y,
-                    ]}
-                    bezier
-                    stroke="#38bdf8"
-                    strokeWidth={2}
-                    dash={[4, 2]}
-                  />
-                </Group>
-              );
-            })()}
         </Layer>
 
         {/* ======================================================== */}
@@ -1215,6 +1352,101 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                 </Group>
               );
             })()}
+
+          {/* In-progress Wire Drawing with Waypoint Turns */}
+          {wireSourceElementId &&
+            (() => {
+              const srcEl = project.elements.find((e) => e.id === wireSourceElementId);
+              if (!srcEl) return null;
+
+              const pointsList = wireDraftPoints.length > 0 ? wireDraftPoints : [srcEl.position];
+              const lastPoint = pointsList[pointsList.length - 1];
+
+              // 90 deg orthogonal step from last point to mouse
+              const stepPoint = { x: mouseWorldPos.x, y: lastPoint.y };
+              const currentPath = [...pointsList, stepPoint, mouseWorldPos];
+              const currentFlat = currentPath.flatMap((p) => [p.x, p.y]);
+
+              const legDistMm = pxToMm(distance(lastPoint, mouseWorldPos));
+
+              return (
+                <Group listening={false}>
+                  {/* Starting anchor */}
+                  <Circle x={srcEl.position.x} y={srcEl.position.y} radius={6} fill="#38bdf8" stroke="#ffffff" strokeWidth={2} />
+
+                  {/* Intermediate waypoint markers */}
+                  {pointsList.slice(1).map((pt, idx) => (
+                    <Group key={`wp_${idx}`} x={pt.x} y={pt.y}>
+                      <Circle radius={5} fill="#0ea5e9" stroke="#ffffff" strokeWidth={1.5} />
+                      <Text x={-12} y={-14} text={`#${idx + 1}`} fontSize={8.5} fill="#38bdf8" fontStyle="bold" />
+                    </Group>
+                  ))}
+
+                  {/* Orthogonal wire path */}
+                  <Line
+                    points={currentFlat}
+                    stroke="#38bdf8"
+                    strokeWidth={2.5}
+                    dash={[5, 3]}
+                    lineCap="round"
+                    lineJoin="round"
+                  />
+
+                  {/* Live length badge */}
+                  <Group x={(lastPoint.x + mouseWorldPos.x) / 2} y={(lastPoint.y + mouseWorldPos.y) / 2 - 16}>
+                    <Rect x={-50} y={-9} width={100} height={18} cornerRadius={4} fill="#0f172a" stroke="#38bdf8" strokeWidth={1} />
+                    <Text x={-50} y={-5} width={100} text={`${legDistMm} мм (кут 90°)`} fontSize={9} fontStyle="bold" fill="#38bdf8" fontFamily="monospace" align="center" />
+                  </Group>
+
+                  {/* Guidance banner near cursor */}
+                  <Group x={mouseWorldPos.x + 15} y={mouseWorldPos.y + 15}>
+                    <Rect x={0} y={0} width={255} height={24} cornerRadius={4} fill="rgba(15, 23, 42, 0.95)" stroke="#38bdf8" strokeWidth={1} />
+                    <Text x={8} y={6} text="Клік: поворот 90° | Клік по приладу: з'єднати | BS: назад" fontSize={8.5} fill="#7dd3fc" />
+                  </Group>
+                </Group>
+              );
+            })()}
+
+          {/* Hovered Wire Inspection Tooltip */}
+          {hoveredWireId && !wireSourceElementId &&
+            (() => {
+              const hWire = project.wires.find((w) => w.id === hoveredWireId);
+              if (!hWire) return null;
+              const circuit = project.circuits.find((c) => c.id === hWire.circuitId);
+              const fromEl = project.elements.find((e) => e.id === hWire.fromId);
+              const toEl = project.elements.find((e) => e.id === hWire.toId);
+              if (!fromEl || !toEl) return null;
+
+              return (
+                <Group x={mouseWorldPos.x + 18} y={mouseWorldPos.y - 45} listening={false}>
+                  <Rect
+                    x={0}
+                    y={0}
+                    width={220}
+                    height={72}
+                    cornerRadius={6}
+                    fill="#0f172a"
+                    stroke={circuit?.color || '#38bdf8'}
+                    strokeWidth={1.5}
+                    shadowColor="black"
+                    shadowBlur={10}
+                    shadowOpacity={0.6}
+                  />
+                  <Text x={8} y={8} text={`Траса ${hWire.cableTag || 'W'} [${circuit?.name || 'Група'}]`} fontSize={9.5} fontStyle="bold" fill="#ffffff" />
+                  <Text x={8} y={23} text={`Кабель: ${getCableDisplayName(hWire.cableType)} (${getCableCrossSection(hWire.cableType)})`} fontSize={8.5} fill="#7dd3fc" />
+                  <Text x={8} y={37} text={`Довжина: ${hWire.calculatedLengthM} м (${hWire.conduit === 'ceiling' ? 'Стеля в гофрі' : hWire.conduit === 'floor' ? 'У стяжці' : 'У штробі'})`} fontSize={8.5} fill="#cbd5e1" />
+                  <Text x={8} y={51} text={`${fromEl.name} ➔ ${toEl.name}`} fontSize={8} fill="#94a3b8" />
+                </Group>
+              );
+            })()}
+
+          {/* Switch linking banner */}
+          {linkingSwitchId && (
+            <Group x={stageDimensions.width / 2 - 160} y={20} listening={false}>
+              <Rect x={0} y={0} width={320} height={28} cornerRadius={6} fill="#0284c7" stroke="#38bdf8" strokeWidth={1.5} />
+              <Text x={10} y={7} width={300} text="🔗 Режим зв'язування: клікніть світильник на плані" fontSize={11} fontStyle="bold" fill="#ffffff" align="center" />
+            </Group>
+          )}
         </Layer>
       </Stage>
 

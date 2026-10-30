@@ -23,7 +23,12 @@ import { BlueprintUploadModal } from './components/panels/BlueprintUploadModal';
 import { BackupPowerModal } from './components/panels/BackupPowerModal';
 import { DstuDrawingAlbumModal } from './components/panels/DstuDrawingAlbumModal';
 import { ThreeDViewModal } from './components/panels/ThreeDViewModal';
-import { autoRouteProjectCables } from './utils/autoRouting';
+import {
+  autoRouteProjectCables,
+  autoNumberCircuitsAndCables,
+  autoAssignProjectCircuitsAndCables,
+  linkSwitchToLuminaires,
+} from './utils/autoRouting';
 import { BackupSystemConfig } from './types/cad';
 import { Code2, Image as ImageIcon, Zap, CheckCircle2 } from 'lucide-react';
 
@@ -44,6 +49,8 @@ export default function App() {
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
   const [selectedWallId, setSelectedWallId] = useState<string | null>(null);
   const [selectedOpeningId, setSelectedOpeningId] = useState<string | null>(null);
+  const [selectedWireId, setSelectedWireId] = useState<string | null>(null);
+  const [linkingSwitchId, setLinkingSwitchId] = useState<string | null>(null);
 
   // View Filter Mode
   const [viewFilter, setViewFilter] = useState<ViewFilterMode>('all');
@@ -274,6 +281,55 @@ export default function App() {
       ...project,
       wires: [...project.wires, wire],
     });
+    setSelectedWireId(wire.id);
+  }, [project, updateProjectWithHistory]);
+
+  const handleUpdateWire = useCallback((updated: WireRoute) => {
+    updateProjectWithHistory({
+      ...project,
+      wires: project.wires.map((w) => (w.id === updated.id ? updated : w)),
+    });
+  }, [project, updateProjectWithHistory]);
+
+  const handleDeleteWire = useCallback((id: string) => {
+    updateProjectWithHistory({
+      ...project,
+      wires: project.wires.filter((w) => w.id !== id),
+    });
+    setSelectedWireId((curr) => (curr === id ? null : curr));
+  }, [project, updateProjectWithHistory]);
+
+  const handleSelectWire = useCallback((id: string | null) => {
+    setSelectedWireId(id);
+    if (id) {
+      setSelectedElementId(null);
+      setSelectedWallId(null);
+      setSelectedOpeningId(null);
+    }
+  }, []);
+
+  // Switch Linking action
+  const handleLinkSwitchToLuminaires = useCallback((switchId: string, lightIds: string[]) => {
+    const updatedProj = linkSwitchToLuminaires(project, switchId, lightIds);
+    updateProjectWithHistory(updatedProj);
+    setLinkingSwitchId(null);
+    setToastMessage("Вимикач успішно зв'язано зі світильниками та створено групу керування");
+    setTimeout(() => setToastMessage(null), 3500);
+  }, [project, updateProjectWithHistory]);
+
+  // Project bulk electrical actions
+  const handleAutoAssignCircuits = useCallback(() => {
+    const res = autoAssignProjectCircuitsAndCables(project);
+    updateProjectWithHistory(res.project);
+    setToastMessage(`⚡ ${res.message}`);
+    setTimeout(() => setToastMessage(null), 4000);
+  }, [project, updateProjectWithHistory]);
+
+  const handleAutoNumberCables = useCallback(() => {
+    const updatedProj = autoNumberCircuitsAndCables(project);
+    updateProjectWithHistory(updatedProj);
+    setToastMessage(`🔢 Автонумерація ДСТУ: присвоєно номери групам щита (Гр.1..N) та маркування кабелів (W1-01)`);
+    setTimeout(() => setToastMessage(null), 4000);
   }, [project, updateProjectWithHistory]);
 
   // Circuit actions
@@ -543,6 +599,7 @@ export default function App() {
                 if (id) {
                   setSelectedWallId(null);
                   setSelectedOpeningId(null);
+                  setSelectedWireId(null);
                 }
               }}
               onSelectWall={(id) => {
@@ -550,6 +607,7 @@ export default function App() {
                 if (id) {
                   setSelectedElementId(null);
                   setSelectedOpeningId(null);
+                  setSelectedWireId(null);
                 }
               }}
               onSelectOpening={(id) => {
@@ -557,8 +615,14 @@ export default function App() {
                 if (id) {
                   setSelectedElementId(null);
                   setSelectedWallId(null);
+                  setSelectedWireId(null);
                 }
               }}
+              selectedWireId={selectedWireId}
+              onSelectWire={handleSelectWire}
+              onDeleteWire={handleDeleteWire}
+              linkingSwitchId={linkingSwitchId}
+              onLinkSwitchToLuminaires={handleLinkSwitchToLuminaires}
               onUpdateElementPosition={handleUpdateElementPosition}
               onAddElement={handleAddElement}
               onAddWall={handleAddWall}
@@ -587,6 +651,7 @@ export default function App() {
                 if (id) {
                   setSelectedWallId(null);
                   setSelectedOpeningId(null);
+                  setSelectedWireId(null);
                 }
               }}
               onSelectWall={(id) => {
@@ -594,6 +659,7 @@ export default function App() {
                 if (id) {
                   setSelectedElementId(null);
                   setSelectedOpeningId(null);
+                  setSelectedWireId(null);
                 }
               }}
               onSelectOpening={(id) => {
@@ -601,6 +667,7 @@ export default function App() {
                 if (id) {
                   setSelectedElementId(null);
                   setSelectedWallId(null);
+                  setSelectedWireId(null);
                 }
               }}
               onUpdateElementPosition={handleUpdateElementPosition}
@@ -620,6 +687,7 @@ export default function App() {
           selectedElementId={selectedElementId}
           selectedWallId={selectedWallId}
           selectedOpeningId={selectedOpeningId}
+          selectedWireId={selectedWireId}
           onUpdateElement={handleUpdateElement}
           onDeleteElement={handleDeleteElement}
           onDuplicateElement={handleDuplicateElement}
@@ -627,6 +695,14 @@ export default function App() {
           onDeleteWall={handleDeleteWall}
           onUpdateOpening={handleUpdateOpening}
           onDeleteOpening={handleDeleteOpening}
+          onSelectWire={handleSelectWire}
+          onUpdateWire={handleUpdateWire}
+          onDeleteWire={handleDeleteWire}
+          linkingSwitchId={linkingSwitchId}
+          onStartSwitchLinking={(swId) => setLinkingSwitchId(swId)}
+          onCancelSwitchLinking={() => setLinkingSwitchId(null)}
+          onAutoAssignCircuits={handleAutoAssignCircuits}
+          onAutoNumberCables={handleAutoNumberCables}
         />
       </div>
 

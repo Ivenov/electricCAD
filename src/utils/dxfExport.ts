@@ -75,6 +75,94 @@ export function generateProjectDxf(project: CadProject): string {
     addCode(31, 0.0);
   });
 
+  // Draw Openings (Doors & Windows in A-OPENINGS)
+  project.openings.forEach((op) => {
+    const wall = project.walls.find((w) => w.id === op.wallId);
+    if (!wall) return;
+
+    const w1x = pxToMm(wall.start.x);
+    const w1y = -pxToMm(wall.start.y);
+    const w2x = pxToMm(wall.end.x);
+    const w2y = -pxToMm(wall.end.y);
+
+    const dx = w2x - w1x;
+    const dy = w2y - w1y;
+    const len = Math.hypot(dx, dy);
+    if (len === 0) return;
+
+    const ux = dx / len;
+    const uy = dy / len;
+    const nx = -uy;
+    const ny = ux;
+
+    const opWidthMm = op.width;
+    const centerX = w1x + dx * op.positionRatio;
+    const centerY = w1y + dy * op.positionRatio;
+
+    const startX = centerX - (ux * opWidthMm) / 2;
+    const startY = centerY - (uy * opWidthMm) / 2;
+    const endX = centerX + (ux * opWidthMm) / 2;
+    const endY = centerY + (uy * opWidthMm) / 2;
+
+    if (op.type === 'door') {
+      // Door opening jamb marks
+      const swingLen = opWidthMm * 0.9;
+      const leafX = startX + nx * swingLen;
+      const leafY = startY + ny * swingLen;
+
+      // Door leaf line
+      addCode(0, 'LINE');
+      addCode(8, 'A-OPENINGS');
+      addCode(10, startX);
+      addCode(20, startY);
+      addCode(30, 0.0);
+      addCode(11, leafX);
+      addCode(21, leafY);
+      addCode(31, 0.0);
+
+      // Swing chord line
+      addCode(0, 'LINE');
+      addCode(8, 'A-OPENINGS');
+      addCode(10, leafX);
+      addCode(20, leafY);
+      addCode(30, 0.0);
+      addCode(11, endX);
+      addCode(21, endY);
+      addCode(31, 0.0);
+
+      // Door tag
+      addCode(0, 'TEXT');
+      addCode(8, 'A-OPENINGS');
+      addCode(10, centerX + nx * 150);
+      addCode(20, centerY + ny * 150);
+      addCode(30, 0.0);
+      addCode(40, 75.0);
+      addCode(1, `Двері ${opWidthMm} мм`);
+    } else {
+      // Window: 2 parallel lines for sill / glass
+      const offset = (wall.thickness || 150) * 0.25;
+      for (const sign of [-1, 1]) {
+        addCode(0, 'LINE');
+        addCode(8, 'A-OPENINGS');
+        addCode(10, startX + nx * offset * sign);
+        addCode(20, startY + ny * offset * sign);
+        addCode(30, 0.0);
+        addCode(11, endX + nx * offset * sign);
+        addCode(21, endY + ny * offset * sign);
+        addCode(31, 0.0);
+      }
+
+      // Window tag
+      addCode(0, 'TEXT');
+      addCode(8, 'A-OPENINGS');
+      addCode(10, centerX + nx * 120);
+      addCode(20, centerY + ny * 120);
+      addCode(30, 0.0);
+      addCode(40, 70.0);
+      addCode(1, `Вікно ${opWidthMm} мм`);
+    }
+  });
+
   // Draw Electrical Elements
   project.elements.forEach((el) => {
     const cx = pxToMm(el.position.x);
@@ -94,6 +182,9 @@ export function generateProjectDxf(project: CadProject): string {
     addCode(30, 0.0);
     addCode(40, 150.0); // 150mm symbol radius
 
+    // Switch group identifier if bound (a, b, S1, S2)
+    const switchTag = el.switchGroupId ? ` [${el.switchGroupId}]` : '';
+
     // Element Label Text
     addCode(0, 'TEXT');
     addCode(8, layer);
@@ -101,7 +192,7 @@ export function generateProjectDxf(project: CadProject): string {
     addCode(20, cy - 80.0);
     addCode(30, 0.0);
     addCode(40, 90.0); // 90mm text height
-    addCode(1, `${el.name} [h=+${el.mountingHeightMm}]`);
+    addCode(1, `${el.name}${switchTag} [h=+${el.mountingHeightMm}]`);
 
     // Backup Indicator Text
     if (isBackup) {
@@ -121,6 +212,9 @@ export function generateProjectDxf(project: CadProject): string {
     const toEl = project.elements.find((e) => e.id === wire.toId);
     if (!fromEl || !toEl) return;
 
+    let midPointX = 0;
+    let midPointY = 0;
+
     if (wire.points && wire.points.length >= 2) {
       for (let i = 0; i < wire.points.length - 1; i++) {
         const p1 = wire.points[i];
@@ -135,6 +229,9 @@ export function generateProjectDxf(project: CadProject): string {
         addCode(21, -pxToMm(p2.y));
         addCode(31, 0.0);
       }
+      const midIdx = Math.floor(wire.points.length / 2);
+      midPointX = pxToMm(wire.points[midIdx].x);
+      midPointY = -pxToMm(wire.points[midIdx].y);
     } else {
       // Orthogonal Manhattan line between fromEl and toEl
       const x1 = pxToMm(fromEl.position.x);
@@ -160,7 +257,20 @@ export function generateProjectDxf(project: CadProject): string {
       addCode(11, x2);
       addCode(21, y2);
       addCode(31, 0.0);
+
+      midPointX = (x1 + x2) / 2;
+      midPointY = (y1 + y2) / 2;
     }
+
+    // Add cable tag annotation in CAD
+    const wireTagText = `${wire.cableTag ? `[${wire.cableTag}] ` : ''}${wire.calculatedLengthM}m`;
+    addCode(0, 'TEXT');
+    addCode(8, 'E-WIRING');
+    addCode(10, midPointX + 50);
+    addCode(20, midPointY + 50);
+    addCode(30, 0.0);
+    addCode(40, 70.0);
+    addCode(1, wireTagText);
   });
 
   // Draw DSTU Title Block Frame (Border)

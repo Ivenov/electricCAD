@@ -20,6 +20,8 @@ import {
   snapToNearestWall,
   generateCurvedWirePath,
   generateOrthoWirePath,
+  generatePolylineWirePath,
+  getCableCrossSection,
   calculateCableLengthM,
   MM_PER_PX,
   snapToWallGeometry,
@@ -38,6 +40,7 @@ interface CadCanvasProps {
   selectedWallId: string | null;
   selectedOpeningId?: string | null;
   selectedOpeningPreset?: OpeningCatalogItem | null;
+  selectedWireId?: string | null;
   viewFilter: ViewFilterMode;
   showDimensions: boolean;
   showHeights: boolean;
@@ -46,6 +49,7 @@ interface CadCanvasProps {
   onSelectElement: (id: string | null) => void;
   onSelectWall: (id: string | null) => void;
   onSelectOpening?: (id: string | null) => void;
+  onSelectWire?: (id: string | null) => void;
   onUpdateElementPosition: (id: string, newPos: Point, newRotation?: number, wallId?: string) => void;
   onAddElement: (element: ElectricalElement) => void;
   onAddWall: (wall: Wall) => void;
@@ -63,6 +67,7 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
   selectedWallId,
   selectedOpeningId,
   selectedOpeningPreset,
+  selectedWireId,
   viewFilter,
   showDimensions,
   showHeights,
@@ -71,6 +76,7 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
   onSelectElement,
   onSelectWall,
   onSelectOpening,
+  onSelectWire,
   onUpdateElementPosition,
   onAddElement,
   onAddWall,
@@ -822,38 +828,77 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
             const wireColor = circuit?.color || (wire.mode === 'curve' ? '#fbbf24' : '#38bdf8');
             const isLighting = wire.mode === 'curve';
 
-            const pathD = isLighting
+            const isSelected = selectedWireId === wire.id;
+            const hasPoints = wire.points && wire.points.length > 0;
+            const pathD = hasPoints
+              ? generatePolylineWirePath(wire.points!)
+              : isLighting
               ? generateCurvedWirePath(fromEl.position, toEl.position, 0.22)
               : generateOrthoWirePath(fromEl.position, toEl.position);
 
+            const badgeText = `${wire.cableTag ? `[${wire.cableTag}] ` : ''}${getCableCrossSection(wire.cableType)} · ${wire.calculatedLengthM} м`;
+            const badgeWidth = Math.max(76, badgeText.length * 6.5);
+
+            // Center of path for badge
+            const centerX = hasPoints
+              ? wire.points![Math.floor(wire.points!.length / 2)].x
+              : (fromEl.position.x + toEl.position.x) / 2;
+            const centerY = hasPoints
+              ? wire.points![Math.floor(wire.points!.length / 2)].y
+              : (fromEl.position.y + toEl.position.y) / 2;
+
             return (
-              <g key={wire.id} className="group cursor-pointer">
+              <g
+                key={wire.id}
+                className="group cursor-pointer"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelectWire?.(wire.id);
+                  onSelectElement(null);
+                  onSelectWall(null);
+                }}
+              >
                 {/* Thick invisible hit area */}
-                <path d={pathD} fill="none" stroke="transparent" strokeWidth="14" />
+                <path d={pathD} fill="none" stroke="transparent" strokeWidth="18" />
+
+                {/* Selection Halo */}
+                {isSelected && (
+                  <path
+                    d={pathD}
+                    fill="none"
+                    stroke="#38bdf8"
+                    strokeWidth={isLighting ? 6 : 7}
+                    strokeOpacity="0.4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                )}
+
                 {/* Main wire path */}
                 <path
                   d={pathD}
                   fill="none"
-                  stroke={wireColor}
-                  strokeWidth={isLighting ? 1.8 : 2.5}
+                  stroke={isSelected ? '#38bdf8' : wireColor}
+                  strokeWidth={isSelected ? 3.2 : isLighting ? 1.8 : 2.5}
                   strokeDasharray={isLighting ? '4 3' : 'none'}
                   strokeLinecap="round"
+                  strokeLinejoin="round"
                   className="transition-all duration-150 group-hover:stroke-white group-hover:stroke-[3.5px]"
                 />
 
-                {/* Length marker on wire center */}
+                {/* Callout badge on wire */}
                 <g
-                  transform={`translate(${(fromEl.position.x + toEl.position.x) / 2}, ${(fromEl.position.y + toEl.position.y) / 2})`}
-                  className="opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"
+                  transform={`translate(${centerX}, ${centerY})`}
+                  className={`${isSelected ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity pointer-events-none`}
                 >
                   <rect
-                    x="-28"
+                    x={-badgeWidth / 2}
                     y="-9"
-                    width="56"
+                    width={badgeWidth}
                     height="18"
                     rx="4"
-                    fill="rgba(15, 23, 42, 0.95)"
-                    stroke={wireColor}
+                    fill={isSelected ? '#0369a1' : 'rgba(15, 23, 42, 0.95)'}
+                    stroke={isSelected ? '#38bdf8' : wireColor}
                     strokeWidth="1"
                   />
                   <text
@@ -865,7 +910,7 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
                     fontWeight="600"
                     className="font-mono tabular-nums"
                   >
-                    {wire.calculatedLengthM} м
+                    {badgeText}
                   </text>
                 </g>
               </g>

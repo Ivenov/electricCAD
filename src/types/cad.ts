@@ -113,7 +113,8 @@ export interface ElectricalElement {
   mountingHeightMm: number; // e.g. 300, 900, 1050, 2200, 2700
   powerWatts: number;
   circuitId?: string; // id of CircuitGroup
-  switchGroupId?: string; // e.g. "S1", "S2" for matching switch with lights
+  switchGroupId?: string; // e.g. "a", "b", "S1", "S2" for matching switch with lights
+  switchGangs?: { gangId: string; label: string; switchGroupId: string }[]; // for 2-gang and 3-gang switches
   ipRating: 'IP20' | 'IP44' | 'IP65';
   phase?: 'L1' | 'L2' | 'L3';
   label?: string;
@@ -131,6 +132,7 @@ export interface WireRoute {
   cableType: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6' | 'FTP_Cat5e';
   circuitId?: string;
   switchGroupId?: string;
+  cableTag?: string; // e.g. "W1-01", "W2-03"
   calculatedLengthM: number;
 }
 

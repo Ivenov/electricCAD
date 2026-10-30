@@ -188,6 +188,55 @@ export function generateOrthoWirePath(p1: Point, p2: Point): string {
   return `M ${p1.x.toFixed(1)} ${p1.y.toFixed(1)} L ${midX.toFixed(1)} ${p1.y.toFixed(1)} L ${midX.toFixed(1)} ${p2.y.toFixed(1)} L ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
 }
 
+/**
+ * Generates SVG path data through a list of custom waypoint vertices
+ */
+export function generatePolylineWirePath(points: Point[]): string {
+  if (points.length === 0) return '';
+  if (points.length === 1) return `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`;
+  return `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)} ` + points.slice(1).map((p) => `L ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+}
+
+/**
+ * Ukrainian cable notation display (ДСТУ / ПУЕ)
+ */
+export function getCableDisplayName(cableType?: string): string {
+  switch (cableType) {
+    case 'VVGng_3x1.5':
+      return 'ВВГнгд 3×1.5';
+    case 'VVGng_3x2.5':
+      return 'ВВГнгд 3×2.5';
+    case 'VVGng_3x4':
+      return 'ВВГнгд 3×4';
+    case 'VVGng_3x6':
+      return 'ВВГнгд 3×6';
+    case 'FTP_Cat5e':
+      return 'FTP 4×2×0.51';
+    default:
+      return cableType || 'ВВГнгд 3×2.5';
+  }
+}
+
+/**
+ * Returns short cross section specification: "3×1.5", "3×2.5", "3×4", "3×6"
+ */
+export function getCableCrossSection(cableType?: string): string {
+  switch (cableType) {
+    case 'VVGng_3x1.5':
+      return '3×1.5 мм²';
+    case 'VVGng_3x2.5':
+      return '3×2.5 мм²';
+    case 'VVGng_3x4':
+      return '3×4 мм²';
+    case 'VVGng_3x6':
+      return '3×6 мм²';
+    case 'FTP_Cat5e':
+      return 'Cat5e';
+    default:
+      return '3×2.5 мм²';
+  }
+}
+
 export interface WallSnapResult {
   point: Point;
   snappedPoint: Point;
