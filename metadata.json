@@ -1,0 +1,6 @@
+{
+  "name": "ElectroPlan CAD - САПР електрики",
+  "description": "Професійний архітектурний CAD для проектування та розрахунку електричних мереж на планах приміщень згідно з ПУЕ та ДБН.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
