@@ -3,6 +3,8 @@ import { Printer, Download, FileCode, CheckCircle2, ChevronRight, Layers, Cpu, F
 import { CadProject } from '../../types/cad';
 import { downloadDxfFile } from '../../utils/dxfExport';
 import { pxToMm } from '../../utils/cadMath';
+import { calculateProjectElectricalSummary } from '../../utils/electricalCalculations';
+import { SingleLineSchematicSvg } from '../cad/SingleLineSchematicSvg';
 
 interface DstuDrawingAlbumModalProps {
   project: CadProject;
@@ -15,17 +17,18 @@ export const DstuDrawingAlbumModal: React.FC<DstuDrawingAlbumModalProps> = ({
 }) => {
   const [activeSheet, setActiveSheet] = useState<number>(1);
 
-  // Project calculations
-  const totalInstalledWatts = project.elements.reduce((sum, el) => sum + (el.powerWatts || 150), 0);
-  const demandFactor = totalInstalledWatts > 10000 ? 0.7 : 0.8;
-  const calculatedWatts = Math.round(totalInstalledWatts * demandFactor);
-  const calculatedAmps = Math.round((calculatedWatts / 230) * 10) / 10;
+  // Unified engineering project calculations (§6 & §12 ТЗ)
+  const summary = calculateProjectElectricalSummary(project);
+  const totalInstalledWatts = summary.installedPowerWatts;
+  const demandFactor = summary.demandFactor;
+  const calculatedWatts = summary.designPowerWatts;
+  const calculatedAmps = summary.mainCurrentA;
 
   // Backup priority load
   const backupElements = project.elements.filter(
     (el) => el.isBackupPriority || project.circuits.find((c) => c.id === el.circuitId)?.isBackupPriority
   );
-  const backupWatts = backupElements.reduce((sum, el) => sum + (el.powerWatts || 150), 0);
+  const backupWatts = backupElements.reduce((sum, el) => sum + (el.powerWatts || 0), 0);
 
   // Cable lengths summary
   const cableSummary = project.wires.reduce<Record<string, number>>((acc, w) => {
@@ -409,69 +412,23 @@ export const DstuDrawingAlbumModal: React.FC<DstuDrawingAlbumModalProps> = ({
                       Принципова однолінійна розрахункова схема щита (ВРП)
                     </h1>
                     <p className="text-xs text-neutral-600">
-                      Апарати захисту, номінали, дифзахист, розрахункові навантаження та блоки резервування
+                      Векторна схема: ввідний автомат, реле напруги, шини L/N/PE, апарати захисту та параметри ліній за ДСТУ
                     </p>
                   </div>
                   <div className="text-xs font-mono font-bold border border-neutral-900 px-2 py-1 bg-neutral-100">
-                    Ввід: 230 В / 50 Гц / TN-C-S
+                    Ввід: {project.supplyPhase === '3-phase' ? '3N~ 400 В' : '1N~ 230 В'} / 50 Гц / TN-C-S
                   </div>
                 </div>
 
-                {/* Circuit Schedule Table */}
-                <div className="border border-neutral-900 overflow-hidden text-xs">
-                  <table className="w-full text-left">
-                    <thead className="bg-neutral-100 border-b border-neutral-900 text-[11px] font-bold">
-                      <tr>
-                        <th className="p-2 border-r border-neutral-900 text-center w-12">№</th>
-                        <th className="p-2 border-r border-neutral-900">Найменування лінії</th>
-                        <th className="p-2 border-r border-neutral-900">Автоматичний вимикач</th>
-                        <th className="p-2 border-r border-neutral-900">ПЗВ / Дифавтомат</th>
-                        <th className="p-2 border-r border-neutral-900">Марка кабелю</th>
-                        <th className="p-2 border-r border-neutral-900">Потужність</th>
-                        <th className="p-2">Резервування</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-neutral-900 text-[11px]">
-                      {project.circuits.map((c) => {
-                        const grpElements = project.elements.filter((e) => e.circuitId === c.id);
-                        const pWatts = grpElements.reduce((s, e) => s + (e.powerWatts || 150), 0);
-                        return (
-                          <tr key={c.id}>
-                            <td className="p-1.5 border-r border-neutral-900 text-center font-bold font-mono">
-                              {c.number}
-                            </td>
-                            <td className="p-1.5 border-r border-neutral-900 font-medium">{c.name}</td>
-                            <td className="p-1.5 border-r border-neutral-900 font-mono font-bold">
-                              {c.breakerCurve}{c.breakerRatingA}А
-                            </td>
-                            <td className="p-1.5 border-r border-neutral-900 font-mono text-neutral-700">
-                              {c.rcdType !== 'none' ? '30 мА (тип A)' : '—'}
-                            </td>
-                            <td className="p-1.5 border-r border-neutral-900 font-mono">
-                              {c.cableType.replace('_', ' ')}
-                            </td>
-                            <td className="p-1.5 border-r border-neutral-900 font-mono">
-                              {(pWatts / 1000).toFixed(2)} кВт
-                            </td>
-                            <td className="p-1.5 font-bold">
-                              {c.isBackupPriority ? (
-                                <span className="text-emerald-700">⚡ ДБЖ (LiFePO4)</span>
-                              ) : (
-                                <span className="text-neutral-400">Міська мережа</span>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+                {/* Vector Graphical Single-Line Schematic */}
+                <SingleLineSchematicSvg project={project} demandFactor={demandFactor} />
 
                 <div className="p-3 bg-neutral-50 border border-neutral-900 text-xs">
-                  <div className="font-bold mb-1">Захисна автоматика щита:</div>
-                  <div>1. Ввідний автомат: 2P C{project.mainBreakerRatingA || 32} 6кА Hager / Schneider Electric</div>
-                  <div>2. Реле захисту від перепадів напруги: ZUBR D2-40 (відсічка 175–255 В)</div>
-                  <div>3. Ввід резерву: Реверсивний перемикач Hager I-0-II або гібридний інвертор 5 кВт з часом перемикання 10мс</div>
+                  <div className="font-bold mb-1">Захисна автоматика щита за нормами ПУЕ:</div>
+                  <div>1. Ввідний автомат: {project.supplyPhase === '3-phase' ? '3P' : '2P'} C{project.mainBreakerRatingA || 40} 6кА (Hager / Schneider Electric)</div>
+                  <div>2. Реле захисту від перепадів напруги: Zubr {project.supplyPhase === '3-phase' ? '3F' : 'D63'} (контроль 175–255 В, час реакції &lt; 0.04с)</div>
+                  <div>3. Диференційний захист: ПЗВ тип А 30мА на розеткові групи та 10мА на вологий санвузол згідно з ПУЕ 7.1.82</div>
+                  <div>4. Кабельні лінії: мідні монолітні ВВГнгд із негорючою ізоляцією та низьким виділенням диму за ДСТУ 31565</div>
                 </div>
               </div>
             )}

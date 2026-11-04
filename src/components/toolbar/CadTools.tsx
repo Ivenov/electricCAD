@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   MousePointer,
   Hand,
@@ -7,6 +7,8 @@ import {
   ToggleLeft,
   Lightbulb,
   Box,
+  Boxes,
+  Cpu,
   GitBranch,
   Ruler,
   Grid,
@@ -17,10 +19,34 @@ import {
   Sofa,
   DoorOpen,
   AppWindow,
+  Shapes,
+  FileText,
+  Layers,
+  Sparkles,
+  Plus,
 } from 'lucide-react';
-import { CadTool, ViewFilterMode, ElectricalCategory } from '../../types/cad';
+import { CadTool, ViewFilterMode, ElectricalCategory, Room, FurnitureCategory, CustomLibraryItem } from '../../types/cad';
 import { CatalogItem, ELECTRICAL_CATALOG } from '../../data/electricalCatalog';
 import { OpeningCatalogItem, OPENINGS_CATALOG } from '../../data/openingsCatalog';
+import { FurnitureCatalogItem, FURNITURE_CATALOG, FURNITURE_CATEGORIES } from '../../data/furnitureCatalog';
+
+export interface RoomPreset {
+  type: Room['type'];
+  name: string;
+  desc: string;
+  badge: string;
+}
+
+export const ROOM_PRESETS: RoomPreset[] = [
+  { type: 'living', name: 'Вітальня / Зала', desc: 'Основна житлова зона', badge: 'Житлова' },
+  { type: 'bedroom', name: 'Спальня', desc: 'Зона відпочинку', badge: 'Житлова' },
+  { type: 'kitchen', name: 'Кухня', desc: 'Силова зона (плита, духовка, фартух)', badge: 'Силова' },
+  { type: 'bathroom', name: 'Санвузол / Ванна', desc: 'Волога зона (IP44 + ПЗВ 10/30мА)', badge: 'Волога зона' },
+  { type: 'hallway', name: 'Коридор / Хол', desc: 'Вхідна група та щит ВРП', badge: 'Прохідна' },
+  { type: 'balcony', name: 'Балкон / Лоджія', desc: 'Вулична зона', badge: 'Холодна' },
+  { type: 'office', name: 'Кабінет', desc: 'Робоча комп’ютерна зона', badge: 'Робоча' },
+  { type: 'utility', name: 'Гардероб / Комора', desc: 'Підсобне приміщення', badge: 'Підсобна' },
+];
 
 interface CadToolsProps {
   activeTool: CadTool;
@@ -29,14 +55,24 @@ interface CadToolsProps {
   onSelectCatalogItem: (item: CatalogItem) => void;
   selectedOpeningItem?: OpeningCatalogItem | null;
   onSelectOpeningItem?: (item: OpeningCatalogItem) => void;
+  selectedRoomType?: Room['type'];
+  onSelectRoomType?: (type: Room['type']) => void;
+  onAutoDetectRooms?: () => void;
+  selectedFurnitureItem?: FurnitureCatalogItem | null;
+  onSelectFurnitureItem?: (item: FurnitureCatalogItem) => void;
+  onOpenCustomLibraryModal?: () => void;
+  customLibraryItems?: CustomLibraryItem[];
   viewFilter: ViewFilterMode;
   onChangeViewFilter: (filter: ViewFilterMode) => void;
   showDimensions: boolean;
   onToggleDimensions: () => void;
   showHeights: boolean;
+  showHeightsToggle?: () => void;
   onToggleHeights: () => void;
   showFurniture: boolean;
   onToggleFurniture: () => void;
+  showAnnotations?: boolean;
+  onToggleAnnotations?: () => void;
   gridSnapEnabled: boolean;
   onToggleGridSnap: () => void;
   canUndo: boolean;
@@ -44,6 +80,9 @@ interface CadToolsProps {
   onUndo: () => void;
   onRedo: () => void;
   onAutoRoute?: () => void;
+  autoRoutingEnabled?: boolean;
+  onToggleAutoRouting?: () => void;
+  onOpenLayersModal?: () => void;
 }
 
 export const CadTools: React.FC<CadToolsProps> = ({
@@ -53,6 +92,13 @@ export const CadTools: React.FC<CadToolsProps> = ({
   onSelectCatalogItem,
   selectedOpeningItem,
   onSelectOpeningItem,
+  selectedRoomType = 'living',
+  onSelectRoomType,
+  onAutoDetectRooms,
+  selectedFurnitureItem,
+  onSelectFurnitureItem,
+  onOpenCustomLibraryModal,
+  customLibraryItems = [],
   viewFilter,
   onChangeViewFilter,
   showDimensions,
@@ -61,6 +107,9 @@ export const CadTools: React.FC<CadToolsProps> = ({
   onToggleHeights,
   showFurniture,
   onToggleFurniture,
+  showAnnotations = true,
+  onToggleAnnotations,
+  onOpenLayersModal,
   gridSnapEnabled,
   onToggleGridSnap,
   canUndo,
@@ -68,15 +117,22 @@ export const CadTools: React.FC<CadToolsProps> = ({
   onUndo,
   onRedo,
   onAutoRoute,
+  autoRoutingEnabled = true,
+  onToggleAutoRouting,
 }) => {
+  const [selectedFurnitureCategory, setSelectedFurnitureCategory] = useState<FurnitureCategory | 'all'>('all');
+
   const getCatalogItemsByCategory = (category: ElectricalCategory) => {
     if (category === 'panel') {
       return ELECTRICAL_CATALOG.filter((item) => item.category === 'panel' || item.category === 'backup');
     }
+    if (category === 'junction') {
+      return ELECTRICAL_CATALOG.filter((item) => item.category === 'junction');
+    }
     return ELECTRICAL_CATALOG.filter((item) => item.category === category);
   };
 
-  const isDrawerOpen = ['socket', 'switch', 'light', 'panel', 'door', 'window'].includes(activeTool);
+  const isDrawerOpen = ['socket', 'switch', 'light', 'panel', 'junction', 'door', 'window', 'room', 'furniture'].includes(activeTool);
 
   return (
     <div className="flex h-full select-none z-20">
@@ -124,6 +180,19 @@ export const CadTools: React.FC<CadToolsProps> = ({
             <Square className="w-4 h-4" />
           </button>
 
+          {/* Room Tool */}
+          <button
+            onClick={() => onSelectTool('room')}
+            title="Створити приміщення / кімнату (R)"
+            className={`w-10 h-10 rounded-lg flex items-center justify-center transition-colors ${
+              activeTool === 'room'
+                ? 'bg-sky-500 text-neutral-950 font-bold shadow-md shadow-sky-500/20'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+            }`}
+          >
+            <Shapes className="w-4 h-4" />
+          </button>
+
           {/* Door Tool */}
           <button
             onClick={() => {
@@ -160,6 +229,24 @@ export const CadTools: React.FC<CadToolsProps> = ({
             }`}
           >
             <AppWindow className="w-4 h-4" />
+          </button>
+
+          {/* Furniture & Plumbing Tool */}
+          <button
+            onClick={() => {
+              onSelectTool('furniture');
+              if (onSelectFurnitureItem && !selectedFurnitureItem) {
+                onSelectFurnitureItem(FURNITURE_CATALOG[0]);
+              }
+            }}
+            title="Розміщення меблів та сантехніки (F)"
+            className={`w-10 h-10 rounded-lg flex items-center justify-center transition-colors ${
+              activeTool === 'furniture'
+                ? 'bg-sky-500 text-neutral-950 font-bold shadow-md shadow-sky-500/20'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+            }`}
+          >
+            <Sofa className="w-4 h-4" />
           </button>
 
           <div className="w-6 h-px bg-neutral-800 my-1" />
@@ -230,7 +317,7 @@ export const CadTools: React.FC<CadToolsProps> = ({
                 onSelectCatalogItem(items[0]);
               }
             }}
-            title="Електрощити та розподільчі коробки"
+            title="Електрощити (ВРП / ЩРН / ЩС / Резерв)"
             className={`w-10 h-10 rounded-lg flex items-center justify-center transition-colors ${
               activeTool === 'panel'
                 ? 'bg-sky-500 text-neutral-950 font-bold shadow-md shadow-sky-500/20'
@@ -238,6 +325,25 @@ export const CadTools: React.FC<CadToolsProps> = ({
             }`}
           >
             <Box className="w-4 h-4" />
+          </button>
+
+          {/* Junction Boxes Tool */}
+          <button
+            onClick={() => {
+              onSelectTool('junction');
+              const items = getCatalogItemsByCategory('junction');
+              if (items.length > 0 && selectedCatalogItem?.category !== 'junction') {
+                onSelectCatalogItem(items[0]);
+              }
+            }}
+            title="Розподільчі коробки РК (освітлення, розеточні, IP65, ГЗШ) (J)"
+            className={`w-10 h-10 rounded-lg flex items-center justify-center transition-colors ${
+              activeTool === 'junction'
+                ? 'bg-sky-500 text-neutral-950 font-bold shadow-md shadow-sky-500/20'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+            }`}
+          >
+            <Boxes className="w-4 h-4" />
           </button>
 
           {/* Wire Routing Tool */}
@@ -253,16 +359,35 @@ export const CadTools: React.FC<CadToolsProps> = ({
             <GitBranch className="w-4 h-4" />
           </button>
 
-          {/* Auto-routing Action */}
-          {onAutoRoute && (
-            <button
-              onClick={onAutoRoute}
-              title="Автотрасування кабелів за нормами ПУЕ (Ортогонально 90°)"
-              className="w-10 h-10 rounded-lg flex items-center justify-center transition-colors text-amber-400 hover:text-amber-300 hover:bg-amber-950/40 border border-amber-500/40 bg-amber-950/20"
-            >
-              <Zap className="w-4 h-4 text-amber-400" />
-            </button>
-          )}
+          {/* Auto-routing Action & State Toggle */}
+          <div className="flex flex-col items-center gap-1">
+            {onAutoRoute && (
+              <button
+                onClick={onAutoRoute}
+                title="Автотрасування кабелів за нормами ПУЕ (Ортогонально 90°)"
+                className="w-10 h-10 rounded-lg flex items-center justify-center transition-colors text-amber-400 hover:text-amber-300 hover:bg-amber-950/40 border border-amber-500/40 bg-amber-950/20"
+              >
+                <Zap className="w-4 h-4 text-amber-400" />
+              </button>
+            )}
+            {onToggleAutoRouting && (
+              <button
+                onClick={onToggleAutoRouting}
+                title={
+                  autoRoutingEnabled
+                    ? 'Автотрасування: УВІМКНЕНО (клікніть, щоб вимкнути)'
+                    : 'Автотрасування: ВИМКНЕНО (ручне трасування вузлів)'
+                }
+                className={`w-10 h-5 rounded flex items-center justify-center text-[9px] font-bold transition-colors ${
+                  autoRoutingEnabled
+                    ? 'text-emerald-400 bg-emerald-950/40 border border-emerald-500/40'
+                    : 'text-neutral-500 bg-neutral-900 border border-neutral-700/60'
+                }`}
+              >
+                {autoRoutingEnabled ? 'AUTO' : 'MAN'}
+              </button>
+            )}
+          </div>
 
           {/* Measure / Ruler */}
           <button
@@ -276,6 +401,17 @@ export const CadTools: React.FC<CadToolsProps> = ({
           >
             <Ruler className="w-4 h-4" />
           </button>
+
+          {/* Custom Library Creator Tool */}
+          {onOpenCustomLibraryModal && (
+            <button
+              onClick={onOpenCustomLibraryModal}
+              title="Власна бібліотека CAD (+ Створити символ)"
+              className="w-10 h-10 rounded-lg flex items-center justify-center transition-colors text-amber-400 hover:text-amber-300 hover:bg-amber-950/40 border border-amber-500/30 bg-amber-950/20 shadow-sm"
+            >
+              <Sparkles className="w-4 h-4 text-amber-400" />
+            </button>
+          )}
         </div>
 
         {/* Bottom utility toggles */}
@@ -324,6 +460,30 @@ export const CadTools: React.FC<CadToolsProps> = ({
             <Sofa className="w-4 h-4" />
           </button>
 
+          {/* Annotations & Callouts Toggle (Примітки та виноски) */}
+          {onToggleAnnotations && (
+            <button
+              onClick={onToggleAnnotations}
+              title={showAnnotations ? 'Примітки та виноски: УВІМК (клікніть, щоб вимкнути)' : 'Примітки та виноски: ВИМК (клікніть, щоб увімкнути)'}
+              className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors ${
+                showAnnotations ? 'text-amber-400 bg-amber-950/40 border border-amber-800/50' : 'text-neutral-500 hover:text-neutral-300'
+              }`}
+            >
+              <FileText className="w-4 h-4" />
+            </button>
+          )}
+
+          {/* Layer Visibility Manager Modal Trigger */}
+          {onOpenLayersModal && (
+            <button
+              onClick={onOpenLayersModal}
+              title="Диспетчер видимості шарів (CAD Layer Manager)"
+              className="w-9 h-9 rounded-lg flex items-center justify-center text-sky-400 bg-sky-950/40 border border-sky-800/50 hover:bg-sky-900/60 transition-colors"
+            >
+              <Layers className="w-4 h-4" />
+            </button>
+          )}
+
           <div className="w-6 h-px bg-neutral-800 my-0.5" />
 
           {/* Undo / Redo */}
@@ -357,16 +517,192 @@ export const CadTools: React.FC<CadToolsProps> = ({
               {activeTool === 'switch' && 'Каталог вимикачів'}
               {activeTool === 'light' && 'Каталог освітлення'}
               {activeTool === 'panel' && 'Щити та обладнання'}
+              {activeTool === 'junction' && 'Розподільчі коробки (РК)'}
               {activeTool === 'door' && 'Каталог дверей'}
               {activeTool === 'window' && 'Каталог вікон'}
+              {activeTool === 'room' && 'Створення кімнати'}
+              {activeTool === 'furniture' && 'Меблі та сантехніка'}
             </span>
             <span className="text-[11px] text-neutral-500">
-              {activeTool === 'door' || activeTool === 'window' ? 'Клік на стіну' : 'Клікніть на план'}
+              {activeTool === 'door' || activeTool === 'window'
+                ? 'Клік на стіну'
+                : activeTool === 'room'
+                ? 'Клікніть кути полігону'
+                : 'Клікніть на план'}
             </span>
           </div>
 
           <div className="flex flex-col gap-1.5">
-            {activeTool === 'door' || activeTool === 'window' ? (
+            {activeTool === 'furniture' ? (
+              <div className="space-y-2">
+                {/* Furniture Category Filters */}
+                <div className="flex flex-wrap gap-1 pb-1 border-b border-neutral-800">
+                  <button
+                    onClick={() => setSelectedFurnitureCategory('all')}
+                    className={`px-2 py-1 rounded text-[10px] font-semibold transition-colors ${
+                      selectedFurnitureCategory === 'all'
+                        ? 'bg-sky-500 text-neutral-950'
+                        : 'bg-neutral-800 text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    Всі
+                  </button>
+                  {FURNITURE_CATEGORIES.map((cat) => (
+                    <button
+                      key={cat.id}
+                      onClick={() => setSelectedFurnitureCategory(cat.id)}
+                      className={`px-2 py-1 rounded text-[10px] font-semibold flex items-center gap-1 transition-colors ${
+                        selectedFurnitureCategory === cat.id
+                          ? 'bg-sky-500 text-neutral-950'
+                          : 'bg-neutral-800 text-neutral-400 hover:text-white'
+                      }`}
+                    >
+                      <span>{cat.icon}</span>
+                      <span>{cat.label}</span>
+                    </button>
+                  ))}
+                </div>
+
+                {/* Create Custom Furniture Button */}
+                {onOpenCustomLibraryModal && (
+                  <button
+                    onClick={onOpenCustomLibraryModal}
+                    className="w-full p-2 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold flex items-center justify-center gap-2 transition-colors shadow-sm"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                    <span>+ Створити власні меблі</span>
+                  </button>
+                )}
+
+                {/* Furniture Catalog Items */}
+                {FURNITURE_CATALOG.filter((item) =>
+                  selectedFurnitureCategory === 'all' ? true : item.category === selectedFurnitureCategory
+                ).map((item) => {
+                  const isSelected = selectedFurnitureItem?.id === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      onClick={() => onSelectFurnitureItem?.(item)}
+                      className={`w-full text-left p-2.5 rounded-lg border transition-all flex items-start gap-2.5 ${
+                        isSelected
+                          ? 'bg-neutral-800 border-sky-500/60 shadow-sm'
+                          : 'border-neutral-800/60 hover:bg-neutral-800/40 hover:border-neutral-700'
+                      }`}
+                    >
+                      <div
+                        className={`w-8 h-8 rounded flex items-center justify-center text-xs font-bold shrink-0 mt-0.5 ${
+                          isSelected ? 'bg-sky-500 text-neutral-950' : 'bg-neutral-800 text-neutral-300'
+                        }`}
+                      >
+                        🛋️
+                      </div>
+                      <div className="flex flex-col min-w-0 flex-1">
+                        <span className="text-xs font-medium text-neutral-100 truncate">{item.name}</span>
+                        <span className="text-[11px] text-neutral-400 line-clamp-1">{item.shortDesc}</span>
+                        <div className="flex items-center gap-2 mt-1 text-[10px] text-sky-400 font-mono">
+                          <span>{item.defaultWidthMm}×{item.defaultHeightMm} мм</span>
+                          <span>·</span>
+                          <span className="text-neutral-400 font-normal">{item.badge}</span>
+                        </div>
+                        {item.electricalHints && item.electricalHints.length > 0 && (
+                          <div className="mt-1 text-[9.5px] text-amber-400 flex items-center gap-1">
+                            <span>⚡</span>
+                            <span className="truncate">{item.electricalHints[0]}</span>
+                          </div>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+
+                {/* Custom Furniture from customLibrary */}
+                {customLibraryItems.filter((i) => i.kind === 'furniture').length > 0 && (
+                  <div className="pt-2 border-t border-neutral-800">
+                    <div className="text-[10px] font-bold text-amber-400 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                      <Sparkles className="w-3 h-3" />
+                      <span>Власні меблі ({customLibraryItems.filter((i) => i.kind === 'furniture').length})</span>
+                    </div>
+                    {customLibraryItems
+                      .filter((i) => i.kind === 'furniture')
+                      .map((cItem) => {
+                        const fakePreset: FurnitureCatalogItem = {
+                          id: cItem.id,
+                          name: cItem.name,
+                          category: (cItem.category as any) || 'custom',
+                          type: (cItem.furnitureType as any) || 'desk',
+                          defaultWidthMm: cItem.widthMm || 1200,
+                          defaultHeightMm: cItem.heightMm || 600,
+                          cadShape: cItem.cadShape || 'generic',
+                          shortDesc: cItem.shortDesc || 'Власний блок',
+                          badge: `${cItem.widthMm}×${cItem.heightMm}`,
+                          electricalHints: cItem.electricalHints || [],
+                        };
+                        const isSelected = selectedFurnitureItem?.id === fakePreset.id;
+                        return (
+                          <button
+                            key={cItem.id}
+                            onClick={() => onSelectFurnitureItem?.(fakePreset)}
+                            className={`w-full text-left p-2.5 rounded-lg border transition-all flex items-start gap-2.5 mb-1.5 ${
+                              isSelected
+                                ? 'bg-neutral-800 border-amber-500/60 shadow-sm'
+                                : 'border-neutral-800/60 hover:bg-neutral-800/40 hover:border-neutral-700'
+                            }`}
+                          >
+                            <div className="w-8 h-8 rounded bg-amber-500/20 text-amber-300 flex items-center justify-center text-xs font-bold shrink-0 mt-0.5 border border-amber-500/30">
+                              ⭐
+                            </div>
+                            <div className="flex flex-col min-w-0 flex-1">
+                              <span className="text-xs font-medium text-white truncate">{cItem.name}</span>
+                              <div className="flex items-center gap-2 mt-0.5 text-[10px] text-amber-300 font-mono">
+                                <span>{cItem.widthMm}×{cItem.heightMm} мм</span>
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                  </div>
+                )}
+              </div>
+            ) : activeTool === 'room' ? (
+              <div className="space-y-2">
+                {onAutoDetectRooms && (
+                  <button
+                    onClick={onAutoDetectRooms}
+                    className="w-full p-2.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-500/40 text-sky-300 text-xs font-semibold flex items-center justify-center gap-2 transition-colors mb-2"
+                  >
+                    <Shapes className="w-3.5 h-3.5" />
+                    <span>Визначити кімнати за стінами</span>
+                  </button>
+                )}
+                {ROOM_PRESETS.map((rp) => {
+                  const isSelected = selectedRoomType === rp.type;
+                  return (
+                    <button
+                      key={rp.type}
+                      onClick={() => onSelectRoomType?.(rp.type)}
+                      className={`w-full text-left p-2.5 rounded-lg border transition-all flex items-start gap-2.5 ${
+                        isSelected
+                          ? 'bg-neutral-800 border-sky-500/60 shadow-sm'
+                          : 'border-neutral-800/60 hover:bg-neutral-800/40 hover:border-neutral-700'
+                      }`}
+                    >
+                      <div
+                        className={`w-7 h-7 rounded flex items-center justify-center text-xs font-bold shrink-0 mt-0.5 ${
+                          isSelected ? 'bg-sky-500 text-neutral-950' : 'bg-neutral-800 text-neutral-300'
+                        }`}
+                      >
+                        {rp.type === 'bathroom' ? '🚿' : rp.type === 'kitchen' ? '🍳' : rp.type === 'bedroom' ? '🛏️' : '🛋️'}
+                      </div>
+                      <div className="flex flex-col min-w-0">
+                        <span className="text-xs font-medium text-neutral-100 truncate">{rp.name}</span>
+                        <span className="text-[11px] text-neutral-400 line-clamp-1">{rp.desc}</span>
+                        <span className="text-[10px] text-sky-400 font-mono mt-0.5">{rp.badge}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : activeTool === 'door' || activeTool === 'window' ? (
               OPENINGS_CATALOG.filter((item) => item.type === activeTool).map((item) => {
                 const isSelected = selectedOpeningItem?.id === item.id || (!selectedOpeningItem && item.type === activeTool);
                 return (
@@ -401,43 +737,114 @@ export const CadTools: React.FC<CadToolsProps> = ({
                 );
               })
             ) : (
-              getCatalogItemsByCategory(activeTool as ElectricalCategory).map((item) => {
-                const isSelected = selectedCatalogItem?.type === item.type;
-                return (
+              <>
+                {/* Custom Library quick trigger button */}
+                {onOpenCustomLibraryModal && (
                   <button
-                    key={item.type}
-                    onClick={() => onSelectCatalogItem(item)}
-                    className={`w-full text-left p-2.5 rounded-lg border transition-all flex items-start gap-2.5 ${
-                      isSelected
-                        ? 'bg-neutral-800 border-sky-500/60 shadow-sm'
-                        : 'border-neutral-800/60 hover:bg-neutral-800/40 hover:border-neutral-700'
-                    }`}
+                    onClick={onOpenCustomLibraryModal}
+                    className="w-full p-2 mb-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold flex items-center justify-center gap-2 transition-colors shadow-sm"
                   >
-                    <div
-                      className={`w-7 h-7 rounded flex items-center justify-center text-xs font-mono font-bold shrink-0 mt-0.5 ${
-                        isSelected ? 'bg-sky-500 text-neutral-950' : 'bg-neutral-800 text-neutral-300'
+                    <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                    <span>+ Створити власний символ</span>
+                  </button>
+                )}
+
+                {/* Custom items matching electrical */}
+                {customLibraryItems.filter((i) => i.kind === 'electrical').length > 0 && (
+                  <div className="mb-2 pb-2 border-b border-neutral-800">
+                    <div className="text-[10px] font-bold text-amber-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+                      <Sparkles className="w-3 h-3" />
+                      <span>Власні символи ({customLibraryItems.filter((i) => i.kind === 'electrical').length})</span>
+                    </div>
+                    {customLibraryItems
+                      .filter((i) => i.kind === 'electrical')
+                      .map((cItem) => {
+                        const fakeCatItem: CatalogItem = {
+                          type: 'custom_element',
+                          category: (cItem.category as any) || 'custom',
+                          name: cItem.name,
+                          shortDesc: cItem.shortDesc || 'Власний елемент',
+                          defaultHeightMm: cItem.mountingHeightMm || 300,
+                          defaultPowerWatts: cItem.powerWatts || 500,
+                          defaultIpRating: cItem.ipRating || 'IP20',
+                          recommendedBreakerA: (cItem.recommendedBreakerA as any) || 16,
+                          recommendedCable: (cItem.recommendedCable as any) || 'VVGng_3x2.5',
+                          badge: cItem.phase === '3-phase' ? '3Ф' : '1Ф',
+                        };
+                        const isSelected = selectedCatalogItem?.name === cItem.name;
+                        return (
+                          <button
+                            key={cItem.id}
+                            onClick={() => onSelectCatalogItem(fakeCatItem)}
+                            className={`w-full text-left p-2 rounded-lg border transition-all flex items-start gap-2 mb-1 ${
+                              isSelected
+                                ? 'bg-neutral-800 border-amber-500/60 shadow-sm'
+                                : 'border-neutral-800/60 hover:bg-neutral-800/40 hover:border-neutral-700'
+                            }`}
+                          >
+                            <div
+                              className="w-7 h-7 rounded flex items-center justify-center text-xs font-bold shrink-0 mt-0.5 border"
+                              style={{
+                                backgroundColor: `${cItem.symbolColor || '#f59e0b'}20`,
+                                borderColor: cItem.symbolColor || '#f59e0b',
+                                color: cItem.symbolColor || '#f59e0b',
+                              }}
+                            >
+                              ⚡
+                            </div>
+                            <div className="flex flex-col min-w-0">
+                              <span className="text-xs font-semibold text-white truncate">{cItem.name}</span>
+                              <div className="flex items-center gap-1.5 text-[10px] text-amber-400 font-mono">
+                                <span>{cItem.powerWatts || 0} Вт</span>
+                                <span>·</span>
+                                <span>+{cItem.mountingHeightMm || 300} мм</span>
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                  </div>
+                )}
+
+                {/* Standard Catalog Items */}
+                {getCatalogItemsByCategory(activeTool as ElectricalCategory).map((item) => {
+                  const isSelected = selectedCatalogItem?.type === item.type;
+                  return (
+                    <button
+                      key={item.type}
+                      onClick={() => onSelectCatalogItem(item)}
+                      className={`w-full text-left p-2.5 rounded-lg border transition-all flex items-start gap-2.5 ${
+                        isSelected
+                          ? 'bg-neutral-800 border-sky-500/60 shadow-sm'
+                          : 'border-neutral-800/60 hover:bg-neutral-800/40 hover:border-neutral-700'
                       }`}
                     >
-                      {item.badge}
-                    </div>
-                    <div className="flex flex-col min-w-0">
-                      <span className="text-xs font-medium text-neutral-100 truncate">{item.name}</span>
-                      <span className="text-[11px] text-neutral-400 line-clamp-1">{item.shortDesc}</span>
-                      <div className="flex items-center gap-2 mt-1 text-[10px] text-neutral-500 font-mono">
-                        <span>+{item.defaultHeightMm} мм</span>
-                        <span>·</span>
-                        <span>{item.defaultIpRating}</span>
-                        {item.defaultPowerWatts > 0 && (
-                          <>
-                            <span>·</span>
-                            <span>{item.defaultPowerWatts} Вт</span>
-                          </>
-                        )}
+                      <div
+                        className={`w-7 h-7 rounded flex items-center justify-center text-xs font-mono font-bold shrink-0 mt-0.5 ${
+                          isSelected ? 'bg-sky-500 text-neutral-950' : 'bg-neutral-800 text-neutral-300'
+                        }`}
+                      >
+                        {item.badge}
                       </div>
-                    </div>
-                  </button>
-                );
-              })
+                      <div className="flex flex-col min-w-0">
+                        <span className="text-xs font-medium text-neutral-100 truncate">{item.name}</span>
+                        <span className="text-[11px] text-neutral-400 line-clamp-1">{item.shortDesc}</span>
+                        <div className="flex items-center gap-2 mt-1 text-[10px] text-neutral-500 font-mono">
+                          <span>+{item.defaultHeightMm} мм</span>
+                          <span>·</span>
+                          <span>{item.defaultIpRating}</span>
+                          {item.defaultPowerWatts > 0 && (
+                            <>
+                              <span>·</span>
+                              <span>{item.defaultPowerWatts} Вт</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </>
             )}
           </div>
 

@@ -1,4 +1,4 @@
-import { Point, Wall, ElectricalElement, WireRoute } from '../types/cad';
+import { Point, Wall, ElectricalElement, WireRoute, WallOpening } from '../types/cad';
 
 export const MM_PER_PX = 10; // 1 pixel in viewport = 10 millimeters in world (100px = 1 meter)
 
@@ -212,6 +212,8 @@ export function getCableDisplayName(cableType?: string): string {
       return 'ВВГнгд 3×6';
     case 'FTP_Cat5e':
       return 'FTP 4×2×0.51';
+    case 'KNX_Bus':
+      return 'KNX JY(St)Y 2×2×0.8';
     default:
       return cableType || 'ВВГнгд 3×2.5';
   }
@@ -232,6 +234,8 @@ export function getCableCrossSection(cableType?: string): string {
       return '3×6 мм²';
     case 'FTP_Cat5e':
       return 'Cat5e';
+    case 'KNX_Bus':
+      return 'KNX 2×2×0.8';
     default:
       return '3×2.5 мм²';
   }
@@ -443,3 +447,340 @@ export function findWallOpeningPlacement(
     distanceToEndMm: pxToMm(distToEndPx),
   };
 }
+
+/**
+ * Checks if two 2D line segments (p1-p2 and p3-p4) intersect
+ */
+export function doLineSegmentsIntersect(p1: Point, p2: Point, p3: Point, p4: Point): boolean {
+  const ccw = (a: Point, b: Point, c: Point) => {
+    return (c.y - a.y) * (b.x - a.x) > (b.y - a.y) * (c.x - a.x);
+  };
+  return ccw(p1, p3, p4) !== ccw(p2, p3, p4) && ccw(p1, p2, p3) !== ccw(p1, p2, p4);
+}
+
+/**
+ * Checks if a 2D line segment (u1, v1) to (u2, v2) intersects an axis-aligned box [-hw, hw] x [-ht, ht].
+ */
+function segmentIntersectsBox2D(u1: number, v1: number, u2: number, v2: number, hw: number, ht: number): boolean {
+  // Check if either endpoint is inside the box
+  if (Math.abs(u1) <= hw && Math.abs(v1) <= ht) return true;
+  if (Math.abs(u2) <= hw && Math.abs(v2) <= ht) return true;
+
+  // If both endpoints are on the same side outside the box, no intersection
+  if ((u1 < -hw && u2 < -hw) || (u1 > hw && u2 > hw)) return false;
+  if ((v1 < -ht && v2 < -ht) || (v1 > ht && v2 > ht)) return false;
+
+  const du = u2 - u1;
+  const dv = v2 - v1;
+  if (Math.abs(du) < 1e-6 && Math.abs(dv) < 1e-6) {
+    return Math.abs(u1) <= hw && Math.abs(v1) <= ht;
+  }
+
+  // Parameter t in [0, 1] for crossing u = -hw or u = +hw
+  if (Math.abs(du) > 1e-6) {
+    const tLeft = (-hw - u1) / du;
+    if (tLeft >= 0 && tLeft <= 1) {
+      const v = v1 + tLeft * dv;
+      if (v >= -ht && v <= ht) return true;
+    }
+    const tRight = (hw - u1) / du;
+    if (tRight >= 0 && tRight <= 1) {
+      const v = v1 + tRight * du;
+      if (v >= -ht && v <= ht) return true;
+    }
+  }
+
+  // Parameter t in [0, 1] for crossing v = -ht or v = +ht
+  if (Math.abs(dv) > 1e-6) {
+    const tBottom = (-ht - v1) / dv;
+    if (tBottom >= 0 && tBottom <= 1) {
+      const u = u1 + tBottom * du;
+      if (u >= -hw && u <= hw) return true;
+    }
+    const tTop = (ht - v1) / dv;
+    if (tTop >= 0 && tTop <= 1) {
+      const u = u1 + tTop * du;
+      if (u >= -hw && u <= hw) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Checks if a wire route intersects any door or window opening.
+ * Under Ukrainian PUE §2.1.52 & DBN V.2.5-23:2010, wall chases (штроби)
+ * cannot pass through doors (empty openings) or windows.
+ * Uses exact 2D oriented bounding volume test along the wall plane.
+ */
+export function checkChaseIntersectsOpening(
+  points: Point[],
+  walls: Wall[],
+  openings: WallOpening[]
+): { hasCollision: boolean; opening?: WallOpening; wall?: Wall } {
+  if (points.length < 2 || walls.length === 0 || openings.length === 0) {
+    return { hasCollision: false };
+  }
+
+  const wallMap = new Map<string, Wall>();
+  walls.forEach((w) => wallMap.set(w.id, w));
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const p1 = points[i];
+    const p2 = points[i + 1];
+
+    for (const op of openings) {
+      const wall = wallMap.get(op.wallId);
+      if (!wall) continue;
+
+      const wdx = wall.end.x - wall.start.x;
+      const wdy = wall.end.y - wall.start.y;
+      const wallLen = Math.hypot(wdx, wdy);
+      if (wallLen < 1e-4) continue;
+
+      // Unit vector along wall and unit normal
+      const ux = wdx / wallLen;
+      const uy = wdy / wallLen;
+      const nx = -uy;
+      const ny = ux;
+
+      // Center of the opening in 2D world coordinates
+      const cx = wall.start.x + wdx * op.positionRatio;
+      const cy = wall.start.y + wdy * op.positionRatio;
+
+      // Half-dimensions: width along wall + thickness across wall (+6px clearance margin)
+      const halfW = mmToPx(op.width) / 2 + 6;
+      const halfT = wall.thickness / (2 * MM_PER_PX) + 8;
+
+      // Transform segment endpoints into local opening coordinate frame (u, v)
+      const u1 = (p1.x - cx) * ux + (p1.y - cy) * uy;
+      const v1 = (p1.x - cx) * nx + (p1.y - cy) * ny;
+      const u2 = (p2.x - cx) * ux + (p2.y - cy) * uy;
+      const v2 = (p2.x - cx) * nx + (p2.y - cy) * ny;
+
+      if (segmentIntersectsBox2D(u1, v1, u2, v2, halfW, halfT)) {
+        return { hasCollision: true, opening: op, wall };
+      }
+    }
+  }
+
+  return { hasCollision: false };
+}
+
+/**
+ * Finds the midpoint and orientation of the longest straight segment in a polyline.
+ * Used for placing cable tags and callout badges with optimal readability.
+ */
+export function getLongestSegmentMidpoint(points: Point[]): {
+  midpoint: Point;
+  angleDeg: number;
+  length: number;
+  segmentIndex: number;
+} {
+  if (points.length < 2) {
+    return {
+      midpoint: points[0] || { x: 0, y: 0 },
+      angleDeg: 0,
+      length: 0,
+      segmentIndex: 0,
+    };
+  }
+
+  let maxLen = -1;
+  let bestMid: Point = { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2 };
+  let bestAngle = 0;
+  let bestIdx = 0;
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const len = Math.hypot(dx, dy);
+    if (len > maxLen) {
+      maxLen = len;
+      bestMid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+      let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+      // Flip upside down text
+      if (angle > 90 || angle < -90) {
+        angle += 180;
+      }
+      bestAngle = angle;
+      bestIdx = i;
+    }
+  }
+
+  return {
+    midpoint: bestMid,
+    angleDeg: bestAngle,
+    length: maxLen,
+    segmentIndex: bestIdx,
+  };
+}
+
+/**
+ * Resolves overlapping parallel wire segments.
+ * When multiple cables traverse the same wall corridor or segment, applies a perpendicular
+ * lateral shift (spacing 6px) so all cables in the bundle run visibly side-by-side.
+ * Strictly verifies that shifted traces never penetrate window or door openings.
+ */
+export function computeParallelBundleOffsets(
+  wires: WireRoute[],
+  elements: ElectricalElement[],
+  walls: Wall[] = [],
+  openings: WallOpening[] = []
+): Map<string, Point[]> {
+  const result = new Map<string, Point[]>();
+  const elMap = new Map<string, ElectricalElement>();
+  elements.forEach((e) => elMap.set(e.id, e));
+
+  // 1. Get raw points for all wires
+  const wirePoints = new Map<string, Point[]>();
+  wires.forEach((wire) => {
+    if (wire.points && wire.points.length >= 2) {
+      wirePoints.set(wire.id, [...wire.points]);
+    } else {
+      const fromEl = elMap.get(wire.fromId);
+      const toEl = elMap.get(wire.toId);
+      if (fromEl && toEl) {
+        const dx = Math.abs(toEl.position.x - fromEl.position.x);
+        const dy = Math.abs(toEl.position.y - fromEl.position.y);
+        let path: Point[];
+        if (dx < 5 || dy < 5) {
+          path = [fromEl.position, toEl.position];
+        } else if (dx > dy) {
+          path = [fromEl.position, { x: toEl.position.x, y: fromEl.position.y }, toEl.position];
+        } else {
+          path = [fromEl.position, { x: fromEl.position.x, y: toEl.position.y }, toEl.position];
+        }
+        wirePoints.set(wire.id, path);
+      }
+    }
+  });
+
+  interface SegmentRef {
+    wireId: string;
+    segIndex: number;
+    p1: Point;
+    p2: Point;
+    isHoriz: boolean;
+    coord: number;
+    spanMin: number;
+    spanMax: number;
+  }
+
+  const allSegments: SegmentRef[] = [];
+  wires.forEach((w) => {
+    if (w.mode === 'curve') return;
+    const pts = wirePoints.get(w.id);
+    if (!pts || pts.length < 2) return;
+
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const dx = Math.abs(p2.x - p1.x);
+      const dy = Math.abs(p2.y - p1.y);
+
+      if (dy < 4) {
+        allSegments.push({
+          wireId: w.id,
+          segIndex: i,
+          p1,
+          p2,
+          isHoriz: true,
+          coord: (p1.y + p2.y) / 2,
+          spanMin: Math.min(p1.x, p2.x),
+          spanMax: Math.max(p1.x, p2.x),
+        });
+      } else if (dx < 4) {
+        allSegments.push({
+          wireId: w.id,
+          segIndex: i,
+          p1,
+          p2,
+          isHoriz: false,
+          coord: (p1.x + p2.x) / 2,
+          spanMin: Math.min(p1.y, p2.y),
+          spanMax: Math.max(p1.y, p2.y),
+        });
+      }
+    }
+  });
+
+  const horizClusters: SegmentRef[][] = [];
+  const vertClusters: SegmentRef[][] = [];
+
+  allSegments.forEach((seg) => {
+    const list = seg.isHoriz ? horizClusters : vertClusters;
+    let found = false;
+    for (const cluster of list) {
+      const ref = cluster[0];
+      if (
+        Math.abs(ref.coord - seg.coord) <= 6 &&
+        seg.spanMax > ref.spanMin + 15 &&
+        seg.spanMin < ref.spanMax - 15
+      ) {
+        cluster.push(seg);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      list.push([seg]);
+    }
+  });
+
+  const segOffsets = new Map<string, number>();
+  const processClusters = (clusters: SegmentRef[][]) => {
+    clusters.forEach((cluster) => {
+      if (cluster.length <= 1) return;
+      const count = cluster.length;
+      cluster.forEach((seg, idx) => {
+        const lateralOffset = (idx - (count - 1) / 2) * 6; // 6px perpendicular spacing
+        segOffsets.set(`${seg.wireId}_${seg.segIndex}`, lateralOffset);
+      });
+    });
+  };
+
+  processClusters(horizClusters);
+  processClusters(vertClusters);
+
+  wires.forEach((w) => {
+    const pts = wirePoints.get(w.id);
+    if (!pts || pts.length < 2) return;
+
+    if (w.mode === 'curve') {
+      result.set(w.id, pts);
+      return;
+    }
+
+    const newPts: Point[] = pts.map((p) => ({ ...p }));
+    for (let i = 0; i < pts.length - 1; i++) {
+      const offset = segOffsets.get(`${w.id}_${i}`);
+      if (offset && Math.abs(offset) > 0.1) {
+        const isHoriz = Math.abs(pts[i + 1].y - pts[i].y) < 4;
+        if (isHoriz) {
+          if (i > 0) newPts[i].y += offset;
+          if (i + 1 < pts.length - 1) newPts[i + 1].y += offset;
+        } else {
+          if (i > 0) newPts[i].x += offset;
+          if (i + 1 < pts.length - 1) newPts[i + 1].x += offset;
+        }
+      }
+    }
+
+    // STRICT PUE VERIFICATION: If shifted polyline penetrates any opening, revert to original safe pts!
+    if (walls.length > 0 && openings.length > 0) {
+      const coll = checkChaseIntersectsOpening(newPts, walls, openings);
+      if (coll.hasCollision) {
+        result.set(w.id, pts);
+        return;
+      }
+    }
+
+    result.set(w.id, newPts);
+  });
+
+  return result;
+}
+

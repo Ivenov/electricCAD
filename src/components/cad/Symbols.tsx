@@ -373,11 +373,59 @@ export const ElectricalSymbol: React.FC<SymbolProps> = ({
         );
 
       case 'junction_box':
+      case 'junction_box_light':
+      case 'junction_box_power':
+      case 'junction_box_waterproof':
         return (
           <g>
-            <circle cx="0" cy="0" r={half * 0.45} fill="#1e293b" stroke="currentColor" strokeWidth="2" />
-            <line x1={-half * 0.3} y1="0" x2={half * 0.3} y2="0" stroke="currentColor" strokeWidth="1.5" />
-            <line x1="0" y1={-half * 0.3} x2="0" y2={half * 0.3} stroke="currentColor" strokeWidth="1.5" />
+            <circle
+              cx="0"
+              cy="0"
+              r={half * 0.45}
+              fill={type === 'junction_box_waterproof' ? 'rgba(16, 185, 129, 0.3)' : '#1e293b'}
+              stroke={
+                type === 'junction_box_light'
+                  ? '#eab308'
+                  : type === 'junction_box_power'
+                  ? '#38bdf8'
+                  : type === 'junction_box_waterproof'
+                  ? '#10b981'
+                  : 'currentColor'
+              }
+              strokeWidth="2"
+            />
+            <line
+              x1={-half * 0.3}
+              y1="0"
+              x2={half * 0.3}
+              y2="0"
+              stroke={
+                type === 'junction_box_light'
+                  ? '#eab308'
+                  : type === 'junction_box_power'
+                  ? '#38bdf8'
+                  : type === 'junction_box_waterproof'
+                  ? '#10b981'
+                  : 'currentColor'
+              }
+              strokeWidth="1.5"
+            />
+            <line
+              x1="0"
+              y1={-half * 0.3}
+              x2="0"
+              y2={half * 0.3}
+              stroke={
+                type === 'junction_box_light'
+                  ? '#eab308'
+                  : type === 'junction_box_power'
+                  ? '#38bdf8'
+                  : type === 'junction_box_waterproof'
+                  ? '#10b981'
+                  : 'currentColor'
+              }
+              strokeWidth="1.5"
+            />
           </g>
         );
 

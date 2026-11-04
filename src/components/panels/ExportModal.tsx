@@ -1,7 +1,15 @@
-import React, { useRef } from 'react';
-import { Download, Printer, FileJson, Upload, FileCode, BookOpen, Layers, Box } from 'lucide-react';
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useRef, useState } from 'react';
+import { Download, Printer, FileJson, Upload, FileCode, Image as ImageIcon, FileSpreadsheet, AlertCircle, Box } from 'lucide-react';
 import { CadProject } from '../../types/cad';
 import { downloadDxfFile } from '../../utils/dxfExport';
+import { downloadIfcFile } from '../../utils/ifcExport';
+import { generateCadProjectSvg } from '../../utils/svgExport';
+import { validateAndParseProjectJson } from '../../utils/storage';
 
 interface ExportModalProps {
   project: CadProject;
@@ -21,6 +29,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   onClose,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importErrors, setImportErrors] = useState<string[]>([]);
 
   // 1. Export as JSON
   const handleExportJson = () => {
@@ -33,52 +42,83 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     downloadAnchor.remove();
   };
 
-  // 2. Import JSON
+  // 2. Import JSON with Schema Validation and in-modal error handling
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    setImportErrors([]);
     const reader = new FileReader();
     reader.onload = (event) => {
-      try {
-        const json = JSON.parse(event.target?.result as string);
-        if (json.walls && json.elements) {
-          onImportProject(json);
-          onClose();
-        } else {
-          alert('Невірний формат файлу проекту CAD.');
-        }
-      } catch (err) {
-        alert('Помилка при читанні JSON файлу.');
+      const content = event.target?.result as string;
+      const res = validateAndParseProjectJson(content);
+      if (res.valid && res.project) {
+        onImportProject(res.project);
+        onClose();
+      } else {
+        setImportErrors(res.errors);
       }
     };
     reader.readAsText(file);
   };
 
-  // 3. Export SVG
+  // 3. Export SVG from CAD project model
   const handleExportSvg = () => {
-    const svgElement = document.querySelector('svg.pointer-events-auto') as SVGSVGElement;
-    if (!svgElement) return;
-
-    const serializer = new XMLSerializer();
-    let source = serializer.serializeToString(svgElement);
-
-    if (!source.match(/^<svg[^>]+xmlns="http\:\/\/www\.w3\.org\/2000\/svg"/)) {
-      source = source.replace(/^<svg/, '<svg xmlns="http://www.w3.org/2000/svg"');
-    }
-
-    const svgBlob = new Blob([source], { type: 'image/svg+xml;charset=utf-8' });
+    const svgContent = generateCadProjectSvg(project);
+    const svgBlob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
     const url = URL.createObjectURL(svgBlob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `${project.title.replace(/\s+/g, '_')}_Blueprint.svg`;
+    link.download = `${project.title.replace(/\s+/g, '_')}_Векторне_креслення.svg`;
     document.body.appendChild(link);
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
   };
 
-  // 4. Print layout
+  // 4. Export PNG canvas snapshot
+  const handleExportPng = () => {
+    // Шукаємо Konva або будь-який HTML5 canvas на сторінці
+    const canvas = document.querySelector('.konvajs-content canvas') as HTMLCanvasElement || document.querySelector('canvas') as HTMLCanvasElement;
+    if (canvas) {
+      const dataUrl = canvas.toDataURL('image/png', 1.0);
+      const link = document.createElement('a');
+      link.href = dataUrl;
+      link.download = `${project.title.replace(/\s+/g, '_')}_План_електрики.png`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      return;
+    }
+
+    // Якщо канвас не знайдено (наприклад SVG режим), конвертуємо SVG у PNG через Image
+    const svgContent = generateCadProjectSvg(project);
+    const svgBlob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+    const img = new Image();
+    img.onload = () => {
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = img.width || 1920;
+      tempCanvas.height = img.height || 1080;
+      const ctx = tempCanvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+        ctx.drawImage(img, 0, 0);
+        const dataUrl = tempCanvas.toDataURL('image/png', 1.0);
+        const link = document.createElement('a');
+        link.href = dataUrl;
+        link.download = `${project.title.replace(/\s+/g, '_')}_План_електрики.png`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      }
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  };
+
+  // 5. Print layout
   const handlePrint = () => {
     window.print();
   };
@@ -93,8 +133,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <Download className="w-4 h-4" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-white font-display">Експорт та друк проекту</h2>
-              <p className="text-xs text-neutral-400">Збереження креслень, специфікацій та файлів даних</p>
+              <h2 className="text-base font-bold text-white font-display">Експорт та збереження проекту</h2>
+              <p className="text-xs text-neutral-400">Формати AutoCAD, векторний SVG, растровий PNG та проектні дані JSON</p>
             </div>
           </div>
           <button
@@ -106,147 +146,113 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         </div>
 
         {/* Content */}
-        <div className="p-6 space-y-3">
-          {/* DSTU Full Drawing Album */}
-          {onOpenDstuAlbum && (
-            <button
-              onClick={() => {
-                onOpenDstuAlbum();
-                onClose();
-              }}
-              className="w-full p-3.5 rounded-xl border border-sky-500/40 bg-sky-950/30 hover:bg-sky-950/50 hover:border-sky-400 flex items-center gap-3.5 text-left transition-colors group"
-            >
-              <div className="w-9 h-9 rounded-lg bg-sky-500/20 border border-sky-500/40 flex items-center justify-center text-sky-400 shrink-0">
-                <BookOpen className="w-4 h-4" />
+        <div className="p-6 space-y-4">
+          {importErrors.length > 0 && (
+            <div className="p-3.5 rounded-lg bg-rose-950/40 border border-rose-800/80 flex items-start gap-2.5 text-xs text-rose-200">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-bold">Помилка валідації файлу проекту:</div>
+                <ul className="list-disc list-inside mt-1 space-y-0.5 text-[11px] text-rose-300">
+                  {importErrors.map((err, idx) => (
+                    <li key={idx}>{err}</li>
+                  ))}
+                </ul>
               </div>
-              <div className="flex-1">
-                <div className="text-xs font-bold text-white group-hover:text-sky-300 transition-colors flex items-center gap-2">
-                  <span>Альбом креслень за стандартом ДСТУ (5 аркушів)</span>
-                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-sky-500/30 text-sky-200 border border-sky-400/40 font-mono">
-                    А4 / А3
-                  </span>
-                </div>
-                <div className="text-[11px] text-neutral-300">
-                  Повний комплект: пояснювальна записка, плани розеток та освітлення, однолінійна схема щита, кабельний журнал
-                </div>
-              </div>
-            </button>
+            </div>
           )}
 
-          {/* 3D Chases & Cables Visualization */}
-          {onOpen3DView && (
+          <div className="grid grid-cols-2 gap-3">
+            {/* AutoCAD DXF Export */}
             <button
               onClick={() => {
+                downloadDxfFile(project);
                 onClose();
-                onOpen3DView();
               }}
-              className="w-full p-3.5 rounded-xl border border-cyan-500/40 bg-gradient-to-r from-cyan-950/40 via-cyan-900/20 to-neutral-950 hover:border-cyan-400 flex items-center gap-3.5 text-left transition-colors group shadow-lg shadow-cyan-950/30"
+              className="p-4 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800/80 hover:border-amber-500/40 transition-all text-left group flex flex-col justify-between"
             >
-              <div className="w-9 h-9 rounded-lg bg-cyan-950/80 border border-cyan-500/40 flex items-center justify-center text-cyan-400 shrink-0 shadow-sm">
-                <Box className="w-4 h-4 text-cyan-400" />
+              <div className="flex items-center justify-between mb-2">
+                <FileCode className="w-6 h-6 text-amber-400 group-hover:scale-110 transition-transform" />
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300">.DXF</span>
               </div>
-              <div className="flex-1">
-                <div className="text-xs font-bold text-white group-hover:text-cyan-300 transition-colors flex items-center gap-2">
-                  <span>3D-Візуалізація штроблення та розведення</span>
-                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-500/30 text-cyan-200 border border-cyan-400/40 font-mono">
-                    Three.js WebGL
-                  </span>
-                </div>
-                <div className="text-[11px] text-neutral-300">
-                  Просторовий огляд: вертикальні опуски у штробах (25×25мм), гофра по стелі та в стяжці, щит ВРП та ДБЖ
-                </div>
+              <div>
+                <h4 className="text-xs font-bold text-neutral-200">Креслення AutoCAD</h4>
+                <p className="text-[11px] text-neutral-400 mt-0.5">Векторні шари стін, електроточок та трас кабелів</p>
               </div>
             </button>
-          )}
 
-          {/* AutoCAD DXF Export */}
-          <button
-            onClick={() => downloadDxfFile(project)}
-            className="w-full p-3.5 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800 hover:border-neutral-700 flex items-center gap-3.5 text-left transition-colors group"
-          >
-            <div className="w-9 h-9 rounded-lg bg-amber-950/50 border border-amber-800/60 flex items-center justify-center text-amber-400 shrink-0">
-              <FileCode className="w-4 h-4" />
-            </div>
-            <div className="flex-1">
-              <div className="text-xs font-bold text-neutral-100 group-hover:text-amber-400 transition-colors flex items-center gap-2">
-                <span>Експорт в AutoCAD (.DXF R12 / 2000)</span>
-                <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-mono">
-                  AutoCAD / LibreCAD
-                </span>
+            {/* PNG Image Export */}
+            <button
+              onClick={handleExportPng}
+              className="p-4 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800/80 hover:border-emerald-500/40 transition-all text-left group flex flex-col justify-between"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <ImageIcon className="w-6 h-6 text-emerald-400 group-hover:scale-110 transition-transform" />
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">.PNG</span>
               </div>
-              <div className="text-[11px] text-neutral-400">
-                Векторний CAD-файл із шарами стін (A-WALLS), розеток (E-SOCKETS), щита та кабельних трас (E-WIRING)
+              <div>
+                <h4 className="text-xs font-bold text-neutral-200">Зображення плану</h4>
+                <p className="text-[11px] text-neutral-400 mt-0.5">Висока роздільна здатність для замовника та презентацій</p>
               </div>
-            </div>
-          </button>
+            </button>
 
-          {/* AutoCAD DXF Import (Two-way architectural import) */}
-          {onOpenDxfImport && (
+            {/* SVG Vector Export */}
+            <button
+              onClick={handleExportSvg}
+              className="p-4 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800/80 hover:border-sky-500/40 transition-all text-left group flex flex-col justify-between"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <Download className="w-6 h-6 text-sky-400 group-hover:scale-110 transition-transform" />
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300">.SVG</span>
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-neutral-200">Векторний SVG</h4>
+                <p className="text-[11px] text-neutral-400 mt-0.5">Масштабоване креслення для друку та редагування</p>
+              </div>
+            </button>
+
+            {/* JSON Project Backup */}
+            <button
+              onClick={handleExportJson}
+              className="p-4 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800/80 hover:border-purple-500/40 transition-all text-left group flex flex-col justify-between"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <FileJson className="w-6 h-6 text-purple-400 group-hover:scale-110 transition-transform" />
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300">.JSON</span>
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-neutral-200">Файл проекту ElectroPlan</h4>
+                <p className="text-[11px] text-neutral-400 mt-0.5">Повна резервна копія даних із версією схеми</p>
+              </div>
+            </button>
+
+            {/* OpenBIM / IFC 4.3 Export */}
             <button
               onClick={() => {
+                downloadIfcFile(project);
                 onClose();
-                onOpenDxfImport();
               }}
-              className="w-full p-3.5 rounded-xl border border-emerald-500/40 bg-emerald-950/20 hover:bg-emerald-950/40 hover:border-emerald-400 flex items-center gap-3.5 text-left transition-colors group shadow-sm"
+              className="col-span-2 p-4 rounded-xl border border-sky-500/40 bg-sky-950/20 hover:bg-sky-900/40 transition-all text-left group flex items-center justify-between shadow-sm shadow-sky-950/50"
             >
-              <div className="w-9 h-9 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 shrink-0">
-                <FileCode className="w-4 h-4" />
-              </div>
-              <div className="flex-1">
-                <div className="text-xs font-bold text-neutral-100 group-hover:text-emerald-300 transition-colors flex items-center gap-2">
-                  <span>Двосторонній імпорт архітектурного DXF (.dxf)</span>
-                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-mono">
-                    Імпорт стін
-                  </span>
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-lg bg-sky-500/20 border border-sky-500/30 flex items-center justify-center text-sky-400">
+                  <Box className="w-5 h-5 text-sky-400 group-hover:scale-110 transition-transform" />
                 </div>
-                <div className="text-[11px] text-neutral-400">
-                  Розпізнавання стін, перегородок, дверей та вікон з креслень AutoCAD / ArchiCAD / Revit
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-xs font-bold text-white">OpenBIM / IFC 4.3 (ISO 16739-1:2024)</h4>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 font-semibold border border-sky-500/30">.IFC</span>
+                  </div>
+                  <p className="text-[11px] text-neutral-300 mt-0.5">
+                    3D-стіни, кімнати, електроточки та траси для Autodesk Revit, ArchiCAD, BlenderBIM
+                  </p>
                 </div>
               </div>
+              <Download className="w-4 h-4 text-sky-400 group-hover:translate-x-1 transition-transform" />
             </button>
-          )}
+          </div>
 
-          {/* SVG Vector */}
-          <button
-            onClick={handleExportSvg}
-            className="w-full p-3.5 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800 hover:border-neutral-700 flex items-center gap-3.5 text-left transition-colors group"
-          >
-            <div className="w-9 h-9 rounded-lg bg-sky-950/50 border border-sky-800/60 flex items-center justify-center text-sky-400 shrink-0">
-              <Layers className="w-4 h-4" />
-            </div>
-            <div className="flex-1">
-              <div className="text-xs font-bold text-neutral-100 group-hover:text-sky-400 transition-colors">
-                Векторне креслення SVG (Архітектурний план)
-              </div>
-              <div className="text-[11px] text-neutral-400">
-                Ідеально для масштабування без втрати якості та відкриття у векторних редакторах
-              </div>
-            </div>
-          </button>
-
-          {/* JSON File */}
-          <button
-            onClick={handleExportJson}
-            className="w-full p-3.5 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800 hover:border-neutral-700 flex items-center gap-3.5 text-left transition-colors group"
-          >
-            <div className="w-9 h-9 rounded-lg bg-amber-950/50 border border-amber-800/60 flex items-center justify-center text-amber-400 shrink-0">
-              <FileJson className="w-4 h-4" />
-            </div>
-            <div className="flex-1">
-              <div className="text-xs font-bold text-neutral-100 group-hover:text-amber-400 transition-colors">
-                Зберегти проект у файл JSON
-              </div>
-              <div className="text-[11px] text-neutral-400">
-                Повна база проекту: стіни, розетки, кабелі, групи та параметри щита
-              </div>
-            </div>
-          </button>
-
-          {/* Import JSON */}
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="w-full p-3.5 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800 hover:border-neutral-700 flex items-center gap-3.5 text-left transition-colors group"
-          >
+          {/* Import JSON File */}
+          <div className="pt-2 border-t border-neutral-800">
             <input
               type="file"
               ref={fileInputRef}
@@ -254,46 +260,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               accept=".json"
               className="hidden"
             />
-            <div className="w-9 h-9 rounded-lg bg-emerald-950/50 border border-emerald-800/60 flex items-center justify-center text-emerald-400 shrink-0">
-              <Upload className="w-4 h-4" />
-            </div>
-            <div className="flex-1">
-              <div className="text-xs font-bold text-neutral-100 group-hover:text-emerald-400 transition-colors">
-                Відкрити збережений проект (JSON)
-              </div>
-              <div className="text-[11px] text-neutral-400">
-                Завантажити створене раніше креслення з диска
-              </div>
-            </div>
-          </button>
-
-          {/* Print Sheet */}
-          <button
-            onClick={handlePrint}
-            className="w-full p-3.5 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800 hover:border-neutral-700 flex items-center gap-3.5 text-left transition-colors group"
-          >
-            <div className="w-9 h-9 rounded-lg bg-purple-950/50 border border-purple-800/60 flex items-center justify-center text-purple-400 shrink-0">
-              <Printer className="w-4 h-4" />
-            </div>
-            <div className="flex-1">
-              <div className="text-xs font-bold text-neutral-100 group-hover:text-purple-400 transition-colors">
-                Друк креслення (PDF / Принтер)
-              </div>
-              <div className="text-[11px] text-neutral-400">
-                Виведення на друк зі штампом ДСТУ та розмірами
-              </div>
-            </div>
-          </button>
-        </div>
-
-        {/* Footer */}
-        <div className="px-6 py-3.5 border-t border-neutral-800 bg-neutral-900 flex justify-end">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium transition-colors"
-          >
-            Закрити
-          </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="w-full p-3 rounded-xl border border-dashed border-neutral-700 hover:border-sky-500/60 bg-neutral-950 hover:bg-neutral-900/60 transition-colors flex items-center justify-center gap-2 text-xs font-semibold text-neutral-300"
+            >
+              <Upload className="w-4 h-4 text-sky-400" />
+              <span>Імпортувати збережений проект (.JSON)</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>

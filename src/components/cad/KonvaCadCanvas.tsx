@@ -10,6 +10,7 @@ import {
   Arc,
   Transformer,
   Image as KonvaImage,
+  Path as KonvaPath,
 } from 'react-konva';
 import Konva from 'konva';
 import {
@@ -23,8 +24,10 @@ import {
   CadTool,
   ViewFilterMode,
   Point,
+  LayerVisibilityConfig,
 } from '../../types/cad';
 import { KonvaElectricalSymbol } from './KonvaSymbols';
+import { KonvaFurnitureSymbol } from './KonvaFurnitureSymbols';
 import {
   distance,
   pxToMm,
@@ -39,10 +42,17 @@ import {
   WallSnapResult,
   getCableDisplayName,
   getCableCrossSection,
+  computeParallelBundleOffsets,
+  getLongestSegmentMidpoint,
+  closestPointOnSegment,
 } from '../../utils/cadMath';
 import { computeOrthogonalPath } from '../../utils/autoRouting';
 import { CatalogItem } from '../../data/electricalCatalog';
 import { OpeningCatalogItem } from '../../data/openingsCatalog';
+import { FurnitureCatalogItem } from '../../data/furnitureCatalog';
+import { calculatePolygonAreaM2 } from '../../utils/roomGeometry';
+import { ROOM_PRESETS } from '../toolbar/CadTools';
+import { CadRuler } from './CadRuler';
 
 interface KonvaCadCanvasProps {
   project: CadProject;
@@ -52,11 +62,25 @@ interface KonvaCadCanvasProps {
   selectedWallId: string | null;
   selectedOpeningId?: string | null;
   selectedOpeningPreset?: OpeningCatalogItem | null;
+  selectedRoomType?: Room['type'];
   selectedWireId?: string | null;
+  selectedFurnitureId?: string | null;
+  onSelectFurniture?: (id: string | null) => void;
+  selectedFurniturePreset?: FurnitureCatalogItem | null;
+  onAddFurniture?: (item: FurnitureItem) => void;
+  onUpdateFurniturePosition?: (id: string, newPos: Point, newRotation?: number) => void;
+  onDeleteFurniture?: (id: string) => void;
   viewFilter: ViewFilterMode;
   showDimensions: boolean;
   showHeights: boolean;
   showFurniture: boolean;
+  showAnnotations?: boolean;
+  cadStyle?: 'autocad' | 'modern';
+  layerVisibility?: LayerVisibilityConfig;
+  onToggleAnnotations?: () => void;
+  onToggleCadStyle?: () => void;
+  onOpenSwitchWiringDiagram?: (sw?: ElectricalElement) => void;
+  onOpenLayersModal?: () => void;
   gridSnapEnabled: boolean;
   onSelectElement: (id: string | null) => void;
   onSelectWall: (id: string | null) => void;
@@ -67,7 +91,9 @@ interface KonvaCadCanvasProps {
   onAddWall: (wall: Wall) => void;
   onAddOpening?: (opening: WallOpening) => void;
   onDeleteOpening?: (id: string) => void;
+  onAddRoom?: (room: Room) => void;
   onAddWire: (wire: WireRoute) => void;
+  onUpdateWire?: (wire: WireRoute) => void;
   onDeleteWire?: (id: string) => void;
   onDeleteElement: (id: string) => void;
   onUpdateBackgroundImage?: (updates: Partial<NonNullable<CadProject['backgroundImage']>>) => void;
@@ -83,11 +109,25 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   selectedWallId,
   selectedOpeningId,
   selectedOpeningPreset,
+  selectedRoomType = 'living',
   selectedWireId,
+  selectedFurnitureId,
+  onSelectFurniture,
+  selectedFurniturePreset,
+  onAddFurniture,
+  onUpdateFurniturePosition,
+  onDeleteFurniture,
   viewFilter,
   showDimensions,
   showHeights,
   showFurniture,
+  showAnnotations = true,
+  cadStyle = 'autocad',
+  layerVisibility,
+  onToggleAnnotations,
+  onToggleCadStyle,
+  onOpenSwitchWiringDiagram,
+  onOpenLayersModal,
   gridSnapEnabled,
   onSelectElement,
   onSelectWall,
@@ -98,7 +138,9 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   onAddWall,
   onAddOpening,
   onDeleteOpening,
+  onAddRoom,
   onAddWire,
+  onUpdateWire,
   onDeleteWire,
   onDeleteElement,
   onUpdateBackgroundImage,
@@ -112,6 +154,19 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   // Canvas size
   const [stageDimensions, setStageDimensions] = useState({ width: 1200, height: 800 });
 
+  // Rulers state
+  const [showRulers, setShowRulers] = useState(true);
+
+  // Compute parallel bundle offsets so overlapping cables separate into parallel traces
+  const bundleOffsetMap = useMemo(() => {
+    return computeParallelBundleOffsets(
+      project.wires,
+      project.elements,
+      project.walls,
+      project.openings
+    );
+  }, [project.wires, project.elements, project.walls, project.openings]);
+
   // Pan & Zoom
   const [scale, setScale] = useState(1.05);
   const [stagePos, setStagePos] = useState<Point>({ x: 100, y: 70 });
@@ -119,11 +174,14 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
 
   // Tool states
   const [wallStartPoint, setWallStartPoint] = useState<Point | null>(null);
+  const [roomDraftPoints, setRoomDraftPoints] = useState<Point[]>([]);
   const [wireSourceElementId, setWireSourceElementId] = useState<string | null>(null);
   const [wireDraftPoints, setWireDraftPoints] = useState<Point[]>([]);
   const [hoveredWireId, setHoveredWireId] = useState<string | null>(null);
   const [measureStartPoint, setMeasureStartPoint] = useState<Point | null>(null);
   const [mouseWorldPos, setMouseWorldPos] = useState<Point>({ x: 0, y: 0 });
+  const [mouseScreenPos, setMouseScreenPos] = useState<Point>({ x: -100, y: -100 });
+  const [isCursorInside, setIsCursorInside] = useState(false);
 
   // Advanced Wall Snapping & Openings states
   const [wallSnapResult, setWallSnapResult] = useState<WallSnapResult | null>(null);
@@ -159,6 +217,170 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     }
   }, [project.backgroundImage?.dataUrl]);
 
+  // Helper to complete a wire connection between two elements with custom waypoints
+  const completeWireConnection = useCallback(
+    (fromEl: ElectricalElement, toEl: ElectricalElement, customWaypoints?: Point[]) => {
+      // PUE Rule: Sockets and Switches / Luminaires must NEVER be connected together
+      const isSocketFrom = fromEl.category === 'socket';
+      const isSocketTo = toEl.category === 'socket';
+      const isSwitchOrLightFrom = fromEl.category === 'switch' || fromEl.category === 'light';
+      const isSwitchOrLightTo = toEl.category === 'switch' || toEl.category === 'light';
+
+      if ((isSocketFrom && isSwitchOrLightTo) || (isSwitchOrLightFrom && isSocketTo)) {
+        console.warn('PUE Violation: Sockets cannot be directly wired to switches or luminaires.');
+        setWireSourceElementId(null);
+        setWireDraftPoints([]);
+        return;
+      }
+
+      const isLightingControl =
+        (fromEl.category === 'switch' && toEl.category === 'light') ||
+        (fromEl.category === 'light' && toEl.category === 'switch') ||
+        (fromEl.category === 'light' && toEl.category === 'light');
+
+      const waypoints =
+        customWaypoints && customWaypoints.length > 1
+          ? [...customWaypoints, toEl.position]
+          : computeOrthogonalPath(fromEl.position, toEl.position, project.walls, project.openings);
+
+      const wireLength = calculateCableLengthM(
+        fromEl,
+        toEl,
+        project.ceilingHeightMm,
+        'ceiling',
+        isLightingControl ? undefined : waypoints
+      );
+
+      const matchedCircuit = project.circuits.find(
+        (c) => c.id === (toEl.circuitId || fromEl.circuitId)
+      );
+
+      const circuitWiresCount =
+        project.wires.filter((w) => w.circuitId === matchedCircuit?.id).length + 1;
+
+      const cableTag = matchedCircuit
+        ? `W${matchedCircuit.number}-${circuitWiresCount < 10 ? '0' : ''}${circuitWiresCount}`
+        : `W0-${project.wires.length + 1}`;
+
+      const newWire: WireRoute = {
+        id: 'wire_' + Date.now(),
+        fromId: fromEl.id,
+        toId: toEl.id,
+        points: isLightingControl ? undefined : waypoints,
+        mode: isLightingControl ? 'curve' : 'ortho',
+        conduit:
+          (fromEl.category === 'junction' && toEl.category === 'switch') ||
+          (fromEl.category === 'switch' && toEl.category === 'junction')
+            ? 'wall_chase'
+            : 'ceiling',
+        cableType:
+          fromEl.type === 'knx_actuator' ||
+          toEl.type === 'knx_actuator' ||
+          fromEl.type === 'knx_power_supply' ||
+          toEl.type === 'knx_power_supply' ||
+          fromEl.type === 'leak_sensor' ||
+          toEl.type === 'leak_sensor'
+            ? 'KNX_Bus'
+            : isLightingControl
+            ? 'VVGng_3x1.5'
+            : matchedCircuit?.cableType || 'VVGng_3x2.5',
+        busType:
+          fromEl.type === 'knx_actuator' ||
+          toEl.type === 'knx_actuator' ||
+          fromEl.type === 'knx_power_supply' ||
+          toEl.type === 'knx_power_supply' ||
+          fromEl.type === 'leak_sensor' ||
+          toEl.type === 'leak_sensor'
+            ? 'knx'
+            : 'power',
+        circuitId: toEl.circuitId || fromEl.circuitId,
+        switchGroupId: fromEl.switchGroupId || toEl.switchGroupId,
+        cableTag,
+        calculatedLengthM: wireLength,
+        isManual: true, // Marked as manual so user waypoint edits are never overwritten by auto-routing!
+      };
+
+      if (fromEl.category === 'switch' && toEl.category === 'light') {
+        const swGroup = fromEl.switchGroupId || `S_${fromEl.id.slice(-3)}`;
+        fromEl.switchGroupId = swGroup;
+        toEl.switchGroupId = swGroup;
+      }
+
+      onAddWire(newWire);
+      setWireSourceElementId(null);
+      setWireDraftPoints([]);
+    },
+    [project.walls, project.openings, project.ceilingHeightMm, project.circuits, project.wires, onAddWire]
+  );
+
+  // Finishes wire drafting to the nearest element or auto-created terminal junction box
+  const handleFinishDraftWire = useCallback(() => {
+    if (!wireSourceElementId) return;
+    const fromEl = project.elements.find((item) => item.id === wireSourceElementId);
+    if (!fromEl) {
+      setWireSourceElementId(null);
+      setWireDraftPoints([]);
+      return;
+    }
+
+    const lastPoint = wireDraftPoints[wireDraftPoints.length - 1] || mouseWorldPos;
+
+    // 1. Look for nearest existing electrical element (other than fromEl)
+    let candidateEl: ElectricalElement | null = null;
+    let minDistance = Infinity;
+
+    for (const el of project.elements) {
+      if (el.id === fromEl.id) continue;
+      // Prohibit matching incompatible element types (e.g. Socket to Switch/Light)
+      const isSocketFrom = fromEl.category === 'socket';
+      const isSocketTo = el.category === 'socket';
+      const isSwitchOrLightFrom = fromEl.category === 'switch' || fromEl.category === 'light';
+      const isSwitchOrLightTo = el.category === 'switch' || el.category === 'light';
+      if ((isSocketFrom && isSwitchOrLightTo) || (isSwitchOrLightFrom && isSocketTo)) {
+        continue;
+      }
+
+      const d = distance(el.position, lastPoint);
+      if (d < minDistance) {
+        minDistance = d;
+        candidateEl = el;
+      }
+    }
+
+    // If within reasonable proximity (e.g. 50px), connect to it!
+    if (candidateEl && minDistance < 50) {
+      completeWireConnection(fromEl, candidateEl, wireDraftPoints);
+      return;
+    }
+
+    // 2. Otherwise create a terminal junction box at lastPoint so the trace has a valid, renderable destination
+    const isLightingEl = fromEl.category === 'switch' || fromEl.category === 'light';
+    const termBox: ElectricalElement = {
+      id: `el_jb_term_${Date.now()}`,
+      category: 'junction',
+      type: isLightingEl ? 'junction_box_light' : 'junction_box',
+      name: isLightingEl ? 'Розподільча коробка освітлення (РК-L)' : 'Розподільчий вузол (РК)',
+      position: gridSnapEnabled ? snapPointToGrid(lastPoint, 10) : lastPoint,
+      rotation: 0,
+      mountingHeightMm: 2500,
+      powerWatts: 0,
+      ipRating: 'IP20',
+      circuitId: fromEl.circuitId,
+      label: isLightingEl ? 'РК-L' : 'РК',
+    };
+
+    onAddElement(termBox);
+    completeWireConnection(fromEl, termBox, wireDraftPoints);
+  }, [
+    wireSourceElementId,
+    wireDraftPoints,
+    mouseWorldPos,
+    project.elements,
+    gridSnapEnabled,
+    onAddElement,
+    completeWireConnection,
+  ]);
+
   // Spacebar pan and shortcuts listener
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -166,6 +388,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         setIsSpacePressed(true);
       } else if (e.key === 'Escape') {
         setWallStartPoint(null);
+        setRoomDraftPoints([]);
         setWireSourceElementId(null);
         setWireDraftPoints([]);
         setMeasureStartPoint(null);
@@ -173,6 +396,22 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         onSelectWall(null);
         onSelectOpening?.(null);
         onSelectWire?.(null);
+      } else if (e.key === 'Enter') {
+        if (activeTool === 'room' && roomDraftPoints.length >= 3) {
+          const area = calculatePolygonAreaM2(roomDraftPoints);
+          const preset = ROOM_PRESETS.find((r) => r.type === selectedRoomType) || ROOM_PRESETS[0];
+          const newRoom: Room = {
+            id: 'room_' + Date.now(),
+            name: preset.name.split('/')[0].trim(),
+            type: selectedRoomType || 'living',
+            points: roomDraftPoints,
+            areaM2: area,
+          };
+          onAddRoom?.(newRoom);
+          setRoomDraftPoints([]);
+        } else if (activeTool === 'wire' && wireSourceElementId) {
+          handleFinishDraftWire();
+        }
       } else if (e.key === 'Backspace' && wireSourceElementId) {
         // Step back intermediate waypoint
         setWireDraftPoints((prev) => {
@@ -207,6 +446,10 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
       window.removeEventListener('keyup', handleKeyUp);
     };
   }, [
+    activeTool,
+    roomDraftPoints,
+    selectedRoomType,
+    onAddRoom,
     selectedElementId,
     selectedOpeningId,
     selectedWireId,
@@ -218,6 +461,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     onSelectWall,
     onSelectOpening,
     onSelectWire,
+    handleFinishDraftWire,
   ]);
 
   // Attach transformer to selected element
@@ -298,6 +542,11 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   const handleStagePointerMove = () => {
     const worldPos = getWorldPointerPos();
     setMouseWorldPos(worldPos);
+    const screenPtr = stageRef.current?.getPointerPosition();
+    if (screenPtr) {
+      setMouseScreenPos(screenPtr);
+      if (!isCursorInside) setIsCursorInside(true);
+    }
 
     if (activeTool === 'wall') {
       // 1. Magnetic geometry snap
@@ -372,10 +621,57 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         return;
       }
 
-      // 2. WIRE ROUTING: Clicking empty canvas adds an intermediate corner turn (waypoint)
-      if (activeTool === 'wire' && wireSourceElementId) {
-        const nextWaypoint = gridSnapEnabled ? snapPointToGrid(worldPos, 10) : worldPos;
-        setWireDraftPoints((prev) => [...prev, nextWaypoint]);
+      // 1.5. ROOM TOOL (drawing room polygon vertices)
+      if (activeTool === 'room') {
+        const effectivePos = gridSnapEnabled ? snapPointToGrid(worldPos, 10) : worldPos;
+        if (roomDraftPoints.length >= 3 && distance(roomDraftPoints[0], effectivePos) < 25) {
+          // Close room!
+          const area = calculatePolygonAreaM2(roomDraftPoints);
+          const preset = ROOM_PRESETS.find((r) => r.type === selectedRoomType) || ROOM_PRESETS[0];
+          const newRoom: Room = {
+            id: 'room_' + Date.now(),
+            name: preset.name.split('/')[0].trim(),
+            type: selectedRoomType || 'living',
+            points: roomDraftPoints,
+            areaM2: area,
+          };
+          onAddRoom?.(newRoom);
+          setRoomDraftPoints([]);
+        } else {
+          setRoomDraftPoints((prev) => [...prev, effectivePos]);
+        }
+        return;
+      }
+
+      // 2. WIRE ROUTING: Clicking empty canvas adds an intermediate waypoint, or connects if near element
+      if (activeTool === 'wire') {
+        const effectivePos = gridSnapEnabled ? snapPointToGrid(worldPos, 10) : worldPos;
+
+        // If no source element yet, check if clicked near an element (within 40px)
+        if (!wireSourceElementId) {
+          const nearEl = project.elements.find((e) => distance(e.position, effectivePos) < 40);
+          if (nearEl) {
+            setWireSourceElementId(nearEl.id);
+            setWireDraftPoints([nearEl.position]);
+            return;
+          }
+          return;
+        }
+
+        // If source element exists, check if user clicked near another target element (within 35px)
+        const targetEl = project.elements.find(
+          (e) => e.id !== wireSourceElementId && distance(e.position, effectivePos) < 35
+        );
+        if (targetEl) {
+          const fromEl = project.elements.find((e) => e.id === wireSourceElementId);
+          if (fromEl) {
+            completeWireConnection(fromEl, targetEl, wireDraftPoints);
+          }
+          return;
+        }
+
+        // Otherwise add intermediate waypoint corner
+        setWireDraftPoints((prev) => [...prev, effectivePos]);
         return;
       }
 
@@ -408,8 +704,29 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
           finalWallId = wallSnap.wallId;
         }
 
+        const isLightingCategory =
+          selectedCatalogItem.category === 'light' ||
+          selectedCatalogItem.category === 'switch' ||
+          selectedCatalogItem.category === 'junction' ||
+          selectedCatalogItem.type.startsWith('junction_box') ||
+          selectedCatalogItem.type.startsWith('switch_') ||
+          selectedCatalogItem.type.startsWith('light_');
+
+        const isLightCircuit = (c: { cableType: string; breakerRatingA: number; name: string }) => {
+          const cName = c.name.toLowerCase();
+          return (
+            c.cableType === 'VVGng_3x1.5' ||
+            c.breakerRatingA <= 10 ||
+            cName.includes('освіт') ||
+            cName.includes('світл') ||
+            cName.includes('освещ') ||
+            cName.includes('свет') ||
+            cName.includes('light')
+          );
+        };
+
         const matchedCircuit = project.circuits.find((c) =>
-          selectedCatalogItem.category === 'light' ? c.cableType === 'VVGng_3x1.5' : c.breakerRatingA >= 16
+          isLightingCategory ? isLightCircuit(c) : (!isLightCircuit(c) && c.breakerRatingA >= 16)
         );
 
         const newElement: ElectricalElement = {
@@ -431,12 +748,32 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         return;
       }
 
+      // 5. PLACING NEW FURNITURE
+      if (activeTool === 'furniture' && selectedFurniturePreset) {
+        const newFurniture: FurnitureItem = {
+          id: `furn_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          type: selectedFurniturePreset.type,
+          name: selectedFurniturePreset.name,
+          category: selectedFurniturePreset.category,
+          position: effectivePos,
+          width: selectedFurniturePreset.defaultWidthMm,
+          height: selectedFurniturePreset.defaultHeightMm,
+          rotation: 0,
+          cadShape: selectedFurniturePreset.cadShape,
+          electricalHints: selectedFurniturePreset.electricalHints,
+        };
+        onAddFurniture?.(newFurniture);
+        onSelectFurniture?.(newFurniture.id);
+        return;
+      }
+
       // Deselect if clicked on empty canvas in select mode
       if (activeTool === 'select') {
         onSelectElement(null);
         onSelectWall(null);
         onSelectOpening?.(null);
         onSelectWire?.(null);
+        onSelectFurniture?.(null);
       }
     }
   };
@@ -461,61 +798,8 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
       } else if (wireSourceElementId !== el.id) {
         const fromEl = project.elements.find((item) => item.id === wireSourceElementId);
         if (fromEl) {
-          const isLightingControl =
-            (fromEl.category === 'switch' && el.category === 'light') ||
-            (fromEl.category === 'light' && el.category === 'switch') ||
-            (fromEl.category === 'light' && el.category === 'light');
-
-          const fullPoints = wireDraftPoints.length > 1
-            ? [...wireDraftPoints, el.position]
-            : computeOrthogonalPath(fromEl.position, el.position, project.walls);
-
-          const wireLength = calculateCableLengthM(
-            fromEl,
-            el,
-            project.ceilingHeightMm,
-            'ceiling',
-            isLightingControl ? undefined : fullPoints
-          );
-
-          const matchedCircuit = project.circuits.find(
-            (c) => c.id === (el.circuitId || fromEl.circuitId)
-          );
-
-          const circuitWiresCount = project.wires.filter(
-            (w) => w.circuitId === matchedCircuit?.id
-          ).length + 1;
-
-          const cableTag = matchedCircuit
-            ? `W${matchedCircuit.number}-${circuitWiresCount < 10 ? '0' : ''}${circuitWiresCount}`
-            : `W0-${project.wires.length + 1}`;
-
-          const newWire: WireRoute = {
-            id: 'wire_' + Date.now(),
-            fromId: fromEl.id,
-            toId: el.id,
-            points: isLightingControl ? undefined : fullPoints,
-            mode: isLightingControl ? 'curve' : 'ortho',
-            conduit: 'ceiling',
-            cableType: isLightingControl
-              ? 'VVGng_3x1.5'
-              : (matchedCircuit?.cableType || 'VVGng_3x2.5'),
-            circuitId: el.circuitId || fromEl.circuitId,
-            switchGroupId: fromEl.switchGroupId || el.switchGroupId,
-            cableTag,
-            calculatedLengthM: wireLength,
-          };
-
-          if (fromEl.category === 'switch' && el.category === 'light') {
-            const swGroup = fromEl.switchGroupId || `S_${fromEl.id.slice(-3)}`;
-            fromEl.switchGroupId = swGroup;
-            el.switchGroupId = swGroup;
-          }
-
-          onAddWire(newWire);
+          completeWireConnection(fromEl, el, wireDraftPoints);
         }
-        setWireSourceElementId(null);
-        setWireDraftPoints([]);
       }
       return;
     }
@@ -554,27 +838,80 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   // Filter visible elements
   const filteredElements = useMemo(() => {
     return project.elements.filter((el) => {
+      // Granular Layer Visibility filter
+      if (layerVisibility) {
+        if (el.category === 'socket' || el.category === 'appliance' || el.category === 'backup') {
+          if (!layerVisibility.sockets) return false;
+        } else if (el.category === 'switch') {
+          if (!layerVisibility.switches) return false;
+        } else if (el.category === 'light') {
+          if (!layerVisibility.lights) return false;
+        }
+      }
+
       if (viewFilter === 'all') return true;
       if (viewFilter === 'sockets') return el.category === 'socket' || el.category === 'panel' || el.category === 'appliance';
       if (viewFilter === 'lighting') return el.category === 'light' || el.category === 'switch' || el.category === 'panel';
       return true;
     });
-  }, [project.elements, viewFilter]);
+  }, [project.elements, viewFilter, layerVisibility]);
 
   // Filter visible wires
   const filteredWires = useMemo(() => {
-    if (viewFilter === 'sockets') return project.wires.filter((w) => w.cableType !== 'VVGng_3x1.5');
-    if (viewFilter === 'lighting') return project.wires.filter((w) => w.cableType === 'VVGng_3x1.5' || w.mode === 'curve');
-    return project.wires;
-  }, [project.wires, viewFilter]);
+    return project.wires.filter((w) => {
+      // Granular Layer Visibility filter
+      if (layerVisibility) {
+        const isLighting = w.mode === 'curve';
+        if (isLighting && !layerVisibility.wiresLighting) return false;
+        if (!isLighting && !layerVisibility.wiresPower) return false;
+        if (w.conduit === 'wall_chase' && !layerVisibility.conduitChase) return false;
+        if (w.conduit === 'ceiling' && !layerVisibility.conduitCeiling) return false;
+        if (w.conduit === 'floor' && !layerVisibility.conduitFloor) return false;
+      }
+
+      if (viewFilter === 'sockets') return w.cableType !== 'VVGng_3x1.5';
+      if (viewFilter === 'lighting') return w.cableType === 'VVGng_3x1.5' || w.mode === 'curve';
+      return true;
+    });
+  }, [project.wires, viewFilter, layerVisibility]);
+
+  // Stage Double Click (finish manual wire routing to nearest element or create terminal node)
+  const handleStageDblClick = () => {
+    if (activeTool === 'wire' && wireSourceElementId) {
+      handleFinishDraftWire();
+    }
+  };
 
   return (
     <div
       ref={containerRef}
-      className={`relative w-full h-full overflow-hidden select-none cad-grid-dark ${
-        isSpacePressed || activeTool === 'pan' ? 'cursor-grab' : 'cursor-crosshair'
-      }`}
+      onMouseEnter={() => setIsCursorInside(true)}
+      onMouseLeave={() => setIsCursorInside(false)}
+      className={`relative w-full h-full overflow-hidden select-none ${
+        cadStyle === 'autocad' ? 'bg-[#0c0d10]' : 'cad-grid-dark'
+      } ${isSpacePressed || activeTool === 'pan' ? 'cursor-grab' : 'cursor-crosshair'}`}
     >
+      {/* AutoCAD Full-screen Crosshair Cursor & Center Pickbox Overlay */}
+      {cadStyle === 'autocad' && isCursorInside && !isSpacePressed && activeTool !== 'pan' && (
+        <div className="absolute inset-0 pointer-events-none z-30 overflow-hidden">
+          {/* Horizontal Hairline */}
+          <div
+            className="absolute left-0 right-0 h-px bg-slate-200/40"
+            style={{ top: `${mouseScreenPos.y}px` }}
+          />
+          {/* Vertical Hairline */}
+          <div
+            className="absolute top-0 bottom-0 w-px bg-slate-200/40"
+            style={{ left: `${mouseScreenPos.x}px` }}
+          />
+          {/* Center Pickbox */}
+          <div
+            className="absolute w-2.5 h-2.5 border border-slate-100 bg-transparent -translate-x-1/2 -translate-y-1/2 shadow-sm"
+            style={{ left: `${mouseScreenPos.x}px`, top: `${mouseScreenPos.y}px` }}
+          />
+        </div>
+      )}
+
       <Stage
         ref={stageRef}
         width={stageDimensions.width}
@@ -586,6 +923,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         draggable={activeTool === 'pan' || isSpacePressed}
         onWheel={handleWheel}
         onClick={handleStageClick}
+        onDblClick={handleStageDblClick}
         onMouseMove={handleStagePointerMove}
         onDragEnd={(e) => {
           if (e.target === stageRef.current) {
@@ -631,7 +969,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         {/* LAYER 2: BACKGROUND BLUEPRINT PLAN (CUSTOM IMAGE)        */}
         {/* ======================================================== */}
         <Layer id="backgroundBlueprintLayer">
-          {bgHtmlImage && project.backgroundImage && (
+          {(layerVisibility?.blueprint ?? true) && bgHtmlImage && project.backgroundImage && (
             <KonvaImage
               image={bgHtmlImage}
               x={project.backgroundImage.x}
@@ -656,7 +994,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         {/* ======================================================== */}
         <Layer id="architecturePlanLayer">
           {/* Rooms with areas */}
-          {project.rooms.map((room) => {
+          {(layerVisibility?.rooms ?? true) && project.rooms.map((room) => {
             const flatPoints = room.points.flatMap((p) => [p.x, p.y]);
             const avgX = room.points.reduce((sum, p) => sum + p.x, 0) / room.points.length;
             const avgY = room.points.reduce((sum, p) => sum + p.y, 0) / room.points.length;
@@ -713,46 +1051,56 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             );
           })}
 
-          {/* Furniture Blocks */}
-          {showFurniture &&
-            project.furniture.map((item) => {
-              const halfW = item.width / 20;
-              const halfH = item.height / 20;
+          {/* Active room polygon drawing draft */}
+          {roomDraftPoints.length > 0 && (
+            <Group listening={false}>
+              <Line
+                points={[...roomDraftPoints.flatMap((p) => [p.x, p.y]), mouseWorldPos.x, mouseWorldPos.y]}
+                stroke="#38bdf8"
+                strokeWidth={2}
+                dash={[6, 3]}
+                fill="rgba(56, 189, 248, 0.12)"
+              />
+              {roomDraftPoints.map((pt, i) => (
+                <Circle
+                  key={i}
+                  x={pt.x}
+                  y={pt.y}
+                  r={i === 0 ? 6 : 4}
+                  fill={i === 0 ? '#38bdf8' : '#ffffff'}
+                  stroke="#0284c7"
+                  strokeWidth={2}
+                />
+              ))}
+            </Group>
+          )}
 
-              return (
-                <Group
-                  key={item.id}
-                  x={item.position.x}
-                  y={item.position.y}
-                  rotation={item.rotation}
-                  opacity={0.4}
-                  listening={false}
-                >
-                  <Rect
-                    x={-halfW}
-                    y={-halfH}
-                    width={halfW * 2}
-                    height={halfH * 2}
-                    cornerRadius={4}
-                    fill="#1e293b"
-                    stroke="#475569"
-                    strokeWidth={1.5}
-                  />
-                  <Text
-                    x={-halfW}
-                    y={-4}
-                    width={halfW * 2}
-                    text={item.name}
-                    fontSize={8}
-                    fill="#94a3b8"
-                    align="center"
-                  />
-                </Group>
-              );
-            })}
+          {/* Furniture & Plumbing CAD Blocks */}
+          {(layerVisibility ? layerVisibility.furniture : showFurniture) &&
+            project.furniture &&
+            project.furniture.map((item) => (
+              <KonvaFurnitureSymbol
+                key={item.id}
+                item={item}
+                isSelected={selectedFurnitureId === item.id}
+                isDraggable={activeTool === 'select'}
+                onSelect={() => {
+                  if (activeTool === 'select') {
+                    onSelectFurniture?.(item.id);
+                    onSelectElement(null);
+                    onSelectWall(null);
+                    onSelectOpening?.(null);
+                    onSelectWire?.(null);
+                  }
+                }}
+                onDragEnd={(newPos) => {
+                  onUpdateFurniturePosition?.(item.id, newPos);
+                }}
+              />
+            ))}
 
           {/* Walls */}
-          {project.walls.map((wall) => {
+          {(layerVisibility?.walls ?? true) && project.walls.map((wall) => {
             const isSelected = selectedWallId === wall.id;
             const wallLengthMm = pxToMm(distance(wall.start, wall.end));
             const strokeW = wall.thickness / MM_PER_PX;
@@ -788,7 +1136,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                 />
 
                 {/* Wall length dimension tag */}
-                {showDimensions && wallLengthMm > 400 && (
+                {(layerVisibility ? layerVisibility.dimensions : showDimensions) && wallLengthMm > 400 && (
                   <Group
                     x={(wall.start.x + wall.end.x) / 2}
                     y={(wall.start.y + wall.end.y) / 2}
@@ -821,7 +1169,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
           })}
 
           {/* Openings (Doors & Windows) */}
-          {project.openings.map((op) => {
+          {(layerVisibility?.openings ?? true) && project.openings.map((op) => {
             const wall = wallMap.get(op.wallId);
             if (!wall) return null;
 
@@ -933,21 +1281,20 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         </Layer>
 
         {/* ======================================================== */}
-        {/* LAYER 4: WIRING & CONNECTIONS (Orthogonal with Turns & Badges) */}
+        {/* LAYER 4: WIRING & CONNECTIONS (Bundle Offsets, Draggable Handles, Badges) */}
         {/* ======================================================== */}
         <Layer id="wiresConnectionsLayer">
-          {filteredWires.map((wire) => {
+          {filteredWires.map((wire, wireIdx) => {
             const fromEl = project.elements.find((e) => e.id === wire.fromId);
             const toEl = project.elements.find((e) => e.id === wire.toId);
             if (!fromEl || !toEl) return null;
 
             const circuit = project.circuits.find((c) => c.id === wire.circuitId);
-            const wireColor = circuit?.color || (wire.mode === 'curve' ? '#fbbf24' : '#38bdf8');
             const isLighting = wire.mode === 'curve';
             const isSelected = selectedWireId === wire.id;
             const isHovered = hoveredWireId === wire.id;
 
-            // Calculate bezier control point or multi-point ortho path
+            // Calculate bezier control point for curved lighting wire
             const midX = (fromEl.position.x + toEl.position.x) / 2;
             const midY = (fromEl.position.y + toEl.position.y) / 2;
             const dx = toEl.position.x - fromEl.position.x;
@@ -955,165 +1302,552 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             const dist = Math.hypot(dx, dy);
             const nx = -dy / (dist || 1);
             const ny = dx / (dist || 1);
-            const ctrlX = midX + nx * dist * 0.22;
-            const ctrlY = midY + ny * dist * 0.22;
+            // Stagger curved lines if multiple lights are connected to the same switch
+            const curveOffsetFactor = 0.22 + (wireIdx % 3) * 0.05;
+            const ctrlX = midX + nx * dist * curveOffsetFactor;
+            const ctrlY = midY + ny * dist * curveOffsetFactor;
+            const curvedPathData = `M ${fromEl.position.x} ${fromEl.position.y} Q ${ctrlX} ${ctrlY} ${toEl.position.x} ${toEl.position.y}`;
 
-            // Orthogonal polyline with all waypoints / turns
-            const orthoPoints =
-              wire.points && wire.points.length >= 2
-                ? wire.points
-                : computeOrthogonalPath(fromEl.position, toEl.position, project.walls);
-            const orthoFlatPoints = orthoPoints.flatMap((p) => [p.x, p.y]);
+            // Orthogonal polyline with bundle separation offsets
+            const rawPoints = wire.points && wire.points.length >= 2
+              ? wire.points
+              : computeOrthogonalPath(fromEl.position, toEl.position, project.walls, project.openings);
 
-            // Badge coordinates centered on middle segment
-            let badgeX = midX;
-            let badgeY = midY;
-            if (!isLighting && orthoPoints.length >= 2) {
-              const midSegIdx = Math.floor((orthoPoints.length - 1) / 2);
-              badgeX = (orthoPoints[midSegIdx].x + orthoPoints[midSegIdx + 1].x) / 2;
-              badgeY = (orthoPoints[midSegIdx].y + orthoPoints[midSegIdx + 1].y) / 2;
-            }
+            const isSwitchFrom = fromEl.category === 'switch';
+            const isSwitchTo = toEl.category === 'switch';
+            const isLightFrom = fromEl.category === 'light';
+            const isLightTo = toEl.category === 'light';
+            const isJunctionOrPanelFrom = fromEl.category === 'junction' || fromEl.category === 'panel';
+            const isJunctionOrPanelTo = toEl.category === 'junction' || toEl.category === 'panel';
+
+            // Switch connection phase flow (ПУЕ §6.1.14 & §7.1.50):
+            // 1. Phase line L from Panel or Junction Box to Switch
+            const isPhaseFeedToSwitch = (isSwitchTo && isJunctionOrPanelFrom) || (isSwitchFrom && isJunctionOrPanelTo);
+            // 2. Switched phase line L' from Switch to Luminaire (or through Junction box to Luminaire)
+            const isSwitchedPhaseToLight = (isSwitchFrom && isLightTo) || (isLightFrom && isSwitchTo) || (isJunctionOrPanelFrom && isLightTo && Boolean(wire.switchGroupId));
+
+            // Use bundled offset path to prevent cables from overlapping on top of each other!
+            // When actively editing/dragging the selected wire, use its direct wire.points
+            const bundledPoints = bundleOffsetMap.get(wire.id);
+            const effectivePoints = isSelected && wire.points && wire.points.length >= 2
+              ? wire.points
+              : (bundledPoints || rawPoints);
+
+            const orthoFlatPoints = effectivePoints.flatMap((p) => [p.x, p.y]);
+
+            const isKnxBus = wire.cableType === 'KNX_Bus' || wire.busType === 'knx';
+
+            // Highlight color: vibrant amber/gold if selected, otherwise phase-coded, KNX green, or circuit color
+            const activeColor = isSelected
+              ? '#f59e0b'
+              : isKnxBus
+              ? '#10b981' // KNX signature Green (JY(St)Y 2x2x0.8)
+              : isPhaseFeedToSwitch
+              ? '#ef4444' // Phase L (red/brown feed)
+              : isSwitchedPhaseToLight
+              ? '#eab308' // Switched phase L' (yellow control line)
+              : (circuit?.color || (isLighting ? '#fbbf24' : '#38bdf8'));
+
+            // Legible callout badge location: center of the longest segment
+            const longestSeg = getLongestSegmentMidpoint(effectivePoints);
+            const badgeX = isLighting ? ctrlX : longestSeg.midpoint.x;
+            const badgeY = isLighting ? ctrlY : longestSeg.midpoint.y;
 
             const cableSpec = getCableCrossSection(wire.cableType);
-            const tagPrefix = wire.cableTag ? `${wire.cableTag} ` : '';
-            const badgeText = `${tagPrefix}${cableSpec} · ${wire.calculatedLengthM} м`;
-            const badgeW = Math.max(74, badgeText.length * 6.2 + 14);
+            const tagPrefix = wire.cableTag ? `[${wire.cableTag}] ` : '';
+            const conduitLabel = wire.conduit === 'wall_chase' ? 'Штроба' : wire.conduit === 'floor' ? 'Підлога' : 'Стеля';
+            
+            // Phase indicator label
+            const phaseBadge = isKnxBus
+              ? '🟢 KNX Bus 30V'
+              : isPhaseFeedToSwitch
+              ? '⚡ L ➔ SW (Фаза)'
+              : isSwitchedPhaseToLight
+              ? "⚡ L' ➔ Світло (Ком.)"
+              : null;
+
+            const badgeLine1 = phaseBadge ? `${phaseBadge} · ${cableSpec}` : `${tagPrefix}${cableSpec}`;
+            const badgeLine2 = `${wire.calculatedLengthM} м · ${conduitLabel}`;
+            const badgeW = Math.max(90, Math.max(badgeLine1.length, badgeLine2.length) * 6.5 + 16);
+            const badgeH = 26;
 
             return (
               <Group key={wire.id}>
-                {/* Glow aura when selected or hovered */}
+                {/* 1. SELECTION & HOVER GLOW AURA */}
                 {(isSelected || isHovered) && (
+                  isLighting ? (
+                    <KonvaPath
+                      data={curvedPathData}
+                      stroke={isSelected ? '#f59e0b' : '#38bdf8'}
+                      strokeWidth={isSelected ? 10 : 7}
+                      opacity={isSelected ? 0.45 : 0.25}
+                      lineCap="round"
+                      lineJoin="round"
+                    />
+                  ) : (
+                    <Line
+                      points={orthoFlatPoints}
+                      stroke={isSelected ? '#f59e0b' : '#38bdf8'}
+                      strokeWidth={isSelected ? 10 : 8}
+                      opacity={isSelected ? 0.45 : 0.25}
+                      lineCap="round"
+                      lineJoin="round"
+                    />
+                  )
+                )}
+
+                {/* 2. VISIBLE CABLE LINE */}
+                {isLighting ? (
+                  <KonvaPath
+                    data={curvedPathData}
+                    stroke={activeColor}
+                    strokeWidth={isSelected ? 3.5 : 2.2}
+                    dash={isSelected ? [6, 3] : [5, 4]}
+                    lineCap="round"
+                    lineJoin="round"
+                  />
+                ) : (
                   <Line
-                    points={
-                      isLighting
-                        ? [fromEl.position.x, fromEl.position.y, ctrlX, ctrlY, toEl.position.x, toEl.position.y]
-                        : orthoFlatPoints
-                    }
-                    bezier={isLighting}
-                    stroke="#38bdf8"
-                    strokeWidth={isLighting ? 7 : 8}
-                    opacity={0.35}
+                    points={orthoFlatPoints}
+                    stroke={activeColor}
+                    strokeWidth={isSelected ? 3.8 : 2.5}
+                    dash={isKnxBus ? [5, 4] : (wire.conduit === 'wall_chase' ? [6, 2] : undefined)}
                     lineCap="round"
                     lineJoin="round"
                   />
                 )}
 
-                {/* Visible cable trace line */}
-                <Line
-                  points={
-                    isLighting
-                      ? [fromEl.position.x, fromEl.position.y, ctrlX, ctrlY, toEl.position.x, toEl.position.y]
-                      : orthoFlatPoints
-                  }
-                  bezier={isLighting}
-                  stroke={isSelected ? '#38bdf8' : wireColor}
-                  strokeWidth={isSelected ? 3.5 : isLighting ? 2.2 : 2.8}
-                  dash={isLighting ? [5, 3] : undefined}
-                  lineCap="round"
-                  lineJoin="round"
-                />
+                {/* 2b. PHASE DIRECTIONAL FLOW CHEVRONS (L ➔ SW and L' ➔ Lamp) */}
+                {(isPhaseFeedToSwitch || isSwitchedPhaseToLight) && (
+                  <Group listening={false}>
+                    {/* Small directional chevron indicator at 40% along line */}
+                    <Circle
+                      x={badgeX - 14}
+                      y={badgeY}
+                      radius={3}
+                      fill={isPhaseFeedToSwitch ? '#ef4444' : '#eab308'}
+                      stroke="#ffffff"
+                      strokeWidth={1}
+                    />
+                    <Text
+                      x={badgeX - 10}
+                      y={badgeY - 5}
+                      text="▶"
+                      fontSize={8}
+                      fill={isPhaseFeedToSwitch ? '#ef4444' : '#eab308'}
+                    />
+                  </Group>
+                )}
 
-                {/* Invisible wide hit area for easy clicking & hovering */}
-                <Line
-                  points={
-                    isLighting
-                      ? [fromEl.position.x, fromEl.position.y, ctrlX, ctrlY, toEl.position.x, toEl.position.y]
-                      : orthoFlatPoints
-                  }
-                  bezier={isLighting}
-                  stroke="transparent"
-                  strokeWidth={18}
-                  lineCap="round"
-                  lineJoin="round"
-                  onClick={(e) => {
-                    e.cancelBubble = true;
-                    onSelectWire?.(wire.id);
-                    onSelectElement(null);
-                    onSelectWall(null);
-                    onSelectOpening?.(null);
-                  }}
-                  onMouseEnter={() => setHoveredWireId(wire.id)}
-                  onMouseLeave={() => setHoveredWireId(null)}
-                />
+                {/* 3. INVISIBLE WIDE HIT AREA FOR CLICKING, HOVERING, & INSERTING POINTS */}
+                {isLighting ? (
+                  <KonvaPath
+                    data={curvedPathData}
+                    stroke="transparent"
+                    strokeWidth={22}
+                    lineCap="round"
+                    lineJoin="round"
+                    onClick={(e) => {
+                      e.cancelBubble = true;
+                      onSelectWire?.(wire.id);
+                      onSelectElement(null);
+                      onSelectWall(null);
+                      onSelectOpening?.(null);
+                    }}
+                    onMouseEnter={() => setHoveredWireId(wire.id)}
+                    onMouseLeave={() => setHoveredWireId(null)}
+                  />
+                ) : (
+                  <Line
+                    points={orthoFlatPoints}
+                    stroke="transparent"
+                    strokeWidth={22}
+                    lineCap="round"
+                    lineJoin="round"
+                    onClick={(e) => {
+                      e.cancelBubble = true;
+                      if (!isSelected) {
+                        onSelectWire?.(wire.id);
+                        onSelectElement(null);
+                        onSelectWall(null);
+                        onSelectOpening?.(null);
+                      } else if (onUpdateWire && effectivePoints.length >= 2) {
+                        // Click on already-selected wire inserts a new point at click location!
+                        const worldPos = getWorldPointerPos();
+                        let bestIdx = 0;
+                        let minD = Infinity;
+                        let bestPt = worldPos;
+                        for (let i = 0; i < effectivePoints.length - 1; i++) {
+                          const cp = closestPointOnSegment(worldPos, effectivePoints[i], effectivePoints[i + 1]);
+                          if (cp.dist < minD) {
+                            minD = cp.dist;
+                            bestIdx = i;
+                            bestPt = cp.point;
+                          }
+                        }
+                        const updated = [
+                          ...effectivePoints.slice(0, bestIdx + 1),
+                          bestPt,
+                          ...effectivePoints.slice(bestIdx + 1),
+                        ];
+                        const newLen = calculateCableLengthM(
+                          fromEl,
+                          toEl,
+                          project.ceilingHeightMm,
+                          wire.conduit,
+                          updated
+                        );
+                        onUpdateWire({
+                          ...wire,
+                          points: updated,
+                          isManual: true,
+                          calculatedLengthM: newLen,
+                        });
+                      }
+                    }}
+                    onMouseEnter={() => setHoveredWireId(wire.id)}
+                    onMouseLeave={() => setHoveredWireId(null)}
+                  />
+                )}
 
-                {/* jsPlumb-style Anchor Dots at terminals */}
+                {/* 4. TERMINAL ANCHOR DOTS */}
                 <Circle
                   x={fromEl.position.x}
                   y={fromEl.position.y}
-                  radius={isSelected ? 5 : 3.5}
-                  fill={wireColor}
+                  radius={isSelected ? 6 : 4}
+                  fill={activeColor}
                   stroke="#ffffff"
-                  strokeWidth={isSelected ? 1.5 : 0.5}
+                  strokeWidth={isSelected ? 2 : 1}
                 />
                 <Circle
                   x={toEl.position.x}
                   y={toEl.position.y}
-                  radius={isSelected ? 5 : 3.5}
-                  fill={wireColor}
+                  radius={isSelected ? 6 : 4}
+                  fill={activeColor}
                   stroke="#ffffff"
-                  strokeWidth={isSelected ? 1.5 : 0.5}
+                  strokeWidth={isSelected ? 2 : 1}
                 />
 
-                {/* Intermediate waypoint corner markers for complex multi-turn routes */}
-                {!isLighting &&
-                  wire.points &&
-                  wire.points.length > 2 &&
-                  wire.points.slice(1, -1).map((pt, pIdx) => (
+                {/* 5. INTERACTIVE DRAGGABLE WAYPOINT HANDLES (WHEN SELECTED) */}
+                {isSelected && !isLighting && effectivePoints.map((pt, pIdx) => {
+                  const isEnd = pIdx === 0 || pIdx === effectivePoints.length - 1;
+                  return (
+                    <Group key={`wp_${pIdx}`}>
+                      {/* Draggable Circle Handle */}
+                      <Circle
+                        x={pt.x}
+                        y={pt.y}
+                        radius={isEnd ? 5 : 7}
+                        fill={isEnd ? activeColor : '#ffffff'}
+                        stroke={activeColor}
+                        strokeWidth={2.5}
+                        draggable={!isEnd}
+                        hitStrokeWidth={16}
+                        shadowColor="black"
+                        shadowBlur={4}
+                        onDragMove={(e) => {
+                          const newPos = gridSnapEnabled
+                            ? snapPointToGrid({ x: e.target.x(), y: e.target.y() }, 10)
+                            : { x: e.target.x(), y: e.target.y() };
+                          e.target.x(newPos.x);
+                          e.target.y(newPos.y);
+                        }}
+                        onDragEnd={(e) => {
+                          const newPos = gridSnapEnabled
+                            ? snapPointToGrid({ x: e.target.x(), y: e.target.y() }, 10)
+                            : { x: e.target.x(), y: e.target.y() };
+                          const updated = [...effectivePoints];
+                          updated[pIdx] = newPos;
+                          const newLen = calculateCableLengthM(
+                            fromEl,
+                            toEl,
+                            project.ceilingHeightMm,
+                            wire.conduit,
+                            updated
+                          );
+                          onUpdateWire?.({
+                            ...wire,
+                            points: updated,
+                            isManual: true,
+                            calculatedLengthM: newLen,
+                          });
+                        }}
+                        onContextMenu={(e) => {
+                          e.evt.preventDefault();
+                          // Delete waypoint on right-click if > 2 points
+                          if (effectivePoints.length > 2 && !isEnd) {
+                            const updated = effectivePoints.filter((_, idx) => idx !== pIdx);
+                            const newLen = calculateCableLengthM(
+                              fromEl,
+                              toEl,
+                              project.ceilingHeightMm,
+                              wire.conduit,
+                              updated
+                            );
+                            onUpdateWire?.({
+                              ...wire,
+                              points: updated,
+                              isManual: true,
+                              calculatedLengthM: newLen,
+                            });
+                          }
+                        }}
+                      />
+
+                      {/* "+" Split Handle between waypoints to insert a new corner */}
+                      {pIdx < effectivePoints.length - 1 && (() => {
+                        const nextPt = effectivePoints[pIdx + 1];
+                        const segDist = distance(pt, nextPt);
+                        if (segDist < 30) return null;
+                        const mx = (pt.x + nextPt.x) / 2;
+                        const my = (pt.y + nextPt.y) / 2;
+                        return (
+                          <Group
+                            x={mx}
+                            y={my}
+                            onClick={(e) => {
+                              e.cancelBubble = true;
+                              const updated = [
+                                ...effectivePoints.slice(0, pIdx + 1),
+                                { x: mx, y: my },
+                                ...effectivePoints.slice(pIdx + 1),
+                              ];
+                              const newLen = calculateCableLengthM(
+                                fromEl,
+                                toEl,
+                                project.ceilingHeightMm,
+                                wire.conduit,
+                                updated
+                              );
+                              onUpdateWire?.({
+                                ...wire,
+                                points: updated,
+                                isManual: true,
+                                calculatedLengthM: newLen,
+                              });
+                            }}
+                          >
+                            <Circle radius={5.5} fill="#0284c7" stroke="#ffffff" strokeWidth={1.5} />
+                            <Text x={-3} y={-4.5} text="+" fontSize={9} fontStyle="bold" fill="#ffffff" />
+                          </Group>
+                        );
+                      })()}
+                    </Group>
+                  );
+                })}
+
+                {/* 6. STATIC TURN MARKERS (WHEN NOT SELECTED) */}
+                {!isSelected && !isLighting && effectivePoints.length > 2 &&
+                  effectivePoints.slice(1, -1).map((pt, pIdx) => (
                     <Circle
-                      key={`turn_${pIdx}`}
+                      key={`static_turn_${pIdx}`}
                       x={pt.x}
                       y={pt.y}
                       radius={2.5}
-                      fill={wireColor}
+                      fill={activeColor}
                       opacity={0.8}
                     />
                   ))}
 
-                {/* Cable tag, cross-section & length callout badge */}
-                <Group
-                  x={badgeX}
-                  y={badgeY - 10}
-                  onClick={(e) => {
-                    e.cancelBubble = true;
-                    onSelectWire?.(wire.id);
-                    onSelectElement(null);
-                    onSelectWall(null);
-                    onSelectOpening?.(null);
-                  }}
-                  onMouseEnter={() => setHoveredWireId(wire.id)}
-                  onMouseLeave={() => setHoveredWireId(null)}
-                >
-                  <Rect
-                    x={-badgeW / 2}
-                    y={-8}
-                    width={badgeW}
-                    height={17}
-                    cornerRadius={3}
-                    fill={isSelected ? '#0369a1' : '#0f172a'}
-                    stroke={isSelected ? '#38bdf8' : wireColor}
-                    strokeWidth={isSelected ? 1.5 : 0.9}
-                  />
-                  <Text
-                    x={-badgeW / 2}
-                    y={-4.5}
-                    width={badgeW}
-                    text={badgeText}
-                    fontSize={8.5}
-                    fontStyle="bold"
-                    fill={isSelected ? '#ffffff' : '#f8fafc'}
-                    fontFamily="monospace"
-                    align="center"
-                  />
-                </Group>
+                {/* 7. AUTOCAD LEADER LINE (ВИНОСКА ЗА ДСТУ) & CALLOUT BADGE */}
+                {(layerVisibility ? layerVisibility.annotations : showAnnotations) && (
+                  <Group>
+                    {/* AutoCAD Leader line: dot at wire, 45 degree angle leg, horizontal shelf line */}
+                    <Line
+                      points={[
+                        badgeX, badgeY,
+                        badgeX + 18, badgeY - 18,
+                        badgeX + 18 + badgeW * 0.7, badgeY - 18
+                      ]}
+                      stroke={isSelected ? '#f59e0b' : '#64748b'}
+                      strokeWidth={1}
+                      dash={[3, 2]}
+                      listening={false}
+                    />
+                    <Circle
+                      x={badgeX}
+                      y={badgeY}
+                      radius={2}
+                      fill={isSelected ? '#f59e0b' : '#64748b'}
+                      listening={false}
+                    />
+
+                    {/* High-contrast callout badge on shelf */}
+                    <Group
+                      x={badgeX + 18 + (badgeW * 0.35)}
+                      y={badgeY - 28}
+                      onClick={(e) => {
+                        e.cancelBubble = true;
+                        onSelectWire?.(wire.id);
+                        onSelectElement(null);
+                        onSelectWall(null);
+                        onSelectOpening?.(null);
+                      }}
+                      onMouseEnter={() => setHoveredWireId(wire.id)}
+                      onMouseLeave={() => setHoveredWireId(null)}
+                    >
+                      <Rect
+                        x={-badgeW / 2}
+                        y={-badgeH / 2}
+                        width={badgeW}
+                        height={badgeH}
+                        cornerRadius={4}
+                        fill={isSelected ? '#0f172a' : '#020617'}
+                        stroke={isSelected ? '#f59e0b' : activeColor}
+                        strokeWidth={isSelected ? 2 : 1.2}
+                        shadowColor="black"
+                        shadowBlur={6}
+                        shadowOpacity={0.8}
+                      />
+                      <Text
+                        x={-badgeW / 2}
+                        y={-badgeH / 2 + 3}
+                        width={badgeW}
+                        text={badgeLine1}
+                        fontSize={8.5}
+                        fontStyle="bold"
+                        fill={isPhaseFeedToSwitch ? '#fca5a5' : isSwitchedPhaseToLight ? '#fef08a' : isSelected ? '#fbbf24' : '#ffffff'}
+                        fontFamily="monospace"
+                        align="center"
+                      />
+                      <Text
+                        x={-badgeW / 2}
+                        y={-badgeH / 2 + 14}
+                        width={badgeW}
+                        text={badgeLine2}
+                        fontSize={7.5}
+                        fill={isSelected ? '#ffffff' : '#94a3b8'}
+                        fontFamily="monospace"
+                        align="center"
+                      />
+                    </Group>
+                  </Group>
+                )}
+
+                {/* 8. FLOATING WIRE OPERATIONS TOOLBAR (WHEN SELECTED) */}
+                {isSelected && (
+                  <Group x={badgeX} y={badgeY - 56}>
+                    {/* Background capsule */}
+                    <Rect
+                      x={-100}
+                      y={-12}
+                      width={200}
+                      height={24}
+                      cornerRadius={12}
+                      fill="#0f172a"
+                      stroke="#f59e0b"
+                      strokeWidth={1.5}
+                      shadowColor="black"
+                      shadowBlur={8}
+                    />
+
+                    {/* "+ Точка" button */}
+                    <Group
+                      x={-68}
+                      y={0}
+                      onClick={(e) => {
+                        e.cancelBubble = true;
+                        if (!onUpdateWire || isLighting || effectivePoints.length < 2) return;
+                        // Insert point at midpoint of longest segment
+                        const seg = getLongestSegmentMidpoint(effectivePoints);
+                        const updated = [
+                          ...effectivePoints.slice(0, seg.segmentIndex + 1),
+                          seg.midpoint,
+                          ...effectivePoints.slice(seg.segmentIndex + 1),
+                        ];
+                        const newLen = calculateCableLengthM(
+                          fromEl,
+                          toEl,
+                          project.ceilingHeightMm,
+                          wire.conduit,
+                          updated
+                        );
+                        onUpdateWire({
+                          ...wire,
+                          points: updated,
+                          isManual: true,
+                          calculatedLengthM: newLen,
+                        });
+                      }}
+                    >
+                      <Rect x={-26} y={-9} width={52} height={18} cornerRadius={4} fill="#1e293b" />
+                      <Text x={-26} y={-5} width={52} text="+ Точка" fontSize={8.5} fontStyle="bold" fill="#38bdf8" align="center" />
+                    </Group>
+
+                    {/* "🗑 Видалити" button */}
+                    <Group
+                      x={-8}
+                      y={0}
+                      onClick={(e) => {
+                        e.cancelBubble = true;
+                        onDeleteWire?.(wire.id);
+                        onSelectWire?.(null);
+                      }}
+                    >
+                      <Rect x={-26} y={-9} width={52} height={18} cornerRadius={4} fill="#450a0a" />
+                      <Text x={-26} y={-5} width={52} text="🗑 Видалити" fontSize={8.5} fontStyle="bold" fill="#fca5a5" align="center" />
+                    </Group>
+
+                    {/* "⚡ Схема L➔L'" button (if lighting/switch) */}
+                    {(isPhaseFeedToSwitch || isSwitchedPhaseToLight || isLighting) && (
+                      <Group
+                        x={56}
+                        y={0}
+                        onClick={(e) => {
+                          e.cancelBubble = true;
+                          const sw = isSwitchFrom ? fromEl : isSwitchTo ? toEl : project.elements.find(el => el.category === 'switch');
+                          onOpenSwitchWiringDiagram?.(sw || undefined);
+                        }}
+                      >
+                        <Rect x={-32} y={-9} width={64} height={18} cornerRadius={4} fill="#451a03" />
+                        <Text x={-32} y={-5} width={64} text="⚡ Схема L➔L'" fontSize={8} fontStyle="bold" fill="#fde047" align="center" />
+                      </Group>
+                    )}
+                  </Group>
+                )}
               </Group>
             );
           })}
         </Layer>
 
         {/* ======================================================== */}
-        {/* LAYER 5: INTERACTIVE ELECTRICAL SYMBOLS                  */}
+        {/* LAYER 5: INTERACTIVE ELECTRICAL SYMBOLS & LIGHTING GLOWS */}
         {/* ======================================================== */}
         <Layer id="elementsLayer">
+          {/* A. Soft Warm Luminaire Illumination Halos */}
+          {filteredElements.map((el) => {
+            if (el.category !== 'light') return null;
+            return (
+              <Group key={`glow_${el.id}`} x={el.position.x} y={el.position.y} listening={false}>
+                {el.type === 'light_sconce' ? (
+                  <Arc
+                    innerRadius={0}
+                    outerRadius={46}
+                    angle={120}
+                    rotation={el.rotation - 60}
+                    fill="rgba(251, 191, 36, 0.2)"
+                    stroke="rgba(251, 191, 36, 0.35)"
+                    strokeWidth={1}
+                  />
+                ) : (
+                  <>
+                    <Circle
+                      radius={viewFilter === 'lighting' ? 44 : 34}
+                      fill="rgba(251, 191, 36, 0.16)"
+                    />
+                    <Circle
+                      radius={viewFilter === 'lighting' ? 44 : 34}
+                      stroke="rgba(251, 191, 36, 0.3)"
+                      strokeWidth={1}
+                      dash={[3, 3]}
+                    />
+                  </>
+                )}
+              </Group>
+            );
+          })}
+
+          {/* B. Electrical Symbols */}
           {filteredElements.map((el) => {
             const isSelected = selectedElementId === el.id;
             const circuit = project.circuits.find((c) => c.id === el.circuitId);
@@ -1133,14 +1867,78 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                 <KonvaElectricalSymbol
                   type={el.type}
                   size={26}
-                  color={elColor}
+                  color={el.customSymbolColor || elColor}
                   isSelected={isSelected}
                   label={el.switchGroupId || el.label}
                   mountingHeightMm={el.mountingHeightMm}
-                  showHeightTag={showHeights}
+                  showHeightTag={layerVisibility ? layerVisibility.heights : showHeights}
                   circuitNumber={circuit?.number}
                   isBackupPriority={Boolean(el.isBackupPriority || circuit?.isBackupPriority)}
+                  customSymbolShape={el.customSymbolShape}
+                  customSymbolColor={el.customSymbolColor}
                 />
+
+                {/* Switch group indicator tag for lighting circuits */}
+                {(layerVisibility ? layerVisibility.annotations : showAnnotations) && (el.category === 'switch' || el.category === 'light') && el.switchGroupId && (
+                  <Group x={16} y={-14} listening={false}>
+                    <Rect
+                      x={-10}
+                      y={-7}
+                      width={20}
+                      height={14}
+                      cornerRadius={3}
+                      fill="#0f172a"
+                      stroke="#fbbf24"
+                      strokeWidth={1}
+                    />
+                    <Text
+                      x={-10}
+                      y={-5}
+                      width={20}
+                      text={el.switchGroupId}
+                      fontSize={8}
+                      fontStyle="bold"
+                      fill="#fbbf24"
+                      align="center"
+                    />
+                  </Group>
+                )}
+
+                {/* Switch Phase L incoming power feed indicator (ПУЕ §6.1.14: Фазний провід L тільки через вимикач) */}
+                {(layerVisibility ? layerVisibility.annotations : showAnnotations) && el.category === 'switch' && (
+                  <Group
+                    x={-24}
+                    y={-14}
+                    onClick={(e) => {
+                      e.cancelBubble = true;
+                      onOpenSwitchWiringDiagram?.(el);
+                    }}
+                    title="Клацніть для перегляду повної монтажної схеми підключення вимикача за ПУЕ (L ➔ SW ➔ L')"
+                  >
+                    <Rect
+                      x={-22}
+                      y={-7}
+                      width={44}
+                      height={14}
+                      cornerRadius={3}
+                      fill="#451a03"
+                      stroke="#f59e0b"
+                      strokeWidth={1}
+                      shadowColor="black"
+                      shadowBlur={4}
+                    />
+                    <Text
+                      x={-22}
+                      y={-5}
+                      width={44}
+                      text="⚡ L ➔ L'"
+                      fontSize={7.5}
+                      fontStyle="bold"
+                      fill="#fde047"
+                      align="center"
+                    />
+                  </Group>
+                )}
               </Group>
             );
           })}
@@ -1450,42 +2248,194 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         </Layer>
       </Stage>
 
-      {/* Floating Canvas Quick Controls (Zoom, Reset, Coordinates) */}
-      <div className="absolute bottom-4 left-4 flex items-center gap-2 bg-neutral-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-neutral-800 text-xs text-neutral-300 shadow-xl z-20">
-        <span className="font-mono tabular-nums text-neutral-400">
-          X: {pxToMm(mouseWorldPos.x)} мм · Y: {pxToMm(mouseWorldPos.y)} мм
-        </span>
-        <span className="text-neutral-600">|</span>
-        <span className="font-mono tabular-nums text-neutral-300">
-          {Math.round(scale * 100)}%
-        </span>
-        <div className="flex items-center gap-1 ml-1">
-          <button
-            onClick={() => setScale((prev) => Math.min(prev * 1.2, 4))}
-            className="w-6 h-6 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-200 transition-colors"
-            title="Приблизить (+)"
+      {/* CAD Metric Dynamic Rulers (Top & Left) */}
+      <CadRuler
+        width={stageDimensions.width}
+        height={stageDimensions.height}
+        scale={scale}
+        stagePos={stagePos}
+        mouseWorldPos={mouseWorldPos}
+        showRulers={showRulers}
+        onToggleRulers={() => setShowRulers(!showRulers)}
+        onResetView={() => {
+          setScale(1.05);
+          setStagePos({ x: 100, y: 70 });
+        }}
+      />
+
+      {/* AutoCAD Professional Model Space Status Bar (X, Y, Z, Snap, Annotation, Style, Switch Diagram) */}
+      <div className="absolute bottom-0 left-0 right-0 h-8 bg-neutral-950/95 border-t border-neutral-800 text-[11px] font-mono flex items-center justify-between px-3 z-30 select-none backdrop-blur-sm">
+        {/* Left: Real-time Millimeter Coordinates */}
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5 text-neutral-300">
+            <span className="text-neutral-500">X:</span>
+            <span className="tabular-nums font-semibold text-sky-400">{pxToMm(mouseWorldPos.x).toFixed(1)}</span>
+            <span className="text-neutral-600">мм</span>
+            <span className="text-neutral-500 ml-1">Y:</span>
+            <span className="tabular-nums font-semibold text-sky-400">{pxToMm(mouseWorldPos.y).toFixed(1)}</span>
+            <span className="text-neutral-600">мм</span>
+            <span className="text-neutral-500 ml-1">Z:</span>
+            <span className="tabular-nums text-neutral-400">0.0</span>
+            <span className="text-neutral-600">мм</span>
+          </div>
+          <div className="h-3 w-px bg-neutral-800" />
+          <span className="text-[10px] text-neutral-400 bg-neutral-900 px-1.5 py-0.5 rounded border border-neutral-800">
+            М 1:100
+          </span>
+        </div>
+
+        {/* Center/Right: AutoCAD Status Controls & Toggles */}
+        <div className="flex items-center gap-1.5">
+          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-950 text-sky-300 border border-sky-700/60">
+            MODEL
+          </span>
+
+          <span
+            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+              gridSnapEnabled
+                ? 'bg-sky-950/80 text-sky-300 border border-sky-600/60'
+                : 'bg-neutral-900 text-neutral-500 border border-neutral-800'
+            }`}
+            title="Прив'язка до сітки"
           >
-            +
+            GRID {gridSnapEnabled ? 'ON' : 'OFF'}
+          </span>
+
+          {onToggleAnnotations && (
+            <button
+              onClick={onToggleAnnotations}
+              className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
+                showAnnotations
+                  ? 'bg-amber-950/70 text-amber-300 border border-amber-600/70'
+                  : 'bg-neutral-900 text-neutral-500 border border-neutral-800 hover:text-neutral-300'
+              }`}
+              title="Показати або приховати примітки, виноски та бірки кабелів на кресленні"
+            >
+              ПРИМІТКИ {showAnnotations ? 'ON' : 'OFF'}
+            </button>
+          )}
+
+          {onToggleCadStyle && (
+            <button
+              onClick={onToggleCadStyle}
+              className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
+                cadStyle === 'autocad'
+                  ? 'bg-slate-900 text-slate-200 border border-slate-600'
+                  : 'bg-neutral-900 text-neutral-400 border border-neutral-800 hover:text-neutral-200'
+              }`}
+              title="Перемкнути стиль вигляду між AutoCAD та Modern"
+            >
+              СТИЛЬ: {cadStyle === 'autocad' ? 'AutoCAD' : 'Modern'}
+            </button>
+          )}
+
+          <button
+            onClick={() => onOpenSwitchWiringDiagram?.()}
+            className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-950/70 hover:bg-amber-900/80 text-amber-300 border border-amber-500/60 flex items-center gap-1 transition-colors"
+            title="Переглянути схему комутації вимикача за нормами ПУЕ: L ➔ Вимикач ➔ L' ➔ Світильник"
+          >
+            <span>⚡ СХЕМА L➔L'</span>
           </button>
+
+          {onOpenLayersModal && (
+            <button
+              onClick={onOpenLayersModal}
+              className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-950/70 hover:bg-sky-900/80 text-sky-300 border border-sky-500/60 flex items-center gap-1 transition-colors"
+              title="Відкрити диспетчер видимості шарів (AutoCAD Layer Manager)"
+            >
+              <span>ШАРИ (LAYERS)</span>
+            </button>
+          )}
+
+          <div className="h-3.5 w-px bg-neutral-800 mx-1" />
+
+          {/* Zoom controls */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setScale((prev) => Math.max(prev * 0.8, 0.3))}
+              className="w-5 h-5 flex items-center justify-center rounded bg-neutral-900 hover:bg-neutral-800 text-neutral-300 text-xs transition-colors"
+              title="Зменшити (-)"
+            >
+              -
+            </button>
+            <span className="text-[10px] text-neutral-400 tabular-nums px-1">
+              {Math.round(scale * 100)}%
+            </span>
+            <button
+              onClick={() => setScale((prev) => Math.min(prev * 1.2, 4))}
+              className="w-5 h-5 flex items-center justify-center rounded bg-neutral-900 hover:bg-neutral-800 text-neutral-300 text-xs transition-colors"
+              title="Збільшити (+)"
+            >
+              +
+            </button>
+            <button
+              onClick={() => {
+                setScale(1.05);
+                setStagePos({ x: 100, y: 70 });
+              }}
+              className="px-1.5 h-5 flex items-center justify-center rounded bg-neutral-900 hover:bg-neutral-800 text-neutral-300 text-[10px] transition-colors"
+              title="Скинути зум"
+            >
+              100%
+            </button>
+            <button
+              onClick={() => setShowRulers(!showRulers)}
+              className={`px-1.5 h-5 flex items-center justify-center rounded text-[10px] font-semibold transition-colors ${
+                showRulers
+                  ? 'bg-sky-950 text-sky-400 border border-sky-800'
+                  : 'bg-neutral-900 text-neutral-500 hover:text-neutral-300'
+              }`}
+              title="Увімкнути/вимкнути лінійку CAD"
+            >
+              Лінійка
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Floating Interactive Wire Drafting HUD */}
+      {activeTool === 'wire' && wireSourceElementId && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-40 bg-neutral-900/95 border border-sky-500/60 shadow-2xl rounded-2xl px-4 py-2.5 flex items-center gap-3 backdrop-blur-md">
+          <div className="flex items-center gap-2 text-xs">
+            <span className="w-2.5 h-2.5 rounded-full bg-sky-400 animate-pulse" />
+            <span className="font-semibold text-neutral-100">
+              Трасування кабелю: <span className="text-sky-400 font-mono font-bold">{wireDraftPoints.length}</span>{' '}
+              {wireDraftPoints.length === 1 ? 'точка' : 'точок'}
+            </span>
+          </div>
+          <div className="h-4 w-px bg-neutral-700" />
           <button
-            onClick={() => setScale((prev) => Math.max(prev * 0.8, 0.3))}
-            className="w-6 h-6 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-200 transition-colors"
-            title="Отдалить (-)"
+            onClick={handleFinishDraftWire}
+            className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-md transition-all active:scale-95"
+            title="Завершити трасу до найближчого приладу або створити вузол (Enter або подвійний клік на полотні)"
           >
-            -
+            <span>✓ Завершити трасу (Enter)</span>
           </button>
           <button
             onClick={() => {
-              setScale(1.05);
-              setStagePos({ x: 100, y: 70 });
+              setWireDraftPoints((prev) => {
+                if (prev.length > 1) return prev.slice(0, prev.length - 1);
+                setWireSourceElementId(null);
+                return [];
+              });
             }}
-            className="px-2 h-6 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-200 transition-colors text-[11px]"
-            title="Сбросить масштаб и положение"
+            className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+            title="Видалити останній вузол (Backspace)"
           >
-            100%
+            <span>⌫ Назад</span>
+          </button>
+          <button
+            onClick={() => {
+              setWireSourceElementId(null);
+              setWireDraftPoints([]);
+            }}
+            className="px-2.5 py-1 bg-neutral-800 hover:bg-red-950/60 hover:text-red-300 text-neutral-400 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+            title="Скасувати трасування (Esc)"
+          >
+            <span>✕ Скасувати (Esc)</span>
           </button>
         </div>
-      </div>
+      )}
     </div>
   );
 };

@@ -4,10 +4,26 @@
  */
 
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
-import { CadProject, CadTool, ViewFilterMode, ElectricalElement, Wall, WallOpening, WireRoute, CircuitGroup, Point } from './types/cad';
+import {
+  CadProject,
+  CadTool,
+  ViewFilterMode,
+  ElectricalElement,
+  Wall,
+  WallOpening,
+  WireRoute,
+  CircuitGroup,
+  Point,
+  Room,
+  FurnitureItem,
+  CustomLibraryItem,
+  LayerVisibilityConfig,
+  DEFAULT_LAYER_VISIBILITY,
+} from './types/cad';
 import { TEMPLATES } from './data/templates';
 import { CatalogItem, ELECTRICAL_CATALOG } from './data/electricalCatalog';
 import { OpeningCatalogItem, DOOR_OPENINGS_CATALOG, WINDOW_OPENINGS_CATALOG } from './data/openingsCatalog';
+import { FurnitureCatalogItem, FURNITURE_CATALOG } from './data/furnitureCatalog';
 import { CadHeader } from './components/toolbar/CadHeader';
 import { CadTools } from './components/toolbar/CadTools';
 import { CadCanvas } from './components/cad/CadCanvas';
@@ -24,6 +40,10 @@ import { BackupPowerModal } from './components/panels/BackupPowerModal';
 import { DstuDrawingAlbumModal } from './components/panels/DstuDrawingAlbumModal';
 import { ThreeDViewModal } from './components/panels/ThreeDViewModal';
 import { DxfImportModal } from './components/panels/DxfImportModal';
+import { SwitchWiringDiagramModal } from './components/panels/SwitchWiringDiagramModal';
+import { LayersVisibilityModal } from './components/panels/LayersVisibilityModal';
+import { CustomLibraryModal } from './components/panels/CustomLibraryModal';
+import { getStoredCustomLibrary, saveStoredCustomLibrary } from './utils/customLibraryStorage';
 import {
   autoRouteProjectCables,
   autoNumberCircuitsAndCables,
@@ -32,11 +52,33 @@ import {
 } from './utils/autoRouting';
 import { BackupSystemConfig } from './types/cad';
 import { Code2, Image as ImageIcon, Zap, CheckCircle2, FileCode } from 'lucide-react';
+import { loadProjectFromLocalStorage, saveProjectToLocalStorage } from './utils/storage';
+import { runPueAudit, applyAutoFix, applyAllAutoFixes } from './utils/pueRulesRegistry';
+import { detectRoomsFromWalls } from './utils/roomGeometry';
 
 export default function App() {
-  // Main Project State initialized with the rich Euro 2-Room apartment template
+  // Main Project State initialized from LocalStorage autosave or standard template
   const [project, setProject] = useState<CadProject>(() => {
+    const loaded = loadProjectFromLocalStorage();
+    if (loaded.project) {
+      return loaded.project;
+    }
     return JSON.parse(JSON.stringify(TEMPLATES[0].project));
+  });
+
+  // Autosave status state
+  const [autosaveStatus, setAutosaveStatus] = useState<'saved' | 'saving' | 'unsaved'>('saved');
+  const [lastSavedTime, setLastSavedTime] = useState<string | null>(() => {
+    const loaded = loadProjectFromLocalStorage();
+    if (loaded.savedAt) {
+      try {
+        const d = new Date(loaded.savedAt);
+        return d.toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' });
+      } catch {
+        return null;
+      }
+    }
+    return null;
   });
 
   // History for Undo / Redo
@@ -47,22 +89,46 @@ export default function App() {
   const [activeTool, setActiveTool] = useState<CadTool>('select');
   const [selectedCatalogItem, setSelectedCatalogItem] = useState<CatalogItem | null>(() => ELECTRICAL_CATALOG[0]);
   const [selectedOpeningPreset, setSelectedOpeningPreset] = useState<OpeningCatalogItem | null>(() => DOOR_OPENINGS_CATALOG[0]);
+  const [selectedRoomType, setSelectedRoomType] = useState<Room['type']>('living');
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
   const [selectedWallId, setSelectedWallId] = useState<string | null>(null);
   const [selectedOpeningId, setSelectedOpeningId] = useState<string | null>(null);
   const [selectedWireId, setSelectedWireId] = useState<string | null>(null);
+  const [selectedFurnitureId, setSelectedFurnitureId] = useState<string | null>(null);
+  const [selectedFurniturePreset, setSelectedFurniturePreset] = useState<FurnitureCatalogItem | null>(() => FURNITURE_CATALOG[0]);
+  const [customLibraryModalOpen, setCustomLibraryModalOpen] = useState(false);
+  const [customLibraryItems, setCustomLibraryItems] = useState<CustomLibraryItem[]>(() => {
+    const stored = getStoredCustomLibrary();
+    if (project.customLibrary && project.customLibrary.length > 0) {
+      const existingIds = new Set(stored.map((i) => i.id));
+      const merged = [...stored];
+      project.customLibrary.forEach((pi) => {
+        if (!existingIds.has(pi.id)) merged.push(pi);
+      });
+      return merged;
+    }
+    return stored;
+  });
   const [linkingSwitchId, setLinkingSwitchId] = useState<string | null>(null);
 
   // View Filter Mode
   const [viewFilter, setViewFilter] = useState<ViewFilterMode>('all');
 
-  // Layer Toggles
+  // Layer Toggles & CAD Layer Manager state
+  const [layerVisibility, setLayerVisibility] = useState<LayerVisibilityConfig>(DEFAULT_LAYER_VISIBILITY);
+  const [layersModalOpen, setLayersModalOpen] = useState(false);
   const [showDimensions, setShowDimensions] = useState(true);
   const [showHeights, setShowHeights] = useState(true);
   const [showFurniture, setShowFurniture] = useState(true);
+  const [showAnnotations, setShowAnnotations] = useState(true);
+  const [cadStyle, setCadStyle] = useState<'autocad' | 'modern'>('autocad');
   const [gridSnapEnabled, setGridSnapEnabled] = useState(true);
   // Canvas engine: Konva.js (hardware accelerated layers) or SVG
   const [engineMode, setEngineMode] = useState<'konva' | 'svg'>('konva');
+
+  // Switch wiring schematic dialog state
+  const [switchWiringModalOpen, setSwitchWiringModalOpen] = useState(false);
+  const [wiringSwitch, setWiringSwitch] = useState<ElectricalElement | null>(null);
 
   // Toast feedback message
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -71,6 +137,22 @@ export default function App() {
   const [activeModal, setActiveModal] = useState<
     'none' | 'circuits' | 'bom' | 'audit' | 'templates' | 'export' | 'json' | 'blueprint' | 'backup' | 'dstu' | '3d' | 'dxf_import'
   >('none');
+
+  // Autosave effect (debounced 600ms)
+  useEffect(() => {
+    setAutosaveStatus('saving');
+    const timer = setTimeout(() => {
+      const res = saveProjectToLocalStorage(project);
+      if (res.success) {
+        setAutosaveStatus('saved');
+        const now = new Date();
+        setLastSavedTime(now.toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' }));
+      } else {
+        setAutosaveStatus('unsaved');
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [project]);
 
   // Helper to commit changes to history stack
   const updateProjectWithHistory = useCallback((newProject: CadProject) => {
@@ -160,6 +242,8 @@ export default function App() {
       } else if (e.key === 'o' || e.key === 'O') {
         setActiveTool('window');
         setSelectedOpeningPreset(WINDOW_OPENINGS_CATALOG[0]);
+      } else if (e.key === 'r' || e.key === 'R') {
+        setActiveTool('room');
       }
     };
 
@@ -199,6 +283,12 @@ export default function App() {
       }),
     }));
   }, []);
+
+  const handleOpenSwitchWiringDiagram = useCallback((sw?: ElectricalElement) => {
+    const targetSwitch = sw || project.elements.find((e) => e.category === 'switch') || null;
+    setWiringSwitch(targetSwitch);
+    setSwitchWiringModalOpen(true);
+  }, [project.elements]);
 
   const handleDeleteElement = useCallback((id: string) => {
     updateProjectWithHistory({
@@ -275,6 +365,121 @@ export default function App() {
     });
     setSelectedOpeningId(null);
   }, [project, updateProjectWithHistory]);
+
+  // Furniture actions
+  const handleAddFurniture = useCallback((item: FurnitureItem) => {
+    updateProjectWithHistory({
+      ...project,
+      furniture: [...(project.furniture || []), item],
+    });
+    setSelectedFurnitureId(item.id);
+    setToastMessage(`🛋️ Розміщено: «${item.name}» (${item.width}×${item.height} мм)`);
+    setTimeout(() => setToastMessage(null), 3000);
+  }, [project, updateProjectWithHistory]);
+
+  const handleUpdateFurniture = useCallback((updated: FurnitureItem) => {
+    updateProjectWithHistory({
+      ...project,
+      furniture: (project.furniture || []).map((f) => (f.id === updated.id ? updated : f)),
+    });
+  }, [project, updateProjectWithHistory]);
+
+  const handleUpdateFurniturePosition = useCallback((id: string, newPos: Point, newRotation?: number) => {
+    setProject((prev) => ({
+      ...prev,
+      furniture: (prev.furniture || []).map((f) => {
+        if (f.id === id) {
+          return {
+            ...f,
+            position: newPos,
+            ...(newRotation !== undefined ? { rotation: newRotation } : {}),
+          };
+        }
+        return f;
+      }),
+    }));
+  }, []);
+
+  const handleDeleteFurniture = useCallback((id: string) => {
+    updateProjectWithHistory({
+      ...project,
+      furniture: (project.furniture || []).filter((f) => f.id !== id),
+    });
+    setSelectedFurnitureId(null);
+    setToastMessage('Меблі видалено');
+    setTimeout(() => setToastMessage(null), 2500);
+  }, [project, updateProjectWithHistory]);
+
+  const handleDuplicateFurniture = useCallback((id: string) => {
+    const existing = (project.furniture || []).find((f) => f.id === id);
+    if (!existing) return;
+    const duplicated: FurnitureItem = {
+      ...existing,
+      id: `furn_${Date.now()}_copy`,
+      name: `${existing.name} (Копія)`,
+      position: { x: existing.position.x + 30, y: existing.position.y + 30 },
+    };
+    updateProjectWithHistory({
+      ...project,
+      furniture: [...(project.furniture || []), duplicated],
+    });
+    setSelectedFurnitureId(duplicated.id);
+    setToastMessage(`Створено дублікат: ${duplicated.name}`);
+    setTimeout(() => setToastMessage(null), 2500);
+  }, [project, updateProjectWithHistory]);
+
+  const handleSelectCustomItemForPlacement = useCallback((item: CustomLibraryItem) => {
+    if (item.kind === 'electrical') {
+      const newEl: ElectricalElement = {
+        id: `el_${Date.now()}_custom`,
+        name: item.name,
+        category: (item.category as any) || 'custom',
+        type: 'custom_element',
+        position: { x: 300, y: 300 },
+        rotation: 0,
+        mountingHeightMm: item.mountingHeightMm || 300,
+        powerWatts: item.powerWatts || 500,
+        ipRating: item.ipRating || 'IP20',
+        phase: item.phase === '3-phase' ? undefined : (item.phase as any) || 'L1',
+        isCustom: true,
+        customSymbolShape: item.symbolShape,
+        customSymbolColor: item.symbolColor,
+        customLibraryId: item.id,
+        notes: item.notes,
+      };
+      handleAddElement(newEl);
+      setSelectedElementId(newEl.id);
+      setSelectedFurnitureId(null);
+      setToastMessage(`⚡ Вставлено власний елемент: «${item.name}»`);
+    } else {
+      const newFurn: FurnitureItem = {
+        id: `furn_${Date.now()}_custom`,
+        name: item.name,
+        type: 'desk',
+        category: 'custom',
+        position: { x: 300, y: 300 },
+        rotation: 0,
+        width: item.widthMm || 1200,
+        height: item.heightMm || 600,
+        cadShape: item.cadShape || 'generic',
+        electricalHints: item.electricalHints,
+        notes: item.notes,
+      };
+      handleAddFurniture(newFurn);
+      setSelectedFurnitureId(newFurn.id);
+      setSelectedElementId(null);
+      setToastMessage(`🛋️ Вставлено власні меблі: «${item.name}»`);
+    }
+    setTimeout(() => setToastMessage(null), 3500);
+  }, [handleAddElement, handleAddFurniture]);
+
+  const handleCustomLibraryUpdated = useCallback((items: CustomLibraryItem[]) => {
+    setCustomLibraryItems(items);
+    setProject((prev) => ({
+      ...prev,
+      customLibrary: items,
+    }));
+  }, []);
 
   // DXF Architectural Import handler
   const handleImportDxfWalls = useCallback((newWalls: Wall[], newOpenings: WallOpening[], replace: boolean) => {
@@ -370,37 +575,113 @@ export default function App() {
     setSelectedWallId(null);
   }, [project]);
 
-  // Simple DRC issue counter for header badge
-  const auditIssueCount = useMemo(() => {
-    let count = 0;
-    const bathRooms = project.rooms.filter((r) => r.type === 'bathroom');
-    project.elements.forEach((el) => {
-      if (el.category === 'socket') {
-        const inBath = bathRooms.some((room) => {
-          const minX = Math.min(...room.points.map((p) => p.x));
-          const maxX = Math.max(...room.points.map((p) => p.x));
-          const minY = Math.min(...room.points.map((p) => p.y));
-          const maxY = Math.max(...room.points.map((p) => p.y));
-          return el.position.x >= minX - 10 && el.position.x <= maxX + 10 && el.position.y >= minY - 10 && el.position.y <= maxY + 10;
-        });
-        if (inBath && el.ipRating !== 'IP44' && el.ipRating !== 'IP65') count++;
-      }
+  // Room actions
+  const handleAddRoom = useCallback((room: Room) => {
+    updateProjectWithHistory({
+      ...project,
+      rooms: [...project.rooms, room],
     });
-    return count;
+    setToastMessage(`🏠 Створено приміщення: «${room.name}» (${room.areaM2} м²)`);
+    setTimeout(() => setToastMessage(null), 3000);
+  }, [project, updateProjectWithHistory]);
+
+  const handleAutoDetectRooms = useCallback(() => {
+    const detected = detectRoomsFromWalls(project.walls, project.rooms);
+    updateProjectWithHistory({
+      ...project,
+      rooms: detected,
+    });
+    setToastMessage(`🏠 Знайдено ${detected.length} приміщень за стінами проекту`);
+    setTimeout(() => setToastMessage(null), 3000);
+  }, [project, updateProjectWithHistory]);
+
+  const handleNewProject = useCallback(() => {
+    const blankProject: CadProject = {
+      id: `proj_${Date.now()}`,
+      title: 'Новий проект квартири',
+      author: 'Інженер',
+      date: new Date().getFullYear().toString(),
+      scale: 0.1,
+      ceilingHeightMm: 2700,
+      gridStepMm: 100,
+      supplyPhase: '1-phase',
+      mainBreakerRatingA: 40,
+      rooms: [],
+      walls: [],
+      openings: [],
+      elements: [],
+      wires: [],
+      furniture: [],
+      circuits: [
+        { id: 'c_light_1', number: 1, name: 'Гр.1 Освітлення', breakerRatingA: 10, breakerCurve: 'B', rcdType: 'none', cableType: 'VVGng_3x1.5', phase: 'L1', color: '#ef4444' },
+        { id: 'c_socket_1', number: 2, name: 'Гр.2 Розетки побутові', breakerRatingA: 16, breakerCurve: 'C', rcdType: 'rcd_30ma', cableType: 'VVGng_3x2.5', phase: 'L1', color: '#38bdf8' },
+        { id: 'c_kitchen_1', number: 3, name: 'Гр.3 Кухня (плита 32А)', breakerRatingA: 32, breakerCurve: 'C', rcdType: 'rcd_30ma', cableType: 'VVGng_3x6', phase: 'L1', color: '#dc2626' },
+        { id: 'c_bath_1', number: 4, name: 'Гр.4 Санвузол (10мА ПЗВ)', breakerRatingA: 16, breakerCurve: 'C', rcdType: 'rcbo_10ma', cableType: 'VVGng_3x2.5', phase: 'L1', color: '#10b981' },
+      ],
+      autoRoutingEnabled: true,
+    };
+    updateProjectWithHistory(blankProject);
+    setSelectedElementId(null);
+    setSelectedWallId(null);
+    setSelectedWireId(null);
+    setSelectedOpeningId(null);
+    setToastMessage('Створено новий чистий план');
+    setTimeout(() => setToastMessage(null), 3000);
+  }, [updateProjectWithHistory]);
+
+  // DRC / PUE Auto-fix handlers
+  const handleAutoFixIssue = useCallback((issueId: string) => {
+    const { updatedProject, message } = applyAutoFix(project, issueId);
+    updateProjectWithHistory(updatedProject);
+    setToastMessage(`🔧 ${message}`);
+    setTimeout(() => setToastMessage(null), 4000);
+  }, [project, updateProjectWithHistory]);
+
+  const handleAutoFixAllIssues = useCallback(() => {
+    const { updatedProject, fixedCount } = applyAllAutoFixes(project);
+    updateProjectWithHistory(updatedProject);
+    setToastMessage(`✨ Автоматично виправлено ${fixedCount} зауважень ПУЕ`);
+    setTimeout(() => setToastMessage(null), 4000);
+  }, [project, updateProjectWithHistory]);
+
+  // Accurate DRC issue counter based on full 12-rule registry with ray-casting polygon checks
+  const auditIssueCount = useMemo(() => {
+    const { errorCount, warningCount } = runPueAudit(project);
+    return errorCount + warningCount;
   }, [project]);
 
-  // Auto-routing PUE cables
+  // Auto-routing PUE cables toggle and run handlers
+  const handleToggleAutoRouting = useCallback(() => {
+    const nextVal = !(project.autoRoutingEnabled ?? true);
+    updateProjectWithHistory({
+      ...project,
+      autoRoutingEnabled: nextVal,
+    });
+    setToastMessage(
+      nextVal
+        ? '⚡ Автотрасування УВІМКНЕНО: кабелі автоматично прокладаються за ПУЕ'
+        : '🔒 Автотрасування ВИМКНЕНО: ручний режим редагування вузлів та трас (захист від перезапису)'
+    );
+    setTimeout(() => setToastMessage(null), 3500);
+  }, [project, updateProjectWithHistory]);
+
   const handleAutoRoute = useCallback(() => {
+    if (project.autoRoutingEnabled === false) {
+      setToastMessage('⚠️ Автотрасування вимкнено в налаштуваннях. Увімкніть «Автотрасування», щоб прокласти лінії.');
+      setTimeout(() => setToastMessage(null), 3500);
+      return;
+    }
     const result = autoRouteProjectCables(project);
     if (result.routedElementsCount > 0) {
       updateProjectWithHistory({
         ...project,
         wires: result.newWires,
+        ...(result.newElements ? { elements: result.newElements } : {}),
       });
       setToastMessage(`Автотрасування ПУЕ успішно виконано: прокладено ${result.routedElementsCount} ліній (довжина ${result.totalLengthM} м)`);
       setTimeout(() => setToastMessage(null), 4000);
     } else {
-      setToastMessage('Всі електроточки вже з\'єднані або не призначені до груп щита');
+      setToastMessage('Всі електроточки вже з\'єднані або захищені в ручному режимі');
       setTimeout(() => setToastMessage(null), 3000);
     }
   }, [project, updateProjectWithHistory]);
@@ -444,7 +725,12 @@ export default function App() {
         onOpenDstuAlbum={() => setActiveModal('dstu')}
         onOpen3DView={() => setActiveModal('3d')}
         onOpenDxfImport={() => setActiveModal('dxf_import')}
+        onOpenLayersModal={() => setLayersModalOpen(true)}
+        onOpenCustomLibrary={() => setCustomLibraryModalOpen(true)}
+        onNewProject={handleNewProject}
         auditIssueCount={auditIssueCount}
+        autosaveStatus={autosaveStatus}
+        lastSavedTime={lastSavedTime}
       />
 
       {/* 2. Secondary Contextual Sub-bar */}
@@ -491,19 +777,53 @@ export default function App() {
           >
             Монтажний план із висотами
           </button>
+          <button
+            onClick={() => setLayersModalOpen(true)}
+            className="flex items-center gap-1 px-3 py-1 rounded-md text-xs font-semibold text-sky-300 hover:text-white bg-sky-950/60 hover:bg-sky-900 border border-sky-600/50 transition-colors whitespace-nowrap shadow-sm"
+            title="Диспетчер властивостей шарів креслення (AutoCAD Layer Manager, пресети)"
+          >
+            <span>Шари креслення</span>
+          </button>
         </div>
 
         {/* Quick Database, Auto-route, DXF & Blueprint Tools */}
         <div className="flex items-center gap-2">
-          {/* Auto-routing Action Button */}
-          <button
-            onClick={handleAutoRoute}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border border-amber-500/40 bg-amber-950/30 text-amber-300 hover:bg-amber-950/50 hover:border-amber-400 transition-colors shadow-sm"
-            title="Автоматичне прокладання кабелів під прямими кутами 90° за нормами ПУЕ"
-          >
-            <Zap className="w-3.5 h-3.5 text-amber-400" />
-            <span className="hidden md:inline">Автотрасування ПУЕ</span>
-          </button>
+          {/* Dual Auto-routing Toggle & Run Controls */}
+          <div className="flex items-center gap-1 p-0.5 bg-neutral-950 rounded-lg border border-neutral-800">
+            <button
+              onClick={handleToggleAutoRouting}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition-all shadow-sm ${
+                (project.autoRoutingEnabled ?? true)
+                  ? 'bg-emerald-950/50 border border-emerald-500/50 text-emerald-300 hover:bg-emerald-900/40'
+                  : 'bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200'
+              }`}
+              title={
+                (project.autoRoutingEnabled ?? true)
+                  ? 'Автотрасування: УВІМКНЕНО (клікніть, щоб вимкнути для всього проекту та перейти в ручний режим)'
+                  : 'Автотрасування: ВИМКНЕНО (ручний режим — автотрасування не чіпатиме ваші вузли)'
+              }
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  (project.autoRoutingEnabled ?? true) ? 'bg-emerald-400 animate-pulse' : 'bg-neutral-500'
+                }`}
+              />
+              <span>{(project.autoRoutingEnabled ?? true) ? 'Автотраса: УВІМК' : 'Автотраса: ВИМК'}</span>
+            </button>
+
+            <button
+              onClick={handleAutoRoute}
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium transition-colors ${
+                (project.autoRoutingEnabled ?? true)
+                  ? 'text-amber-300 hover:text-amber-200 hover:bg-amber-950/40'
+                  : 'text-neutral-500 hover:text-neutral-400 hover:bg-neutral-900'
+              }`}
+              title="Запустити автоматичне прокладання кабелів під прямими кутами 90° за нормами ПУЕ"
+            >
+              <Zap className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden md:inline">Трасувати</span>
+            </button>
+          </div>
 
           <button
             onClick={() => setActiveModal('dxf_import')}
@@ -592,6 +912,16 @@ export default function App() {
             setSelectedOpeningPreset(item);
             setActiveTool(item.type as CadTool);
           }}
+          selectedRoomType={selectedRoomType}
+          onSelectRoomType={setSelectedRoomType}
+          onAutoDetectRooms={handleAutoDetectRooms}
+          selectedFurnitureItem={selectedFurniturePreset}
+          onSelectFurnitureItem={(item) => {
+            setSelectedFurniturePreset(item);
+            setActiveTool('furniture');
+          }}
+          onOpenCustomLibraryModal={() => setCustomLibraryModalOpen(true)}
+          customLibraryItems={customLibraryItems}
           viewFilter={viewFilter}
           onChangeViewFilter={setViewFilter}
           showDimensions={showDimensions}
@@ -600,6 +930,15 @@ export default function App() {
           onToggleHeights={() => setShowHeights(!showHeights)}
           showFurniture={showFurniture}
           onToggleFurniture={() => setShowFurniture(!showFurniture)}
+          showAnnotations={showAnnotations}
+          onToggleAnnotations={() => {
+            setShowAnnotations((prev) => {
+              const next = !prev;
+              setLayerVisibility((cfg) => ({ ...cfg, annotations: next }));
+              return next;
+            });
+          }}
+          onOpenLayersModal={() => setLayersModalOpen(true)}
           gridSnapEnabled={gridSnapEnabled}
           onToggleGridSnap={() => setGridSnapEnabled(!gridSnapEnabled)}
           canUndo={history.length > 0}
@@ -607,6 +946,8 @@ export default function App() {
           onUndo={handleUndo}
           onRedo={handleRedo}
           onAutoRoute={handleAutoRoute}
+          autoRoutingEnabled={project.autoRoutingEnabled ?? true}
+          onToggleAutoRouting={handleToggleAutoRouting}
         />
 
         {/* CAD Canvas Viewport: Konva.js Hardware Accelerated or SVG */}
@@ -620,17 +961,46 @@ export default function App() {
               selectedWallId={selectedWallId}
               selectedOpeningId={selectedOpeningId}
               selectedOpeningPreset={selectedOpeningPreset}
+              selectedRoomType={selectedRoomType}
               viewFilter={viewFilter}
               showDimensions={showDimensions}
               showHeights={showHeights}
               showFurniture={showFurniture}
+              showAnnotations={showAnnotations}
+              cadStyle={cadStyle}
+              layerVisibility={layerVisibility}
+              onToggleAnnotations={() => {
+                setShowAnnotations((prev) => {
+                  const next = !prev;
+                  setLayerVisibility((cfg) => ({ ...cfg, annotations: next }));
+                  return next;
+                });
+              }}
+              onToggleCadStyle={() => setCadStyle((prev) => prev === 'autocad' ? 'modern' : 'autocad')}
+              onOpenSwitchWiringDiagram={handleOpenSwitchWiringDiagram}
+              onOpenLayersModal={() => setLayersModalOpen(true)}
               gridSnapEnabled={gridSnapEnabled}
+              selectedFurnitureId={selectedFurnitureId}
+              onSelectFurniture={(id) => {
+                setSelectedFurnitureId(id);
+                if (id) {
+                  setSelectedElementId(null);
+                  setSelectedWallId(null);
+                  setSelectedOpeningId(null);
+                  setSelectedWireId(null);
+                }
+              }}
+              selectedFurniturePreset={selectedFurniturePreset}
+              onAddFurniture={handleAddFurniture}
+              onUpdateFurniturePosition={handleUpdateFurniturePosition}
+              onDeleteFurniture={handleDeleteFurniture}
               onSelectElement={(id) => {
                 setSelectedElementId(id);
                 if (id) {
                   setSelectedWallId(null);
                   setSelectedOpeningId(null);
                   setSelectedWireId(null);
+                  setSelectedFurnitureId(null);
                 }
               }}
               onSelectWall={(id) => {
@@ -639,6 +1009,7 @@ export default function App() {
                   setSelectedElementId(null);
                   setSelectedOpeningId(null);
                   setSelectedWireId(null);
+                  setSelectedFurnitureId(null);
                 }
               }}
               onSelectOpening={(id) => {
@@ -647,10 +1018,12 @@ export default function App() {
                   setSelectedElementId(null);
                   setSelectedWallId(null);
                   setSelectedWireId(null);
+                  setSelectedFurnitureId(null);
                 }
               }}
               selectedWireId={selectedWireId}
               onSelectWire={handleSelectWire}
+              onUpdateWire={handleUpdateWire}
               onDeleteWire={handleDeleteWire}
               linkingSwitchId={linkingSwitchId}
               onLinkSwitchToLuminaires={handleLinkSwitchToLuminaires}
@@ -659,6 +1032,7 @@ export default function App() {
               onAddWall={handleAddWall}
               onAddOpening={handleAddOpening}
               onDeleteOpening={handleDeleteOpening}
+              onAddRoom={handleAddRoom}
               onAddWire={handleAddWire}
               onDeleteElement={handleDeleteElement}
               onUpdateBackgroundImage={handleUpdateBackgroundImage}
@@ -676,6 +1050,7 @@ export default function App() {
               showDimensions={showDimensions}
               showHeights={showHeights}
               showFurniture={showFurniture}
+              layerVisibility={layerVisibility}
               gridSnapEnabled={gridSnapEnabled}
               onSelectElement={(id) => {
                 setSelectedElementId(id);
@@ -683,6 +1058,7 @@ export default function App() {
                   setSelectedWallId(null);
                   setSelectedOpeningId(null);
                   setSelectedWireId(null);
+                  setSelectedFurnitureId(null);
                 }
               }}
               onSelectWall={(id) => {
@@ -691,6 +1067,7 @@ export default function App() {
                   setSelectedElementId(null);
                   setSelectedOpeningId(null);
                   setSelectedWireId(null);
+                  setSelectedFurnitureId(null);
                 }
               }}
               onSelectOpening={(id) => {
@@ -699,6 +1076,7 @@ export default function App() {
                   setSelectedElementId(null);
                   setSelectedWallId(null);
                   setSelectedWireId(null);
+                  setSelectedFurnitureId(null);
                 }
               }}
               onUpdateElementPosition={handleUpdateElementPosition}
@@ -719,9 +1097,13 @@ export default function App() {
           selectedWallId={selectedWallId}
           selectedOpeningId={selectedOpeningId}
           selectedWireId={selectedWireId}
+          selectedFurnitureId={selectedFurnitureId}
           onUpdateElement={handleUpdateElement}
           onDeleteElement={handleDeleteElement}
           onDuplicateElement={handleDuplicateElement}
+          onUpdateFurniture={handleUpdateFurniture}
+          onDeleteFurniture={handleDeleteFurniture}
+          onDuplicateFurniture={handleDuplicateFurniture}
           onUpdateWall={handleUpdateWall}
           onDeleteWall={handleDeleteWall}
           onUpdateOpening={handleUpdateOpening}
@@ -729,11 +1111,14 @@ export default function App() {
           onSelectWire={handleSelectWire}
           onUpdateWire={handleUpdateWire}
           onDeleteWire={handleDeleteWire}
+          onOpenSwitchWiringDiagram={handleOpenSwitchWiringDiagram}
           linkingSwitchId={linkingSwitchId}
           onStartSwitchLinking={(swId) => setLinkingSwitchId(swId)}
           onCancelSwitchLinking={() => setLinkingSwitchId(null)}
           onAutoAssignCircuits={handleAutoAssignCircuits}
           onAutoNumberCables={handleAutoNumberCables}
+          autoRoutingEnabled={project.autoRoutingEnabled ?? true}
+          onToggleAutoRouting={handleToggleAutoRouting}
         />
       </div>
 
@@ -756,6 +1141,8 @@ export default function App() {
       {activeModal === 'audit' && (
         <ElectricalAuditModal
           project={project}
+          onAutoFix={handleAutoFixIssue}
+          onAutoFixAll={handleAutoFixAllIssues}
           onClose={() => setActiveModal('none')}
         />
       )}
@@ -824,6 +1211,38 @@ export default function App() {
           onClose={() => setActiveModal('none')}
         />
       )}
+
+      {/* Switch Connection Flow & Installation Schematic Modal (ПУЕ §6.1.14 & §7.1.50) */}
+      {switchWiringModalOpen && (
+        <SwitchWiringDiagramModal
+          project={project}
+          selectedSwitch={wiringSwitch || undefined}
+          onClose={() => setSwitchWiringModalOpen(false)}
+        />
+      )}
+
+      {/* CAD Layer Visibility Manager Modal (Вкладка видимості шарів креслення) */}
+      <LayersVisibilityModal
+        isOpen={layersModalOpen}
+        onClose={() => setLayersModalOpen(false)}
+        config={layerVisibility}
+        onChange={(newConfig) => {
+          setLayerVisibility(newConfig);
+          setShowDimensions(newConfig.dimensions);
+          setShowHeights(newConfig.heights);
+          setShowFurniture(newConfig.furniture);
+          setShowAnnotations(newConfig.annotations);
+        }}
+        project={project}
+      />
+
+      {/* Custom Element & Furniture Library Modal (Власна бібліотека та бібліотека меблів) */}
+      <CustomLibraryModal
+        isOpen={customLibraryModalOpen}
+        onClose={() => setCustomLibraryModalOpen(false)}
+        onSelectItemForPlacement={handleSelectCustomItemForPlacement}
+        onLibraryUpdated={handleCustomLibraryUpdated}
+      />
 
       {/* 5. Floating Toast Notification */}
       {toastMessage && (

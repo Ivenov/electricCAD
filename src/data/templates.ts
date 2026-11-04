@@ -288,11 +288,11 @@ export const TEMPLATES: { id: string; name: string; description: string; area: s
         { id: 'bpf_basin', type: 'wash_basin', name: 'Умивальник з тумбою (санвузол 4)', position: { x: 220, y: 1190 }, width: 60, height: 50, rotation: 0 },
       ],
       circuits: [
-        { id: 'cbp_1', number: 1, name: 'Гр.1 Освещение (Магістральна червона лінія за планом)', breakerRatingA: 10, breakerCurve: 'B', rcdType: 'none', cableType: 'VVGng_3x1.5', phase: 'L1', color: '#ef4444', description: 'Освітлення всіх кімнат за кресленням' },
-        { id: 'cbp_2', number: 2, name: 'Гр.2 Освещение санвузла та гаража', breakerRatingA: 10, breakerCurve: 'B', rcdType: 'none', cableType: 'VVGng_3x1.5', phase: 'L2', color: '#f97316', description: 'Окремі вимикачі Гр.2 санвузла та гаража' },
+        { id: 'cbp_1', number: 1, name: 'Гр.1 Освітлення (Магістральна червона лінія за планом)', breakerRatingA: 10, breakerCurve: 'B', rcdType: 'none', cableType: 'VVGng_3x1.5', phase: 'L1', color: '#ef4444', description: 'Освітлення всіх кімнат за кресленням' },
+        { id: 'cbp_2', number: 2, name: 'Гр.2 Освітлення санвузла та гаража', breakerRatingA: 10, breakerCurve: 'B', rcdType: 'none', cableType: 'VVGng_3x1.5', phase: 'L2', color: '#f97316', description: 'Окремі вимикачі Гр.2 санвузла та гаража' },
         { id: 'cbp_sockets_living', number: 3, name: 'Розетки вітальні, спалень та холу', breakerRatingA: 16, breakerCurve: 'C', rcdType: 'rcd_30ma', cableType: 'VVGng_3x2.5', phase: 'L3', color: '#38bdf8' },
         { id: 'cbp_kitchen', number: 4, name: 'Кухня (Варильна поверхня 32А + духова шафа + фартух)', breakerRatingA: 32, breakerCurve: 'C', rcdType: 'rcd_30ma', cableType: 'VVGng_3x6', phase: 'L1', color: '#dc2626' },
-        { id: 'cbp_bath', number: 5, name: 'Санвузол (Пральна машина, бойлер) (10мА УЗО)', breakerRatingA: 16, breakerCurve: 'C', rcdType: 'rcbo_10ma', cableType: 'VVGng_3x2.5', phase: 'L2', color: '#10b981' },
+        { id: 'cbp_bath', number: 5, name: 'Санвузол (Пральна машина, бойлер) (10мА ПЗВ)', breakerRatingA: 16, breakerCurve: 'C', rcdType: 'rcbo_10ma', cableType: 'VVGng_3x2.5', phase: 'L2', color: '#10b981' },
         { id: 'cbp_garage', number: 6, name: 'Гараж та котельня (Силові розетки 380В/220В)', breakerRatingA: 25, breakerCurve: 'C', rcdType: 'rcd_30ma', cableType: 'VVGng_3x4', phase: 'L3', color: '#06b6d4' },
         { id: 'cbp_backup', number: 7, name: 'Гарантована лінія ДБЖ (Холодильник, котел, Wi-Fi, резерв)', breakerRatingA: 16, breakerCurve: 'B', rcdType: 'rcbo_30ma', cableType: 'VVGng_3x2.5', phase: 'L1', color: '#059669', isBackupPriority: true },
       ],
@@ -856,11 +856,16 @@ export const TEMPLATES: { id: string; name: string; description: string; area: s
           circuitId: 'cbp_1',
           calculatedLengthM: 3.6,
         },
-        // Від коробки вітальні до світильника веранди через стіну осі D
+        // Від коробки вітальні до світильника веранди через капітальну стіну осі D (повний обхід вікна та дверей)
         {
           id: 'wbp_jb_lt_terr',
           fromId: 'el_bp_jb_living',
           toId: 'el_bp_lt_terr',
+          points: [
+            { x: 590, y: 780 },
+            { x: 630, y: 780 },
+            { x: 630, y: 250 },
+          ],
           mode: 'ortho',
           conduit: 'ceiling',
           cableType: 'VVGng_3x1.5',

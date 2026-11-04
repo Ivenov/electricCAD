@@ -14,8 +14,9 @@ import {
   ShieldCheck,
   Check,
   Layers,
+  Sofa,
 } from 'lucide-react';
-import { CadProject, ElectricalElement, Wall, WallOpening, WireRoute } from '../../types/cad';
+import { CadProject, ElectricalElement, Wall, WallOpening, WireRoute, FurnitureItem } from '../../types/cad';
 import { pxToMm, distance, getCableDisplayName, getCableCrossSection, calculateCableLengthM } from '../../utils/cadMath';
 
 interface PropertyInspectorProps {
@@ -24,6 +25,7 @@ interface PropertyInspectorProps {
   selectedWallId: string | null;
   selectedOpeningId?: string | null;
   selectedWireId?: string | null;
+  selectedFurnitureId?: string | null;
   onUpdateElement: (updated: ElectricalElement) => void;
   onDeleteElement: (id: string) => void;
   onDuplicateElement: (id: string) => void;
@@ -34,11 +36,17 @@ interface PropertyInspectorProps {
   onSelectWire?: (id: string | null) => void;
   onUpdateWire?: (updated: WireRoute) => void;
   onDeleteWire?: (id: string) => void;
+  onUpdateFurniture?: (updated: FurnitureItem) => void;
+  onDeleteFurniture?: (id: string) => void;
+  onDuplicateFurniture?: (id: string) => void;
+  onOpenSwitchWiringDiagram?: (sw?: ElectricalElement) => void;
   linkingSwitchId?: string | null;
   onStartSwitchLinking?: (switchId: string) => void;
   onCancelSwitchLinking?: () => void;
   onAutoAssignCircuits?: () => void;
   onAutoNumberCables?: () => void;
+  autoRoutingEnabled?: boolean;
+  onToggleAutoRouting?: () => void;
 }
 
 export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
@@ -47,6 +55,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   selectedWallId,
   selectedOpeningId,
   selectedWireId,
+  selectedFurnitureId,
   onUpdateElement,
   onDeleteElement,
   onDuplicateElement,
@@ -57,16 +66,23 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   onSelectWire,
   onUpdateWire,
   onDeleteWire,
+  onUpdateFurniture,
+  onDeleteFurniture,
+  onDuplicateFurniture,
+  onOpenSwitchWiringDiagram,
   linkingSwitchId,
   onStartSwitchLinking,
   onCancelSwitchLinking,
   onAutoAssignCircuits,
   onAutoNumberCables,
+  autoRoutingEnabled = true,
+  onToggleAutoRouting,
 }) => {
   const selectedElement = project.elements.find((el) => el.id === selectedElementId);
   const selectedWall = project.walls.find((w) => w.id === selectedWallId);
   const selectedOpening = project.openings.find((op) => op.id === selectedOpeningId);
   const selectedWire = project.wires.find((w) => w.id === selectedWireId);
+  const selectedFurniture = project.furniture?.find((f) => f.id === selectedFurnitureId);
   const openingWall = selectedOpening ? project.walls.find((w) => w.id === selectedOpening.wallId) : null;
 
   // Common mounting height quick picks in mm
@@ -225,9 +241,185 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             <Trash2 className="w-3.5 h-3.5" />
           </button>
         )}
+        {selectedFurniture && (
+          <div className="flex items-center gap-1">
+            {onDuplicateFurniture && (
+              <button
+                onClick={() => onDuplicateFurniture(selectedFurniture.id)}
+                title="Дублювати меблі"
+                className="p-1.5 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded transition-colors"
+              >
+                <Copy className="w-3.5 h-3.5 text-sky-400" />
+              </button>
+            )}
+            {onDeleteFurniture && (
+              <button
+                onClick={() => onDeleteFurniture(selectedFurniture.id)}
+                title="Видалити меблі (Del)"
+                className="p-1.5 text-rose-400 hover:text-rose-300 hover:bg-rose-950/40 rounded transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4 text-xs">
+        {/* CASE 0: FURNITURE SELECTED */}
+        {selectedFurniture && (
+          <div className="space-y-4">
+            <div className="p-3 rounded-xl bg-neutral-950/70 border border-sky-500/30 flex items-center gap-3">
+              <div className="w-9 h-9 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400 font-bold">
+                <Sofa className="w-5 h-5 text-sky-400" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <span className="text-[10px] text-sky-400 font-mono font-bold uppercase tracking-wider block">
+                  Архітектурні меблі
+                </span>
+                <span className="text-sm font-bold text-white truncate block">
+                  {selectedFurniture.name}
+                </span>
+              </div>
+            </div>
+
+            {/* Name input */}
+            <div>
+              <label className="text-[11px] text-neutral-400 block mb-1">Назва об'єкта</label>
+              <input
+                type="text"
+                value={selectedFurniture.name}
+                onChange={(e) => onUpdateFurniture?.({ ...selectedFurniture, name: e.target.value })}
+                className="w-full bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 text-neutral-100 focus:outline-none focus:border-sky-500 font-medium"
+              />
+            </div>
+
+            {/* Dimensions: Width mm & Depth mm */}
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-[11px] text-neutral-400 block mb-1">Ширина (мм)</label>
+                <input
+                  type="number"
+                  min="100"
+                  max="10000"
+                  step="50"
+                  value={selectedFurniture.width}
+                  onChange={(e) => onUpdateFurniture?.({ ...selectedFurniture, width: Number(e.target.value) || 100 })}
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 font-mono text-neutral-100 focus:outline-none focus:border-sky-500"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] text-neutral-400 block mb-1">Глибина (мм)</label>
+                <input
+                  type="number"
+                  min="100"
+                  max="10000"
+                  step="50"
+                  value={selectedFurniture.height}
+                  onChange={(e) => onUpdateFurniture?.({ ...selectedFurniture, height: Number(e.target.value) || 100 })}
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 font-mono text-neutral-100 focus:outline-none focus:border-sky-500"
+                />
+              </div>
+            </div>
+
+            {/* Coordinates & Rotation */}
+            <div className="grid grid-cols-3 gap-2">
+              <div>
+                <label className="text-[11px] text-neutral-400 block mb-1">X (мм)</label>
+                <div className="bg-neutral-950 border border-neutral-800 rounded px-2 py-1.5 font-mono text-neutral-300">
+                  {pxToMm(selectedFurniture.position.x)}
+                </div>
+              </div>
+              <div>
+                <label className="text-[11px] text-neutral-400 block mb-1">Y (мм)</label>
+                <div className="bg-neutral-950 border border-neutral-800 rounded px-2 py-1.5 font-mono text-neutral-300">
+                  {pxToMm(selectedFurniture.position.y)}
+                </div>
+              </div>
+              <div>
+                <label className="text-[11px] text-neutral-400 block mb-1">Кут</label>
+                <button
+                  onClick={() =>
+                    onUpdateFurniture?.({
+                      ...selectedFurniture,
+                      rotation: ((selectedFurniture.rotation || 0) + 90) % 360,
+                    })
+                  }
+                  className="w-full bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-1.5 flex items-center justify-center gap-1 font-mono text-neutral-200 transition-colors"
+                  title="Повернути на +90°"
+                >
+                  <RotateCw className="w-3 h-3 text-sky-400" />
+                  <span>{selectedFurniture.rotation || 0}°</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Quick Rotation Angle Buttons */}
+            <div>
+              <label className="text-[11px] text-neutral-400 block mb-1.5">Швидкий поворот</label>
+              <div className="grid grid-cols-4 gap-1.5">
+                {[0, 90, 180, 270].map((deg) => (
+                  <button
+                    key={deg}
+                    onClick={() => onUpdateFurniture?.({ ...selectedFurniture, rotation: deg })}
+                    className={`py-1 rounded text-xs font-mono font-semibold border transition-colors ${
+                      (selectedFurniture.rotation || 0) === deg
+                        ? 'bg-sky-500 text-neutral-950 border-sky-400 font-bold'
+                        : 'bg-neutral-950 border-neutral-800 text-neutral-300 hover:bg-neutral-800'
+                    }`}
+                  >
+                    {deg}°
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Electrical Proximity Recommendations Box */}
+            <div className="p-3 rounded-xl bg-neutral-950/80 border border-amber-500/30 space-y-2">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-amber-400 uppercase tracking-wide">
+                <Zap className="w-3.5 h-3.5 text-amber-400" />
+                <span>Рекомендації електрики:</span>
+              </div>
+              {selectedFurniture.electricalHints && selectedFurniture.electricalHints.length > 0 ? (
+                <div className="space-y-1 text-[11px] text-neutral-300">
+                  {selectedFurniture.electricalHints.map((hint, idx) => (
+                    <div key={idx} className="flex items-start gap-1.5">
+                      <span className="text-amber-400">•</span>
+                      <span>{hint}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-[11px] text-neutral-400">
+                  Рекомендовано передбачити розетки загального призначення на відстані не менше 300 мм від підлоги або за спинкою.
+                </p>
+              )}
+            </div>
+
+            {/* Delete / Duplicate buttons */}
+            <div className="flex items-center gap-2 pt-2 border-t border-neutral-800">
+              {onDuplicateFurniture && (
+                <button
+                  onClick={() => onDuplicateFurniture(selectedFurniture.id)}
+                  className="flex-1 py-1.5 px-3 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
+                >
+                  <Copy className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Дублювати</span>
+                </button>
+              )}
+              {onDeleteFurniture && (
+                <button
+                  onClick={() => onDeleteFurniture(selectedFurniture.id)}
+                  className="py-1.5 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 border border-rose-800/50 text-rose-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Видалити</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* CASE 1: ELECTRICAL ELEMENT SELECTED */}
         {selectedElement ? (
           <div className="space-y-4">
@@ -342,6 +534,28 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   </option>
                 ))}
               </select>
+              {(selectedElement.category === 'switch' || selectedElement.category === 'light') && (() => {
+                const c = project.circuits.find((item) => item.id === selectedElement.circuitId);
+                if (c && c.breakerRatingA >= 16) {
+                  return (
+                    <p className="mt-1.5 text-[11px] text-amber-400 bg-amber-950/40 border border-amber-800/50 rounded px-2 py-1">
+                      ⚠️ ПУЕ: Вимикач/освітлення призначено на силову групу {c.breakerRatingA}А. Має бути окрема лінія освітлення 10А (ВВГнгд 3×1.5).
+                    </p>
+                  );
+                }
+                return null;
+              })()}
+              {selectedElement.category === 'socket' && (() => {
+                const c = project.circuits.find((item) => item.id === selectedElement.circuitId);
+                if (c && c.breakerRatingA <= 10) {
+                  return (
+                    <p className="mt-1.5 text-[11px] text-amber-400 bg-amber-950/40 border border-amber-800/50 rounded px-2 py-1">
+                      ⚠️ ПУЕ: Розетка призначена на групу освітлення {c.breakerRatingA}А. Побутові розетки потребують групу 16А (ВВГнгд 3×2.5).
+                    </p>
+                  );
+                }
+                return null;
+              })()}
             </div>
 
             {/* Switch Linking & Key Management (for lights and switches) */}
@@ -463,6 +677,15 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     )}
                   </div>
                 )}
+
+                {/* Interactive Switch Wiring Schematic Dialog Button */}
+                <button
+                  onClick={() => onOpenSwitchWiringDiagram?.(selectedElement)}
+                  className="w-full py-2 px-3 rounded-lg bg-amber-950/40 border border-amber-500/50 text-amber-300 hover:bg-amber-900/50 flex items-center justify-center gap-2 font-semibold text-xs transition-colors shadow-sm"
+                >
+                  <Zap className="w-3.5 h-3.5 text-amber-400" />
+                  <span>⚡ Схема комутації вимикача (L ➔ SW ➔ L')</span>
+                </button>
               </div>
             )}
 
@@ -632,6 +855,57 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               </div>
             </div>
 
+            {/* Auto vs Manual Routing Toggle for this specific wire */}
+            <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 space-y-2">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-neutral-400">Режим цієї траси:</span>
+                <span
+                  className={`font-semibold ${
+                    selectedWire.isManual ? 'text-amber-400' : 'text-emerald-400'
+                  }`}
+                >
+                  {selectedWire.isManual ? '🔒 Ручна (зафіксовано)' : '⚡ Авто ПУЕ (90°)'}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  onClick={() =>
+                    onUpdateWire?.({
+                      ...selectedWire,
+                      isManual: false,
+                    })
+                  }
+                  className={`py-1.5 px-2 rounded text-center border text-[11px] transition-colors ${
+                    !selectedWire.isManual
+                      ? 'bg-emerald-950/60 border-emerald-500 text-emerald-300 font-semibold'
+                      : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                  }`}
+                >
+                  ⚡ Авто ПУЕ
+                </button>
+                <button
+                  onClick={() =>
+                    onUpdateWire?.({
+                      ...selectedWire,
+                      isManual: true,
+                    })
+                  }
+                  className={`py-1.5 px-2 rounded text-center border text-[11px] transition-colors ${
+                    selectedWire.isManual
+                      ? 'bg-amber-950/60 border-amber-500 text-amber-300 font-semibold'
+                      : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                  }`}
+                >
+                  🔒 Зафіксувати
+                </button>
+              </div>
+              <p className="text-[10px] text-neutral-500 leading-tight">
+                {selectedWire.isManual
+                  ? 'Вузли та геометрія захищені від перезапису автоматичним трасуванням.'
+                  : 'Траса автоматично оптимізується за ортогональною сіткою ПУЕ.'}
+              </p>
+            </div>
+
             {/* Circuit Group Selector */}
             <div>
               <label className="text-[11px] text-neutral-500 block mb-1">
@@ -728,28 +1002,95 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               </div>
             </div>
 
-            {/* Intermediate Waypoints Info */}
-            <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 text-xs space-y-1.5">
+            {/* Intermediate Waypoints Info & Insertion */}
+            <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 text-xs space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-neutral-400">Кути повороту:</span>
                 <span className="font-mono text-neutral-200 font-semibold">
                   {selectedWire.points?.length ? `${selectedWire.points.length} точок` : 'Авто ПУЕ (90°)'}
                 </span>
               </div>
-              {selectedWire.points && selectedWire.points.length > 0 && (
+              <div className="flex items-center gap-1.5">
                 <button
-                  onClick={() =>
+                  onClick={() => {
+                    if (!wireFromEl || !wireToEl) return;
+                    const curPoints = selectedWire.points && selectedWire.points.length >= 2
+                      ? selectedWire.points
+                      : [wireFromEl.position, wireToEl.position];
+                    const midX = (curPoints[0].x + curPoints[curPoints.length - 1].x) / 2;
+                    const midY = (curPoints[0].y + curPoints[curPoints.length - 1].y) / 2;
+                    const midIdx = Math.floor(curPoints.length / 2);
+                    const updated = [
+                      ...curPoints.slice(0, midIdx),
+                      { x: midX, y: midY },
+                      ...curPoints.slice(midIdx),
+                    ];
+                    const newLen = calculateCableLengthM(
+                      wireFromEl,
+                      wireToEl,
+                      project.ceilingHeightMm,
+                      selectedWire.conduit,
+                      updated
+                    );
                     onUpdateWire?.({
                       ...selectedWire,
-                      points: undefined,
-                    })
-                  }
-                  className="w-full py-1 text-[11px] text-neutral-400 hover:text-neutral-200 bg-neutral-900 border border-neutral-800 rounded hover:border-neutral-700"
+                      points: updated,
+                      isManual: true,
+                      calculatedLengthM: newLen,
+                    });
+                  }}
+                  className="flex-1 py-1.5 text-[11px] font-semibold text-sky-400 hover:text-sky-300 bg-sky-950/40 border border-sky-800/60 rounded hover:border-sky-700 transition-colors"
                 >
-                  Скинути до стандартного прямого кута
+                  + Додати точку у трасу
                 </button>
-              )}
+                {selectedWire.points && selectedWire.points.length > 0 && (
+                  <button
+                    onClick={() =>
+                      onUpdateWire?.({
+                        ...selectedWire,
+                        points: undefined,
+                      })
+                    }
+                    className="py-1.5 px-2 text-[11px] text-neutral-400 hover:text-neutral-200 bg-neutral-900 border border-neutral-800 rounded hover:border-neutral-700 transition-colors"
+                    title="Скинути до стандартного кута"
+                  >
+                    Скинути
+                  </button>
+                )}
+              </div>
+              <p className="text-[10px] text-neutral-500 leading-tight">
+                Ви також можете клацнути будь-де на обраній лінії на полотні або перетягувати маркери для точного коригування.
+              </p>
             </div>
+
+            {/* Switch connection phase status (L ➔ SW ➔ L') */}
+            {((wireFromEl?.category === 'switch' || wireToEl?.category === 'switch') ||
+              (wireFromEl?.category === 'light' || wireToEl?.category === 'light')) && (
+              <div className="bg-amber-950/30 border border-amber-600/40 rounded-lg p-2.5 space-y-1.5">
+                <div className="flex items-center gap-1.5 text-amber-300 font-semibold text-[11px]">
+                  <Zap className="w-3.5 h-3.5 text-amber-400" />
+                  <span>
+                    {wireToEl?.category === 'switch' || wireFromEl?.category === 'switch'
+                      ? (wireFromEl?.category === 'light' || wireToEl?.category === 'light'
+                        ? "⚡ Комутована лінія L' (Вимикач ➔ Світильник)"
+                        : "⚡ Живильна лінія L (Фаза на вимикач за ПУЕ §6.1.14)")
+                      : "⚡ Лінія освітлення"}
+                  </span>
+                </div>
+                <p className="text-[10px] text-neutral-400 leading-tight">
+                  Фазний провід L заводиться безпосередньо у вимикач. Комутована фаза L' прямує до світильника. Нуль (N) та захисне заземлення (PE) підключаються безпосередньо до світильника.
+                </p>
+                <button
+                  onClick={() => {
+                    const sw = wireFromEl?.category === 'switch' ? wireFromEl : wireToEl?.category === 'switch' ? wireToEl : undefined;
+                    onOpenSwitchWiringDiagram?.(sw);
+                  }}
+                  className="w-full mt-1 py-1.5 px-2 bg-amber-900/40 hover:bg-amber-900/60 border border-amber-500/40 rounded text-amber-200 text-[11px] font-semibold flex items-center justify-center gap-1.5 transition-colors"
+                >
+                  <span>⚡ Схема підключення вимикача (L ➔ SW ➔ L')</span>
+                </button>
+              </div>
+            )}
 
             {/* Conduit / Installation Mode */}
             <div>
@@ -793,6 +1134,18 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                 Враховано трасу на плані + вертикальні спуски/підйоми до точок (висота стелі {project.ceilingHeightMm} мм) + нормативний запас 15% на обробку та підключення за ПУЕ.
               </p>
             </div>
+
+            {/* Delete Wire Action Button */}
+            <button
+              onClick={() => {
+                onDeleteWire?.(selectedWire.id);
+                onSelectWire?.(null);
+              }}
+              className="w-full py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 border border-rose-500/50 text-rose-300 font-semibold text-xs flex items-center justify-center gap-2 transition-colors shadow-sm"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+              <span>Видалити цю кабельну трасу (Delete)</span>
+            </button>
           </div>
         ) : selectedWall ? (
           /* CASE 3: WALL SELECTED */
@@ -975,6 +1328,46 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                 Виберіть елемент, кабельну трасу або стіну на плані для редагування параметрів.
               </p>
             </div>
+
+            {/* Global Project Auto-Routing Toggle Card */}
+            {onToggleAutoRouting && (
+              <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-neutral-300 font-medium">Автотрасування проекту:</span>
+                  <span
+                    className={`font-semibold ${
+                      autoRoutingEnabled ? 'text-emerald-400' : 'text-neutral-400'
+                    }`}
+                  >
+                    {autoRoutingEnabled ? '⚡ УВІМКНЕНО' : '🔒 ВИМКНЕНО'}
+                  </span>
+                </div>
+                <button
+                  onClick={onToggleAutoRouting}
+                  className={`w-full py-1.5 px-3 rounded-md text-xs font-semibold flex items-center justify-center gap-2 border transition-all ${
+                    autoRoutingEnabled
+                      ? 'bg-emerald-950/50 border-emerald-500/50 text-emerald-300 hover:bg-emerald-900/40'
+                      : 'bg-neutral-900 border-neutral-700 text-neutral-400 hover:text-neutral-200'
+                  }`}
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      autoRoutingEnabled ? 'bg-emerald-400 animate-pulse' : 'bg-neutral-500'
+                    }`}
+                  />
+                  <span>
+                    {autoRoutingEnabled
+                      ? 'Вимкнути автотрасування (перейти в ручний режим)'
+                      : 'Увімкнути автоматичне трасування ПУЕ'}
+                  </span>
+                </button>
+                <p className="text-[10px] text-neutral-500 leading-tight">
+                  {autoRoutingEnabled
+                    ? 'Автоматичне прокладання за сіткою ПУЕ під кутами 90° через розподільчі коробки РК.'
+                    : 'Ручний режим: всі створені та відредаговані вузли кабелів зафіксовані.'}
+                </p>
+              </div>
+            )}
 
             {/* Bulk Project Engineering Actions */}
             <div className="space-y-2 border-t border-neutral-800 pt-3">

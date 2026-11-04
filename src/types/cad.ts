@@ -2,6 +2,7 @@ export type CadTool =
   | 'select'
   | 'pan'
   | 'wall'
+  | 'room'
   | 'door'
   | 'window'
   | 'socket'
@@ -10,6 +11,7 @@ export type CadTool =
   | 'panel'
   | 'junction'
   | 'wire'
+  | 'furniture'
   | 'measure';
 
 export type ViewFilterMode = 
@@ -26,7 +28,8 @@ export type ElectricalCategory =
   | 'panel' 
   | 'junction' 
   | 'appliance'
-  | 'backup';
+  | 'backup'
+  | 'custom';
 
 export type ElectricalElementType =
   // Sockets
@@ -89,7 +92,13 @@ export type ElectricalElementType =
   | 'backup_battery'
   | 'backup_station'
   | 'backup_ats'
-  | 'backup_generator';
+  | 'backup_generator'
+  // Smart Home & KNX Automation
+  | 'knx_actuator'
+  | 'knx_power_supply'
+  | 'leak_sensor'
+  // Custom Library Elements
+  | 'custom_element';
 
 export interface Point {
   x: number;
@@ -141,6 +150,10 @@ export interface ElectricalElement {
   label?: string;
   notes?: string;
   isBackupPriority?: boolean; // True if powered during blackout
+  isCustom?: boolean;
+  customSymbolShape?: CustomSymbolShape;
+  customSymbolColor?: string;
+  customLibraryId?: string;
 }
 
 export interface WireRoute {
@@ -150,7 +163,8 @@ export interface WireRoute {
   points?: Point[]; // custom path vertices if manually routed
   mode: 'ortho' | 'curve' | 'direct';
   conduit: 'ceiling' | 'floor' | 'wall_chase';
-  cableType: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6' | 'FTP_Cat5e';
+  cableType: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6' | 'FTP_Cat5e' | 'KNX_Bus';
+  busType?: 'power' | 'knx' | 'ethernet';
   circuitId?: string;
   switchGroupId?: string;
   cableTag?: string; // e.g. "W1-01", "W2-03"
@@ -166,7 +180,7 @@ export interface CircuitGroup {
   breakerRatingA: 10 | 16 | 20 | 25 | 32 | 40;
   breakerCurve: 'B' | 'C';
   rcdType: 'none' | 'rcd_30ma' | 'rcd_10ma' | 'rcbo_30ma' | 'rcbo_10ma';
-  cableType: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6';
+  cableType: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6' | 'KNX_Bus';
   phase: 'L1' | 'L2' | 'L3';
   color: string;
   description?: string;
@@ -187,14 +201,65 @@ export interface BackupSystemConfig {
   mode: 'standard' | 'economy' | 'night_saver';
 }
 
+export type FurnitureCategory = 'living' | 'bedroom' | 'kitchen' | 'bathroom' | 'office' | 'custom';
+
+export type CustomSymbolShape =
+  | 'circle'
+  | 'socket'
+  | 'switch'
+  | 'light'
+  | 'motor'
+  | 'triangle'
+  | 'square'
+  | 'cross'
+  | 'rack'
+  | 'star'
+  | 'diamond'
+  | 'ev_charger'
+  | 'speaker'
+  | 'sensor';
+
 export interface FurnitureItem {
   id: string;
-  type: 'bed' | 'sofa' | 'dining_table' | 'kitchen_sink' | 'stove' | 'fridge' | 'desk' | 'wardrobe' | 'bath' | 'shower' | 'toilet' | 'wash_basin' | 'tv_cabinet';
+  type: 'bed' | 'sofa' | 'dining_table' | 'kitchen_sink' | 'stove' | 'fridge' | 'desk' | 'wardrobe' | 'bath' | 'shower' | 'toilet' | 'wash_basin' | 'tv_cabinet' | string;
   name: string;
   position: Point;
   width: number; // in mm
-  height: number; // in mm
+  height: number; // in mm (depth)
   rotation: number;
+  category?: FurnitureCategory;
+  cadShape?: string;
+  electricalHints?: string[];
+  notes?: string;
+  customItemId?: string;
+}
+
+export interface CustomLibraryItem {
+  id: string;
+  name: string;
+  kind: 'electrical' | 'furniture';
+  category: ElectricalCategory | 'furniture';
+  // Electrical properties
+  electricalType?: string;
+  powerWatts?: number;
+  mountingHeightMm?: number;
+  ipRating?: 'IP20' | 'IP44' | 'IP65';
+  phase?: 'L1' | 'L2' | 'L3' | '3-phase';
+  recommendedBreakerA?: 10 | 16 | 20 | 25 | 32 | 40 | 50 | 63;
+  recommendedCable?: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6' | 'FTP_Cat5e' | 'KNX_Bus';
+  symbolShape?: CustomSymbolShape;
+  symbolColor?: string;
+  // Furniture properties
+  furnitureType?: FurnitureItem['type'] | string;
+  widthMm?: number;
+  heightMm?: number;
+  cadShape?: string;
+  // Metadata & hints
+  shortDesc?: string;
+  notes?: string;
+  electricalHints?: string[];
+  createdAt?: string;
+  isFavorite?: boolean;
 }
 
 export interface BackgroundBlueprint {
@@ -229,6 +294,7 @@ export interface CadProject {
   wires: WireRoute[];
   circuits: CircuitGroup[];
   furniture: FurnitureItem[];
+  customLibrary?: CustomLibraryItem[];
   autoRoutingEnabled?: boolean;
 }
 
@@ -250,4 +316,93 @@ export interface AuditIssue {
   elementId?: string;
   circuitId?: string;
   autoFixAvailable?: boolean;
+}
+
+export interface LayerVisibilityConfig {
+  walls: boolean;            // Стіни та перегородки (A-WALL)
+  openings: boolean;         // Вікна та двері (A-DOOR-WIND)
+  rooms: boolean;            // Приміщення та площі (A-AREA)
+  sockets: boolean;          // Розетки та прилади (E-POWR-SOCK)
+  switches: boolean;         // Вимикачі світла (E-LITE-SWIT)
+  lights: boolean;           // Світильники та люстри (E-LITE-FIXT)
+  wiresPower: boolean;       // Силові кабельні траси (E-POWR-CABL)
+  wiresLighting: boolean;    // Траси освітлення (E-LITE-CABL)
+  conduitChase: boolean;     // Штроби у стінах (E-CHASE)
+  conduitCeiling: boolean;   // Траси по стелі у гофрі (E-CEIL)
+  conduitFloor: boolean;     // Траси у стяжці підлоги (E-FLOR)
+  wiresKnx?: boolean;        // Шина автоматизації KNX / Smart Home (E-KNX-BUS)
+  annotations: boolean;      // Виноски, бірки та примітки (E-ANNO)
+  dimensions: boolean;       // Розміри стін (A-DIMS)
+  heights: boolean;          // Висотні позначки (E-HGHT)
+  furniture: boolean;        // Меблі та сантехніка (A-FURN)
+  blueprint: boolean;        // Підкладка креслення БТІ (A-BLPR)
+}
+
+export const DEFAULT_LAYER_VISIBILITY: LayerVisibilityConfig = {
+  walls: true,
+  openings: true,
+  rooms: true,
+  sockets: true,
+  switches: true,
+  lights: true,
+  wiresPower: true,
+  wiresLighting: true,
+  conduitChase: true,
+  conduitCeiling: true,
+  conduitFloor: true,
+  wiresKnx: true,
+  annotations: true,
+  dimensions: true,
+  heights: true,
+  furniture: true,
+  blueprint: true,
+};
+
+/**
+ * Модульна компоновка електрощита на DIN-рейку (Enclosure & DIN-Rail Builder)
+ */
+export interface DinModuleItem {
+  id: string;
+  type:
+    | 'main_mcb'
+    | 'spd'
+    | 'voltage_relay'
+    | 'rcd'
+    | 'mcb'
+    | 'rcbo'
+    | 'contactor'
+    | 'knx_actuator'
+    | 'knx_psu'
+    | 'terminal_block'
+    | 'blank';
+  name: string;
+  subtitle?: string;
+  widthTe: number; // ширина в модулях 18мм (TE)
+  phase?: 'L1' | 'L2' | 'L3' | '3P' | '1P+N';
+  ratingA?: number;
+  curve?: 'B' | 'C' | 'D';
+  rcdCurrentMa?: 10 | 30 | 100 | 300;
+  circuitId?: string;
+  busbarConnection?: 'L1' | 'L2' | 'L3' | 'N' | 'none';
+  color?: string;
+}
+
+export interface DinRailRow {
+  id: string;
+  index: number;
+  name: string;
+  capacityTe: number; // зазвичай 12 або 18 TE
+  modules: DinModuleItem[];
+  hasBusbar?: boolean;
+  busbarType?: '1P' | '3P' | 'none';
+}
+
+export interface EnclosureConfig {
+  brand: 'Hager' | 'Schneider' | 'ABB' | 'General';
+  model: string; // e.g. "Hager Volta VU36NE", "Schneider Resi9 36M"
+  totalRows: number;
+  rowCapacityTe: number;
+  totalTe: number;
+  mounting: 'flush' | 'surface';
+  rows: DinRailRow[];
 }

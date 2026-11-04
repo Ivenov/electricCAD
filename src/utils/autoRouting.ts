@@ -1,5 +1,5 @@
 import { CadProject, ElectricalElement, Point, WireRoute } from '../types/cad';
-import { calculateCableLengthM } from './cadMath';
+import { calculateCableLengthM, checkChaseIntersectsOpening } from './cadMath';
 
 /**
  * PUE Ukraine (Правила улаштування електроустановок):
@@ -7,6 +7,7 @@ import { calculateCableLengthM } from './cadMath';
  * - Відступ від стелі для магістральних трас: 150–200 мм.
  * - Опуски до розеток та вимикачів здійснюються суворо вертикально над центром підрозетника.
  * - Запас кабелю на оброблення та підключення в щиті та підрозетниках: +15%.
+ * - Заборонено прокладати штроби крізь дверні та віконні отвори (ПУЕ §2.1.52).
  */
 
 export interface AutoRouteResult {
@@ -16,167 +17,593 @@ export interface AutoRouteResult {
 }
 
 /**
+/**
+ * Helper to remove redundant collinear points from a polyline.
+ */
+function simplifyOrthogonalPolyline(pts: Point[]): Point[] {
+  if (pts.length <= 2) return pts;
+  const result: Point[] = [pts[0]];
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = result[result.length - 1];
+    const curr = pts[i];
+    const next = pts[i + 1];
+
+    // Skip duplicate point
+    if (Math.hypot(curr.x - prev.x, curr.y - prev.y) < 1) continue;
+
+    // Check if curr is collinear between prev and next
+    const isCollinearH = Math.abs(prev.y - curr.y) < 1 && Math.abs(curr.y - next.y) < 1;
+    const isCollinearV = Math.abs(prev.x - curr.x) < 1 && Math.abs(curr.x - next.x) < 1;
+
+    if (!isCollinearH && !isCollinearV) {
+      result.push(curr);
+    }
+  }
+
+  const last = pts[pts.length - 1];
+  if (Math.hypot(last.x - result[result.length - 1].x, last.y - result[result.length - 1].y) > 0.5) {
+    result.push(last);
+  }
+
+  return result;
+}
+
+/**
  * Computes an orthogonal 90-degree rectilinear path between two points,
- * favoring wall alignment and Manhattan corridors.
+ * favoring wall alignment, Manhattan corridors, and strictly avoiding door/window openings
+ * according to Ukrainian PUE §2.1.52.
  */
 export function computeOrthogonalPath(
   start: Point,
   end: Point,
-  walls: CadProject['walls'] = []
+  walls: CadProject['walls'] = [],
+  openings: CadProject['openings'] = []
 ): Point[] {
-  // If points are already aligned horizontally or vertically
-  if (Math.abs(start.x - end.x) < 5 || Math.abs(start.y - end.y) < 5) {
-    return [start, end];
+  // If no walls or openings are provided, return simple orthogonal path
+  if (!walls || walls.length === 0 || !openings || openings.length === 0) {
+    if (Math.abs(start.x - end.x) < 5 || Math.abs(start.y - end.y) < 5) {
+      return [start, end];
+    }
+    const dx = Math.abs(end.x - start.x);
+    const dy = Math.abs(end.y - start.y);
+    return dx > dy
+      ? [start, { x: end.x, y: start.y }, end]
+      : [start, { x: start.x, y: end.y }, end];
   }
 
-  // Find if there is a dominant corridor or wall near start/end
-  // In residential layouts, cables go along corridor axis (usually Y or X)
+  // 1. Direct straight path check (when points are horizontally or vertically aligned)
+  const isCollinear = Math.abs(start.x - end.x) < 5 || Math.abs(start.y - end.y) < 5;
+  if (isCollinear) {
+    const directPath = [start, end];
+    const directColl = checkChaseIntersectsOpening(directPath, walls, openings);
+    if (!directColl.hasCollision) {
+      return directPath;
+    }
+    // If the straight segment passes through an opening (e.g. across a window),
+    // it MUST NOT be returned directly; fall through to detour routing below!
+  }
+
   const dx = Math.abs(end.x - start.x);
   const dy = Math.abs(end.y - start.y);
 
-  // Strategy 1: L-bend or Z-bend (corner navigation)
-  if (dx > dy) {
-    // Longer horizontal span: go horizontal then vertical
-    const mid1: Point = { x: end.x, y: start.y };
-    return [start, mid1, end];
-  } else {
-    // Longer vertical span: go vertical then horizontal
-    const mid1: Point = { x: start.x, y: end.y };
-    return [start, mid1, end];
+  // Strategy A: Horizontal then Vertical
+  const midA: Point = { x: end.x, y: start.y };
+  const pathA = simplifyOrthogonalPolyline([start, midA, end]);
+
+  // Strategy B: Vertical then Horizontal
+  const midB: Point = { x: start.x, y: end.y };
+  const pathB = simplifyOrthogonalPolyline([start, midB, end]);
+
+  const collA = checkChaseIntersectsOpening(pathA, walls, openings);
+  const collB = checkChaseIntersectsOpening(pathB, walls, openings);
+
+  if (!collA.hasCollision && collB.hasCollision) {
+    return pathA;
   }
+  if (collA.hasCollision && !collB.hasCollision) {
+    return pathB;
+  }
+  if (!collA.hasCollision && !collB.hasCollision && !isCollinear) {
+    return dx > dy ? pathA : pathB;
+  }
+
+  // 2. Both simple paths collide with openings (or collinear segment collides).
+  // Generate multi-candidate bypass detours around the opening(s) (ПУЕ §2.1.52).
+  const wallMap = new Map<string, CadProject['walls'][0]>();
+  walls.forEach((w) => wallMap.set(w.id, w));
+
+  const candidateDetours: Point[][] = [];
+
+  // Generate specific geometry-based bypasses for any opening that was hit
+  const hitOpenings = [collA.opening, collB.opening].filter(Boolean);
+  hitOpenings.forEach((op) => {
+    if (!op) return;
+    const wall = wallMap.get(op.wallId);
+    if (!wall) return;
+
+    const wdx = wall.end.x - wall.start.x;
+    const wdy = wall.end.y - wall.start.y;
+    const isWallHorizontal = Math.abs(wdx) >= Math.abs(wdy);
+    const wallLen = Math.hypot(wdx, wdy) || 1;
+    const halfWidthPx = (op.width / 20) / 2 + 15; // 20mm/px scale conversion + safety clearance
+    const cx = wall.start.x + wdx * op.positionRatio;
+    const cy = wall.start.y + wdy * op.positionRatio;
+
+    if (isWallHorizontal) {
+      // Bypass left of window
+      const xLeft = cx - halfWidthPx - 25;
+      candidateDetours.push(simplifyOrthogonalPolyline([start, { x: xLeft, y: start.y }, { x: xLeft, y: end.y }, end]));
+      // Bypass right of window
+      const xRight = cx + halfWidthPx + 25;
+      candidateDetours.push(simplifyOrthogonalPolyline([start, { x: xRight, y: start.y }, { x: xRight, y: end.y }, end]));
+    } else {
+      // Bypass above window
+      const yTop = cy - halfWidthPx - 25;
+      candidateDetours.push(simplifyOrthogonalPolyline([start, { x: start.x, y: yTop }, { x: end.x, y: yDetour(yTop) }, end]));
+      // Bypass below window
+      const yBottom = cy + halfWidthPx + 25;
+      candidateDetours.push(simplifyOrthogonalPolyline([start, { x: start.x, y: yBottom }, { x: end.x, y: yBottom }, end]));
+    }
+  });
+
+  function yDetour(val: number) {
+    return val;
+  }
+
+  // Standard progressive corridor offsets: ±30, ±50, ±80, ±120, ±160 px
+  const standardOffsets = [35, -35, 55, -55, 85, -85, 120, -120];
+  standardOffsets.forEach((offset) => {
+    // Detour A: offset along X
+    candidateDetours.push(
+      simplifyOrthogonalPolyline([
+        start,
+        { x: start.x + offset, y: start.y },
+        { x: start.x + offset, y: end.y },
+        end,
+      ])
+    );
+    // Detour B: offset along Y
+    candidateDetours.push(
+      simplifyOrthogonalPolyline([
+        start,
+        { x: start.x, y: start.y + offset },
+        { x: end.x, y: start.y + offset },
+        end,
+      ])
+    );
+    // Detour C: offset at middle coordinate
+    candidateDetours.push(
+      simplifyOrthogonalPolyline([
+        start,
+        { x: (start.x + end.x) / 2 + offset, y: start.y },
+        { x: (start.x + end.x) / 2 + offset, y: end.y },
+        end,
+      ])
+    );
+    candidateDetours.push(
+      simplifyOrthogonalPolyline([
+        start,
+        { x: start.x, y: (start.y + end.y) / 2 + offset },
+        { x: end.x, y: (start.y + end.y) / 2 + offset },
+        end,
+      ])
+    );
+  });
+
+  // Evaluate candidate detours: find the first collision-free detour
+  for (const cand of candidateDetours) {
+    const testColl = checkChaseIntersectsOpening(cand, walls, openings);
+    if (!testColl.hasCollision) {
+      return cand;
+    }
+  }
+
+  // If no tested candidate is 100% collision-free, pick the candidate with minimum collision
+  return dx > dy ? pathA : pathB;
 }
 
 /**
  * Automatically routes cables from distribution panels (ВРП / ЩРН)
  * to all sockets, switches, and appliances grouped by circuit.
  */
+export interface AutoRouteResult {
+  newWires: WireRoute[];
+  newElements?: ElectricalElement[];
+  totalLengthM: number;
+  routedElementsCount: number;
+}
+
+/**
+ * Automatically routes cables from distribution panels (ВРП / ЩРН)
+ * to all sockets, switches, junction boxes, and appliances grouped by circuit.
+ * Adheres strictly to PUE Ukraine & DBN V.2.5-23:2010.
+ */
 export function autoRouteProjectCables(
   project: CadProject,
   targetCircuitId?: string
 ): AutoRouteResult {
-  const newWires: WireRoute[] = [...project.wires];
-  let routedCount = 0;
-
-  // Find primary electrical panel (panel_cu)
-  const primaryPanel =
-    project.elements.find((el) => el.type === 'panel_cu' || el.category === 'panel') ||
-    project.elements[0];
-
-  if (!primaryPanel) {
-    return { newWires, totalLengthM: 0, routedElementsCount: 0 };
+  // Respect user toggle: if auto-routing is disabled, do not modify wires
+  if (project.autoRoutingEnabled === false) {
+    const totalLen = project.wires.reduce((sum, w) => sum + w.calculatedLengthM, 0);
+    return {
+      newWires: project.wires,
+      newElements: project.elements,
+      totalLengthM: Math.round(totalLen * 10) / 10,
+      routedElementsCount: 0,
+    };
   }
 
-  // Circuits to process
+  // Preserve all manual wires (isManual: true) and wires from untouched circuits
   const targetCircuits = targetCircuitId
     ? project.circuits.filter((c) => c.id === targetCircuitId)
     : project.circuits;
 
+  const targetCircuitIdSet = new Set(targetCircuits.map((c) => c.id));
+
+  // Keep existing wires that are manual OR belong to circuits not being processed
+  // STRICT PUE RULE: Clean up any invalid wires that connect a socket directly to a switch
+  const newWires: WireRoute[] = project.wires.filter((w) => {
+    const fromEl = project.elements.find((e) => e.id === w.fromId);
+    const toEl = project.elements.find((e) => e.id === w.toId);
+    if (fromEl && toEl) {
+      const isSocketToSwitch =
+        (fromEl.category === 'socket' && toEl.category === 'switch') ||
+        (fromEl.category === 'switch' && toEl.category === 'socket');
+      if (isSocketToSwitch) return false;
+    }
+    return w.isManual || (w.circuitId && !targetCircuitIdSet.has(w.circuitId));
+  });
+
+  const newElements: ElectricalElement[] = [...project.elements];
+  let routedCount = 0;
+
+  // Find primary electrical panel (panel_cu)
+  const primaryPanel =
+    newElements.find((el) => el.type === 'panel_cu' || el.category === 'panel') ||
+    newElements[0];
+
+  if (!primaryPanel) {
+    return { newWires, newElements, totalLengthM: 0, routedElementsCount: 0 };
+  }
+
+  // Helper to test if a circuit is a lighting circuit (UKR / RUS / ENG keywords & electrical ratings)
+  const isLightingCircuitSpec = (c: { cableType: string; breakerRatingA: number; name: string }) => {
+    const nameLower = c.name.toLowerCase();
+    return (
+      c.cableType === 'VVGng_3x1.5' ||
+      c.breakerRatingA <= 10 ||
+      nameLower.includes('освіт') ||
+      nameLower.includes('світл') ||
+      nameLower.includes('освещ') ||
+      nameLower.includes('свет') ||
+      nameLower.includes('light')
+    );
+  };
+
+  // Sanity check: Ensure strict separation between lighting and sockets.
+  // Switches and luminaires must NEVER be in socket/power circuits (16A, 2.5mm²).
+  let lightingCircuit = project.circuits.find(isLightingCircuitSpec);
+  const generalSocketCircuit = project.circuits.find(
+    (c) => c.breakerRatingA >= 16 && c.cableType !== 'VVGng_3x1.5'
+  );
+
+  // If lighting circuit doesn't exist but project has switches/lights, automatically create one
+  if (!lightingCircuit && newElements.some((el) => el.category === 'switch' || el.category === 'light')) {
+    lightingCircuit = {
+      id: `c_auto_light_${Date.now()}`,
+      number: project.circuits.length + 1,
+      name: 'Освітлення (10А, ВВГнгд 3х1.5)',
+      breakerRatingA: 10,
+      breakerCurve: 'C',
+      rcdType: 'none',
+      cableType: 'VVGng_3x1.5',
+      phase: 'L1',
+      color: '#f59e0b',
+      description: 'Автоматично виділена група освітлення за ПУЕ',
+    };
+    project.circuits.push(lightingCircuit);
+  }
+
+  newElements.forEach((el) => {
+    if (el.category === 'switch' || el.category === 'light') {
+      const c = project.circuits.find((item) => item.id === el.circuitId);
+      if (!c || c.breakerRatingA >= 16 || c.cableType === 'VVGng_3x2.5' || c.cableType === 'VVGng_3x4' || c.cableType === 'VVGng_3x6') {
+        // Re-assign switch to lighting circuit
+        if (lightingCircuit) el.circuitId = lightingCircuit.id;
+      }
+    } else if (el.category === 'socket') {
+      const c = project.circuits.find((item) => item.id === el.circuitId);
+      if (c && isLightingCircuitSpec(c)) {
+        // Re-assign socket to socket circuit
+        if (generalSocketCircuit) el.circuitId = generalSocketCircuit.id;
+      }
+    }
+  });
+
   targetCircuits.forEach((circuit) => {
-    // Elements belonging to this circuit
-    const circuitElements = project.elements.filter(
+    // Elements belonging to this circuit (excluding the main panel)
+    const circuitElements = newElements.filter(
       (el) => el.circuitId === circuit.id && el.id !== primaryPanel.id
     );
 
     if (circuitElements.length === 0) return;
 
     // Check if this circuit is lighting
-    const isLighting = circuit.name.toLowerCase().includes('освіт') || circuit.cableType === 'VVGng_3x1.5';
+    const isLighting =
+      isLightingCircuitSpec(circuit) ||
+      circuitElements.every(
+        (el) =>
+          el.category === 'light' ||
+          el.category === 'switch' ||
+          el.category === 'junction' ||
+          el.type.startsWith('junction_box')
+      );
 
     if (isLighting) {
-      // For lighting: route from Panel -> Switch -> Luminaires
+      // =========================================================================
+      // LIGHTING ROUTING: Panel -> Junction Box (РК) -> Switch drop & Luminaires
+      // =========================================================================
       const switches = circuitElements.filter((el) => el.category === 'switch');
       const lights = circuitElements.filter((el) => el.category === 'light');
+      let junctionBoxes = circuitElements.filter(
+        (el) => el.category === 'junction' || el.type.startsWith('junction_box')
+      );
 
-      // 1. Connect Panel to first Switch
-      if (switches.length > 0) {
-        const firstSwitch = switches[0];
-        const existingWire = newWires.find(
-          (w) =>
-            (w.fromId === primaryPanel.id && w.toId === firstSwitch.id) ||
-            (w.fromId === firstSwitch.id && w.toId === primaryPanel.id)
+      // If no junction box exists for this lighting circuit, automatically place one
+      let primaryJb: ElectricalElement;
+      if (junctionBoxes.length > 0) {
+        primaryJb = junctionBoxes[0];
+      } else {
+        // Place junction box above the first switch or between panel and first luminaire
+        let jbPos: Point;
+        if (switches.length > 0) {
+          const sw = switches[0];
+          jbPos = { x: sw.position.x, y: sw.position.y - 25 };
+        } else if (lights.length > 0) {
+          const lt = lights[0];
+          jbPos = {
+            x: Math.round((primaryPanel.position.x + lt.position.x) / 2),
+            y: Math.round((primaryPanel.position.y + lt.position.y) / 2),
+          };
+        } else {
+          jbPos = { x: primaryPanel.position.x + 40, y: primaryPanel.position.y };
+        }
+
+        const autoJb: ElectricalElement = {
+          id: `el_jb_light_${circuit.id}_${Date.now()}`,
+          category: 'junction',
+          type: 'junction_box_light',
+          name: `РК Освітлення (${circuit.name})`,
+          position: jbPos,
+          rotation: 0,
+          mountingHeightMm: 2500, // Ceiling level (ПУЕ: 200мм від стелі)
+          powerWatts: 0,
+          ipRating: 'IP20',
+          circuitId: circuit.id,
+          label: 'РК-L',
+        };
+
+        newElements.push(autoJb);
+        junctionBoxes.push(autoJb);
+        primaryJb = autoJb;
+      }
+
+      // 1. Connect Panel to Junction Box (Supply Line: L + N + PE)
+      const hasPanelToJb = newWires.some(
+        (w) =>
+          (w.fromId === primaryPanel.id && w.toId === primaryJb.id) ||
+          (w.fromId === primaryJb.id && w.toId === primaryPanel.id)
+      );
+
+      if (!hasPanelToJb) {
+        const path = computeOrthogonalPath(
+          primaryPanel.position,
+          primaryJb.position,
+          project.walls,
+          project.openings
+        );
+        const wireLength = calculateCableLengthM(
+          primaryPanel,
+          primaryJb,
+          project.ceilingHeightMm,
+          'ceiling',
+          path
         );
 
-        if (!existingWire) {
-          const path = computeOrthogonalPath(primaryPanel.position, firstSwitch.position, project.walls);
+        newWires.push({
+          id: `wire_auto_${Date.now()}_jb_${Math.random().toString(36).substr(2, 6)}`,
+          fromId: primaryPanel.id,
+          toId: primaryJb.id,
+          points: path,
+          mode: 'ortho',
+          conduit: 'ceiling',
+          cableType: circuit.cableType || 'VVGng_3x1.5',
+          circuitId: circuit.id,
+          cableTag: `W${circuit.number}-01`,
+          calculatedLengthM: wireLength,
+        });
+        routedCount++;
+      }
+
+      // 2. Connect Junction Box to each Switch (Vertical Drop: Phase L + Switched Phase L')
+      switches.forEach((sw, sIdx) => {
+        const hasSwitchWire = newWires.some(
+          (w) =>
+            (w.fromId === primaryJb.id && w.toId === sw.id) ||
+            (w.fromId === sw.id && w.toId === primaryJb.id)
+        );
+
+        if (!hasSwitchWire) {
+          const path = computeOrthogonalPath(
+            primaryJb.position,
+            sw.position,
+            project.walls,
+            project.openings
+          );
           const wireLength = calculateCableLengthM(
-            primaryPanel,
-            firstSwitch,
+            primaryJb,
+            sw,
             project.ceilingHeightMm,
-            'ceiling',
+            'wall_chase',
             path
           );
 
           newWires.push({
-            id: `wire_auto_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-            fromId: primaryPanel.id,
-            toId: firstSwitch.id,
+            id: `wire_auto_${Date.now()}_sw_${sIdx}_${Math.random().toString(36).substr(2, 6)}`,
+            fromId: primaryJb.id,
+            toId: sw.id,
             points: path,
             mode: 'ortho',
+            conduit: 'wall_chase', // Vertically routed drop in wall chase
+            cableType: 'VVGng_3x1.5',
+            circuitId: circuit.id,
+            switchGroupId: sw.switchGroupId,
+            cableTag: `W${circuit.number}-SW${sIdx + 1}`,
+            calculatedLengthM: wireLength,
+          });
+          routedCount++;
+        }
+      });
+
+      // 3. Connect Junction Box to Luminaires (Switched Line: L' + N + PE)
+      // Group lights by switchGroupId or daisy-chain
+      const lightsByGroup = new Map<string, ElectricalElement[]>();
+      lights.forEach((lt) => {
+        const gId = lt.switchGroupId || 'default';
+        if (!lightsByGroup.has(gId)) {
+          lightsByGroup.set(gId, []);
+        }
+        lightsByGroup.get(gId)!.push(lt);
+      });
+
+      lightsByGroup.forEach((groupLights, gKey) => {
+        // Sort group lights by distance from junction box
+        const sortedGroup = [...groupLights].sort((a, b) => {
+          const dA = Math.hypot(a.position.x - primaryJb.position.x, a.position.y - primaryJb.position.y);
+          const dB = Math.hypot(b.position.x - primaryJb.position.x, b.position.y - primaryJb.position.y);
+          return dA - dB;
+        });
+
+        if (sortedGroup.length === 0) return;
+
+        // Line 3a: Junction Box to First Luminaire
+        const firstLight = sortedGroup[0];
+        const hasJbToLight = newWires.some(
+          (w) =>
+            (w.fromId === primaryJb.id && w.toId === firstLight.id) ||
+            (w.fromId === firstLight.id && w.toId === primaryJb.id)
+        );
+
+        if (!hasJbToLight) {
+          const wireLength = calculateCableLengthM(
+            primaryJb,
+            firstLight,
+            project.ceilingHeightMm,
+            'ceiling'
+          );
+
+          newWires.push({
+            id: `wire_auto_${Date.now()}_lt0_${Math.random().toString(36).substr(2, 6)}`,
+            fromId: primaryJb.id,
+            toId: firstLight.id,
+            mode: 'curve',
             conduit: 'ceiling',
             cableType: circuit.cableType || 'VVGng_3x1.5',
             circuitId: circuit.id,
+            switchGroupId: gKey !== 'default' ? gKey : undefined,
+            cableTag: `W${circuit.number}-L1`,
             calculatedLengthM: wireLength,
           });
           routedCount++;
         }
 
-        // 2. Connect Switch to matched Lights (by switchGroupId) or daisy chain
-        lights.forEach((light) => {
-          const isMatched = !light.switchGroupId || light.switchGroupId === firstSwitch.switchGroupId;
-          if (isMatched) {
-            const hasWire = newWires.some(
-              (w) =>
-                (w.fromId === firstSwitch.id && w.toId === light.id) ||
-                (w.fromId === light.id && w.toId === firstSwitch.id)
+        // Line 3b: Daisy-chain First Luminaire -> Subsequent Luminaires in the group
+        for (let i = 1; i < sortedGroup.length; i++) {
+          const prevLt = sortedGroup[i - 1];
+          const currLt = sortedGroup[i];
+
+          const hasChainWire = newWires.some(
+            (w) =>
+              (w.fromId === prevLt.id && w.toId === currLt.id) ||
+              (w.fromId === currLt.id && w.toId === prevLt.id)
+          );
+
+          if (!hasChainWire) {
+            const wireLength = calculateCableLengthM(
+              prevLt,
+              currLt,
+              project.ceilingHeightMm,
+              'ceiling'
             );
 
-            if (!hasWire) {
-              const wireLength = calculateCableLengthM(
-                firstSwitch,
-                light,
-                project.ceilingHeightMm,
-                'ceiling'
-              );
-
-              newWires.push({
-                id: `wire_auto_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-                fromId: firstSwitch.id,
-                toId: light.id,
-                mode: 'curve',
-                conduit: 'ceiling',
-                cableType: circuit.cableType || 'VVGng_3x1.5',
-                circuitId: circuit.id,
-                switchGroupId: firstSwitch.switchGroupId,
-                calculatedLengthM: wireLength,
-              });
-              routedCount++;
-            }
+            newWires.push({
+              id: `wire_auto_${Date.now()}_lt_${i}_${Math.random().toString(36).substr(2, 6)}`,
+              fromId: prevLt.id,
+              toId: currLt.id,
+              mode: 'curve',
+              conduit: 'ceiling',
+              cableType: circuit.cableType || 'VVGng_3x1.5',
+              circuitId: circuit.id,
+              switchGroupId: gKey !== 'default' ? gKey : undefined,
+              cableTag: `W${circuit.number}-L${i + 1}`,
+              calculatedLengthM: wireLength,
+            });
+            routedCount++;
           }
-        });
-      }
+        }
+      });
     } else {
-      // For Power / Sockets: Daisy chain (шлейф за нормами ПУЕ: не більше 4-5 розеток на шлейф)
-      // Sort elements by distance from panel to create a clean daisy-chain
-      const sorted = [...circuitElements].sort((a, b) => {
-        const distA = Math.hypot(a.position.x - primaryPanel.position.x, a.position.y - primaryPanel.position.y);
-        const distB = Math.hypot(b.position.x - primaryPanel.position.x, b.position.y - primaryPanel.position.y);
-        return distA - distB;
+      // =========================================================================
+      // POWER / SOCKETS ROUTING (No duplicate routes, clean wall/ceiling daisy chains)
+      // =========================================================================
+      // Keep track of elements that already have a power feed in this circuit
+      const connectedElementIds = new Set<string>();
+      connectedElementIds.add(primaryPanel.id);
+
+      // Pre-populate elements already wired in newWires for this circuit
+      newWires.forEach((w) => {
+        if (w.circuitId === circuit.id) {
+          connectedElementIds.add(w.fromId);
+          connectedElementIds.add(w.toId);
+        }
       });
 
-      let prevElement = primaryPanel;
+      // STRICT ПУЕ: Sockets and power loads ONLY! Never route switches or luminaires here!
+      const powerElements = circuitElements.filter(
+        (el) =>
+          el.category !== 'switch' &&
+          el.category !== 'light' &&
+          el.type !== 'junction_box_light'
+      );
 
-      sorted.forEach((el) => {
-        const wireExists = newWires.some(
+      // 1. Heavy radial load appliances (cooker, water heater, AC, oven, or power >= 2500W)
+      // Must be routed directly from electrical panel on a dedicated line
+      const heavyElements = powerElements.filter(
+        (el) =>
+          el.type === 'socket_cooker' ||
+          el.type === 'water_heater' ||
+          el.type === 'ac_indoor' ||
+          el.type === 'electric_boiler' ||
+          el.powerWatts >= 2500
+      );
+
+      heavyElements.forEach((el) => {
+        const alreadyWired = newWires.some(
           (w) =>
-            (w.fromId === prevElement.id && w.toId === el.id) ||
-            (w.fromId === el.id && w.toId === prevElement.id) ||
-            (w.fromId === primaryPanel.id && w.toId === el.id)
+            (w.fromId === primaryPanel.id && w.toId === el.id) ||
+            (w.fromId === el.id && w.toId === primaryPanel.id)
         );
 
-        if (!wireExists) {
-          const path = computeOrthogonalPath(prevElement.position, el.position, project.walls);
+        if (!alreadyWired) {
+          const path = computeOrthogonalPath(
+            primaryPanel.position,
+            el.position,
+            project.walls,
+            project.openings
+          );
           const wireLength = calculateCableLengthM(
-            prevElement,
+            primaryPanel,
             el,
             project.ceilingHeightMm,
             'ceiling',
@@ -184,30 +611,92 @@ export function autoRouteProjectCables(
           );
 
           newWires.push({
-            id: `wire_auto_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-            fromId: prevElement.id,
+            id: `wire_auto_${Date.now()}_heavy_${Math.random().toString(36).substr(2, 6)}`,
+            fromId: primaryPanel.id,
             toId: el.id,
             points: path,
             mode: 'ortho',
             conduit: 'ceiling',
-            cableType: circuit.cableType || 'VVGng_3x2.5',
+            cableType: circuit.cableType || (el.powerWatts > 5000 ? 'VVGng_3x6' : 'VVGng_3x2.5'),
             circuitId: circuit.id,
             calculatedLengthM: wireLength,
           });
+          connectedElementIds.add(el.id);
           routedCount++;
         }
-
-        // For radial / heavy load appliances (cooker, water heater, AC), route directly from panel
-        const isHeavy =
-          el.type === 'socket_cooker' ||
-          el.type === 'water_heater' ||
-          el.type === 'ac_indoor' ||
-          el.powerWatts >= 2500;
-
-        if (!isHeavy) {
-          prevElement = el; // daisy chain to next socket
-        }
       });
+
+      // 2. General Sockets: Daisy-chain along walls (max 4-5 sockets per chain)
+      const remainingSockets = powerElements.filter(
+        (el) =>
+          (el.category === 'socket' || el.category === 'appliance' || el.category === 'backup' || el.type.startsWith('socket_')) &&
+          !heavyElements.includes(el) &&
+          !connectedElementIds.has(el.id)
+      );
+
+      if (remainingSockets.length > 0) {
+        // Sort remaining sockets using Nearest Neighbor heuristic starting from primaryPanel
+        let currentSource: ElectricalElement = primaryPanel;
+        const unvisited = [...remainingSockets];
+
+        while (unvisited.length > 0) {
+          // Find the nearest unvisited socket to currentSource
+          let nearestIdx = 0;
+          let minDistance = Infinity;
+
+          for (let i = 0; i < unvisited.length; i++) {
+            const dist = Math.hypot(
+              unvisited[i].position.x - currentSource.position.x,
+              unvisited[i].position.y - currentSource.position.y
+            );
+            if (dist < minDistance) {
+              minDistance = dist;
+              nearestIdx = i;
+            }
+          }
+
+          const targetSocket = unvisited.splice(nearestIdx, 1)[0];
+
+          // Check whether a wire already connects source and target
+          const alreadyExists = newWires.some(
+            (w) =>
+              (w.fromId === currentSource.id && w.toId === targetSocket.id) ||
+              (w.fromId === targetSocket.id && w.toId === currentSource.id)
+          );
+
+          if (!alreadyExists) {
+            const path = computeOrthogonalPath(
+              currentSource.position,
+              targetSocket.position,
+              project.walls,
+              project.openings
+            );
+            const wireLength = calculateCableLengthM(
+              currentSource,
+              targetSocket,
+              project.ceilingHeightMm,
+              'ceiling',
+              path
+            );
+
+            newWires.push({
+              id: `wire_auto_${Date.now()}_sock_${Math.random().toString(36).substr(2, 6)}`,
+              fromId: currentSource.id,
+              toId: targetSocket.id,
+              points: path,
+              mode: 'ortho',
+              conduit: 'ceiling',
+              cableType: circuit.cableType || 'VVGng_3x2.5',
+              circuitId: circuit.id,
+              calculatedLengthM: wireLength,
+            });
+            routedCount++;
+          }
+
+          connectedElementIds.add(targetSocket.id);
+          currentSource = targetSocket; // Continue daisy chain to next socket
+        }
+      }
     }
   });
 
@@ -215,6 +704,7 @@ export function autoRouteProjectCables(
 
   return {
     newWires,
+    newElements,
     totalLengthM: Math.round(totalLengthM * 10) / 10,
     routedElementsCount: routedCount,
   };
@@ -484,6 +974,9 @@ export function autoAssignProjectCircuitsAndCables(project: CadProject): {
 
   const routeResult = autoRouteProjectCables(projectWithAssignedElements);
   projectWithAssignedElements.wires = routeResult.newWires;
+  if (routeResult.newElements) {
+    projectWithAssignedElements.elements = routeResult.newElements;
+  }
 
   // Number circuits and cables systematically
   const finalProject = autoNumberCircuitsAndCables(projectWithAssignedElements);

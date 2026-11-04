@@ -10,6 +10,7 @@ import {
   CadTool,
   ViewFilterMode,
   Point,
+  LayerVisibilityConfig,
 } from '../../types/cad';
 import { ElectricalSymbol } from './Symbols';
 import {
@@ -45,6 +46,9 @@ interface CadCanvasProps {
   showDimensions: boolean;
   showHeights: boolean;
   showFurniture: boolean;
+  showAnnotations?: boolean;
+  cadStyle?: string;
+  layerVisibility?: LayerVisibilityConfig;
   gridSnapEnabled: boolean;
   onSelectElement: (id: string | null) => void;
   onSelectWall: (id: string | null) => void;
@@ -72,6 +76,7 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
   showDimensions,
   showHeights,
   showFurniture,
+  layerVisibility,
   gridSnapEnabled,
   onSelectElement,
   onSelectWall,
@@ -337,8 +342,29 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
       }
 
       // Find appropriate default circuit
+      const isLightingCategory =
+        selectedCatalogItem.category === 'light' ||
+        selectedCatalogItem.category === 'switch' ||
+        selectedCatalogItem.category === 'junction' ||
+        selectedCatalogItem.type.startsWith('junction_box') ||
+        selectedCatalogItem.type.startsWith('switch_') ||
+        selectedCatalogItem.type.startsWith('light_');
+
+      const isLightCircuit = (c: { cableType: string; breakerRatingA: number; name: string }) => {
+        const cName = c.name.toLowerCase();
+        return (
+          c.cableType === 'VVGng_3x1.5' ||
+          c.breakerRatingA <= 10 ||
+          cName.includes('освіт') ||
+          cName.includes('світл') ||
+          cName.includes('освещ') ||
+          cName.includes('свет') ||
+          cName.includes('light')
+        );
+      };
+
       const matchedCircuit = project.circuits.find((c) =>
-        selectedCatalogItem.category === 'light' ? c.cableType === 'VVGng_3x1.5' : c.breakerRatingA >= 16
+        isLightingCategory ? isLightCircuit(c) : (!isLightCircuit(c) && c.breakerRatingA >= 16)
       );
 
       const newElement: ElectricalElement = {
@@ -383,6 +409,18 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
       } else if (wireSourceElementId !== el.id) {
         const fromEl = project.elements.find((item) => item.id === wireSourceElementId);
         if (fromEl) {
+          // PUE Rule: Sockets and Switches / Luminaires must NEVER be connected together
+          const isSocketFrom = fromEl.category === 'socket';
+          const isSocketTo = el.category === 'socket';
+          const isSwitchOrLightFrom = fromEl.category === 'switch' || fromEl.category === 'light';
+          const isSwitchOrLightTo = el.category === 'switch' || el.category === 'light';
+
+          if ((isSocketFrom && isSwitchOrLightTo) || (isSwitchOrLightFrom && isSocketTo)) {
+            console.warn('PUE Violation: Sockets cannot be directly wired to switches or luminaires.');
+            setWireSourceElementId(null);
+            return;
+          }
+
           const isLightingControl =
             (fromEl.category === 'switch' && el.category === 'light') ||
             (fromEl.category === 'light' && el.category === 'switch') ||
@@ -866,9 +904,9 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
                   <path
                     d={pathD}
                     fill="none"
-                    stroke="#38bdf8"
-                    strokeWidth={isLighting ? 6 : 7}
-                    strokeOpacity="0.4"
+                    stroke="#f59e0b"
+                    strokeWidth={isLighting ? 7 : 8}
+                    strokeOpacity="0.5"
                     strokeLinecap="round"
                     strokeLinejoin="round"
                   />
@@ -878,8 +916,8 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
                 <path
                   d={pathD}
                   fill="none"
-                  stroke={isSelected ? '#38bdf8' : wireColor}
-                  strokeWidth={isSelected ? 3.2 : isLighting ? 1.8 : 2.5}
+                  stroke={isSelected ? '#f59e0b' : wireColor}
+                  strokeWidth={isSelected ? 3.5 : isLighting ? 1.8 : 2.5}
                   strokeDasharray={isLighting ? '4 3' : 'none'}
                   strokeLinecap="round"
                   strokeLinejoin="round"

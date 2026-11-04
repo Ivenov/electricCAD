@@ -63,25 +63,57 @@ export class ThreeElectricalSceneBuilder {
 
     // Calculate bounding center of the floor plan
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    if (project.walls.length > 0) {
+    if (project.walls && project.walls.length > 0) {
       project.walls.forEach(w => {
-        minX = Math.min(minX, w.start.x, w.end.x);
-        maxX = Math.max(maxX, w.start.x, w.end.x);
-        minY = Math.min(minY, w.start.y, w.end.y);
-        maxY = Math.max(maxY, w.start.y, w.end.y);
+        if (w.start && typeof w.start.x === 'number' && typeof w.start.y === 'number' &&
+            w.end && typeof w.end.x === 'number' && typeof w.end.y === 'number') {
+          minX = Math.min(minX, w.start.x, w.end.x);
+          maxX = Math.max(maxX, w.start.x, w.end.x);
+          minY = Math.min(minY, w.start.y, w.end.y);
+          maxY = Math.max(maxY, w.start.y, w.end.y);
+        }
       });
-    } else {
-      minX = 0; maxX = 800; minY = 0; maxY = 600;
+    }
+    if (project.rooms && project.rooms.length > 0) {
+      project.rooms.forEach(r => {
+        r.points?.forEach(p => {
+          if (p && typeof p.x === 'number' && typeof p.y === 'number') {
+            minX = Math.min(minX, p.x);
+            maxX = Math.max(maxX, p.x);
+            minY = Math.min(minY, p.y);
+            maxY = Math.max(maxY, p.y);
+          }
+        });
+      });
+    }
+    if (project.elements && project.elements.length > 0) {
+      project.elements.forEach(e => {
+        if (e.position && typeof e.position.x === 'number' && typeof e.position.y === 'number') {
+          minX = Math.min(minX, e.position.x);
+          maxX = Math.max(maxX, e.position.x);
+          minY = Math.min(minY, e.position.y);
+          maxY = Math.max(maxY, e.position.y);
+        }
+      });
+    }
+    if (!isFinite(minX) || !isFinite(maxX) || minX >= maxX) {
+      minX = 0; maxX = 1200;
+    }
+    if (!isFinite(minY) || !isFinite(maxY) || minY >= maxY) {
+      minY = 0; maxY = 900;
     }
     this.centerX = (minX + maxX) / 2;
     this.centerY = (minY + maxY) / 2;
   }
 
   public to3DCoord(x: number, y: number, heightM: number = 0): THREE.Vector3 {
+    const validX = typeof x === 'number' && isFinite(x) ? x : 0;
+    const validY = typeof y === 'number' && isFinite(y) ? y : 0;
+    const validH = typeof heightM === 'number' && isFinite(heightM) ? heightM : 0;
     return new THREE.Vector3(
-      (x - this.centerX) * this.scaleM,
-      heightM,
-      (y - this.centerY) * this.scaleM
+      (validX - this.centerX) * this.scaleM,
+      validH,
+      (validY - this.centerY) * this.scaleM
     );
   }
 
@@ -146,16 +178,51 @@ export class ThreeElectricalSceneBuilder {
 
   private buildFloorAndCeiling(viewMode: ViewRenderMode, showCeiling: boolean) {
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    this.project.walls.forEach(w => {
-      minX = Math.min(minX, w.start.x, w.end.x);
-      maxX = Math.max(maxX, w.start.x, w.end.x);
-      minY = Math.min(minY, w.start.y, w.end.y);
-      maxY = Math.max(maxY, w.start.y, w.end.y);
-    });
+    if (this.project.walls && this.project.walls.length > 0) {
+      this.project.walls.forEach(w => {
+        if (w.start && typeof w.start.x === 'number' && typeof w.start.y === 'number' &&
+            w.end && typeof w.end.x === 'number' && typeof w.end.y === 'number') {
+          minX = Math.min(minX, w.start.x, w.end.x);
+          maxX = Math.max(maxX, w.start.x, w.end.x);
+          minY = Math.min(minY, w.start.y, w.end.y);
+          maxY = Math.max(maxY, w.start.y, w.end.y);
+        }
+      });
+    }
+    if (this.project.rooms && this.project.rooms.length > 0) {
+      this.project.rooms.forEach(r => {
+        r.points?.forEach(p => {
+          if (p && typeof p.x === 'number' && typeof p.y === 'number') {
+            minX = Math.min(minX, p.x);
+            maxX = Math.max(maxX, p.x);
+            minY = Math.min(minY, p.y);
+            maxY = Math.max(maxY, p.y);
+          }
+        });
+      });
+    }
+    if (this.project.elements && this.project.elements.length > 0) {
+      this.project.elements.forEach(e => {
+        if (e.position && typeof e.position.x === 'number' && typeof e.position.y === 'number') {
+          minX = Math.min(minX, e.position.x);
+          maxX = Math.max(maxX, e.position.x);
+          minY = Math.min(minY, e.position.y);
+          maxY = Math.max(maxY, e.position.y);
+        }
+      });
+    }
+    if (!isFinite(minX) || !isFinite(maxX) || minX >= maxX) {
+      minX = 0; maxX = 1200;
+    }
+    if (!isFinite(minY) || !isFinite(maxY) || minY >= maxY) {
+      minY = 0; maxY = 900;
+    }
 
     const pad = 60;
-    const widthM = (maxX - minX + pad * 2) * this.scaleM;
-    const depthM = (maxY - minY + pad * 2) * this.scaleM;
+    const calcW = (maxX - minX + pad * 2) * this.scaleM;
+    const calcD = (maxY - minY + pad * 2) * this.scaleM;
+    const widthM = Math.max(3, typeof calcW === 'number' && isFinite(calcW) ? calcW : 12);
+    const depthM = Math.max(3, typeof calcD === 'number' && isFinite(calcD) ? calcD : 9);
     const slabThickness = 0.15; // 150mm concrete slab
 
     // Floor Slab (Rough screed / стяжка підлоги)
@@ -231,11 +298,11 @@ export class ThreeElectricalSceneBuilder {
       const dx = p2.x - p1.x;
       const dz = p2.z - p1.z;
       const length = Math.sqrt(dx * dx + dz * dz);
-      if (length < 0.05) return;
+      if (!isFinite(length) || length < 0.05) return;
 
       const angle = Math.atan2(dz, dx);
-      const thickness = (wall.thickness || 150) / 1000;
-      const height = this.ceilingHeightM;
+      const thickness = Math.max(0.05, (wall.thickness || 150) / 1000);
+      const height = Math.max(0.5, this.ceilingHeightM || 2.7);
 
       // Find openings belonging to this wall
       const wallOpenings = (this.project.openings || []).filter(o => o.wallId === wall.id);
