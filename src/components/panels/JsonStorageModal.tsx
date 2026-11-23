@@ -1,7 +1,14 @@
 import React, { useState } from 'react';
-import { Copy, Check, Download, Code2, Table, RefreshCw } from 'lucide-react';
-import { CadProject } from '../../types/cad';
+import { Copy, Check, Download, Code2, Table, RefreshCw, History, Plus, RotateCcw, Trash2 } from 'lucide-react';
+import { CadProject, ProjectSnapshot } from '../../types/cad';
 import { pxToMm } from '../../utils/cadMath';
+import {
+  listProjectSnapshots,
+  saveProjectSnapshot,
+  restoreProjectSnapshot,
+  deleteProjectSnapshot,
+  validateAndParseProjectJson,
+} from '../../utils/storage';
 
 interface JsonStorageModalProps {
   project: CadProject;
@@ -14,10 +21,13 @@ export const JsonStorageModal: React.FC<JsonStorageModalProps> = ({
   onApplyJson,
   onClose,
 }) => {
-  const [activeTab, setActiveTab] = useState<'json' | 'table'>('json');
+  const [activeTab, setActiveTab] = useState<'json' | 'table' | 'snapshots'>('json');
   const [copied, setCopied] = useState(false);
   const [jsonText, setJsonText] = useState(() => JSON.stringify(project, null, 2));
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [snapshots, setSnapshots] = useState<ProjectSnapshot[]>(() => listProjectSnapshots());
+  const [snapshotLabel, setSnapshotLabel] = useState('');
 
   // Copy JSON
   const handleCopy = () => {
@@ -36,42 +46,68 @@ export const JsonStorageModal: React.FC<JsonStorageModalProps> = ({
     link.remove();
   };
 
-  // Apply edited JSON
+  // Apply edited JSON with full schema validation & migration
   const handleApply = () => {
-    try {
-      const parsed = JSON.parse(jsonText);
-      if (!parsed.elements || !parsed.circuits) {
-        setErrorMessage('Некоректна структура проекту: відсутні обов\'язкові масиви elements або circuits.');
-        return;
-      }
-      onApplyJson(parsed);
-      setErrorMessage(null);
-      onClose();
-    } catch (err: any) {
-      setErrorMessage(`Синтаксична помилка JSON: ${err?.message || err}`);
+    const res = validateAndParseProjectJson(jsonText);
+    if (!res.valid || !res.project) {
+      setErrorMessage(res.errors.join('; ') || 'Некоректна структура JSON проекту.');
+      return;
     }
+    onApplyJson(res.project);
+    setErrorMessage(null);
+    onClose();
+  };
+
+  const handleCreateSnapshot = () => {
+    const res = saveProjectSnapshot(project, snapshotLabel.trim() || undefined);
+    if (res.success) {
+      setSnapshots(listProjectSnapshots());
+      setSnapshotLabel('');
+      setErrorMessage(null);
+      setStatusMessage(`Збережено точку відновлення: «${res.snapshot?.label}»`);
+      setTimeout(() => setStatusMessage(null), 3000);
+    } else {
+      setErrorMessage(res.error || 'Не вдалося зберегти версію проекту');
+    }
+  };
+
+  const handleRestoreSnapshot = (snapId: string) => {
+    const restored = restoreProjectSnapshot(snapId);
+    if (!restored) {
+      setErrorMessage('Не вдалося відновити пошкоджену версію проекту');
+      return;
+    }
+    onApplyJson(restored);
+    setJsonText(JSON.stringify(restored, null, 2));
+    setErrorMessage(null);
+    onClose();
+  };
+
+  const handleDeleteSnapshot = (snapId: string) => {
+    const nextList = deleteProjectSnapshot(snapId);
+    setSnapshots(nextList);
   };
 
   return (
     <div className="fixed inset-0 z-50 bg-neutral-950/80 backdrop-blur-sm flex items-center justify-center p-4">
       <div className="bg-neutral-900 border border-neutral-800 rounded-xl w-full max-w-5xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
         {/* Header */}
-        <div className="px-6 py-4 border-b border-neutral-800 flex items-center justify-between">
+        <div className="px-6 py-4 border-b border-neutral-800 flex items-center justify-between gap-2 flex-wrap">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
               <Code2 className="w-4 h-4" />
             </div>
             <div>
               <h2 className="text-base font-bold text-white font-display">
-                База даних проекту та координатна сітка (JSON)
+                База даних проекту та історія версій (JSON)
               </h2>
               <p className="text-xs text-neutral-400">
-                Структуроване збереження координат (X, Y), типів обладнання, фаз, груп та довжин кабелів
+                Координати (X, Y), міграція схем, валідація та локальні точки відновлення (Snapshots)
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <div className="flex items-center gap-1 p-0.5 bg-neutral-950 rounded-lg border border-neutral-800 mr-2">
               <button
                 onClick={() => setActiveTab('json')}
@@ -94,6 +130,20 @@ export const JsonStorageModal: React.FC<JsonStorageModalProps> = ({
               >
                 <Table className="w-3.5 h-3.5" />
                 <span>Сітка координат</span>
+              </button>
+              <button
+                onClick={() => {
+                  setSnapshots(listProjectSnapshots());
+                  setActiveTab('snapshots');
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium transition-colors ${
+                  activeTab === 'snapshots'
+                    ? 'bg-neutral-800 text-amber-400 font-semibold shadow-sm'
+                    : 'text-neutral-400 hover:text-neutral-200'
+                }`}
+              >
+                <History className="w-3.5 h-3.5" />
+                <span>Історія версій ({snapshots.length})</span>
               </button>
             </div>
 
@@ -128,6 +178,14 @@ export const JsonStorageModal: React.FC<JsonStorageModalProps> = ({
           </div>
         )}
 
+        {/* Inline Success notification */}
+        {statusMessage && (
+          <div className="bg-emerald-950/40 border-b border-emerald-800/80 px-6 py-2.5 text-xs text-emerald-300 flex items-center justify-between">
+            <span>{statusMessage}</span>
+            <button onClick={() => setStatusMessage(null)} className="text-emerald-400 font-bold ml-2">✕</button>
+          </div>
+        )}
+
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-4 bg-neutral-950 font-mono text-xs">
           {activeTab === 'json' ? (
@@ -137,7 +195,7 @@ export const JsonStorageModal: React.FC<JsonStorageModalProps> = ({
               className="w-full h-full min-h-[480px] bg-transparent text-emerald-400 font-mono text-xs leading-relaxed focus:outline-none resize-none selection:bg-sky-900"
               spellCheck={false}
             />
-          ) : (
+          ) : activeTab === 'table' ? (
             <div className="border border-neutral-800 rounded-xl overflow-hidden bg-neutral-900">
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
@@ -195,6 +253,87 @@ export const JsonStorageModal: React.FC<JsonStorageModalProps> = ({
                 </tbody>
               </table>
             </div>
+          ) : (
+            <div className="font-sans space-y-4">
+              {/* Create new snapshot box */}
+              <div className="p-4 rounded-xl bg-neutral-900 border border-neutral-800 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                <div className="flex-1">
+                  <label className="text-[11px] text-neutral-400 block mb-1">
+                    Назва контрольної точки відновлення (до 15 версій у сховищі)
+                  </label>
+                  <input
+                    type="text"
+                    value={snapshotLabel}
+                    onChange={(e) => setSnapshotLabel(e.target.value)}
+                    placeholder="Наприклад: Перед автотрасуванням кухні"
+                    className="w-full bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-1.5 text-xs text-neutral-100 focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+                <button
+                  onClick={handleCreateSnapshot}
+                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold rounded-lg text-xs flex items-center justify-center gap-1.5 transition-colors self-end"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Зберегти версію (Snapshot)</span>
+                </button>
+              </div>
+
+              {/* Snapshots list */}
+              {snapshots.length === 0 ? (
+                <div className="p-8 rounded-xl bg-neutral-900/60 border border-neutral-800 text-center text-neutral-400 text-xs">
+                  Збережених версій ще немає. Створіть точку відновлення перед великими змінами плану чи трасування.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {snapshots.map((snap) => (
+                    <div
+                      key={snap.id}
+                      className="p-3.5 rounded-xl bg-neutral-900 border border-neutral-800 hover:border-neutral-700 flex items-center justify-between gap-3 transition-colors"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-neutral-100 truncate">
+                          {snap.label}
+                        </div>
+                        <div className="text-[11px] text-neutral-400 mt-0.5 flex items-center gap-2 flex-wrap font-mono">
+                          <span>
+                            {new Date(snap.createdAt).toLocaleString('uk-UA', {
+                              day: '2-digit',
+                              month: '2-digit',
+                              year: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </span>
+                          <span>·</span>
+                          <span className="text-sky-400">{snap.elementCount} точок</span>
+                          <span>·</span>
+                          <span className="text-amber-400">{snap.wireCount} трас</span>
+                          <span>·</span>
+                          <span className="text-emerald-400">{snap.circuitCount} груп</span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => handleRestoreSnapshot(snap.id)}
+                          className="px-3 py-1.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-500/50 text-sky-300 text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Відновити</span>
+                        </button>
+                        <button
+                          onClick={() => handleDeleteSnapshot(snap.id)}
+                          title="Видалити версію"
+                          className="p-1.5 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 border border-rose-800/50 text-rose-400 transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </div>
 
@@ -216,12 +355,14 @@ export const JsonStorageModal: React.FC<JsonStorageModalProps> = ({
               <RefreshCw className="w-3.5 h-3.5" />
               <span>Скинути до поточного</span>
             </button>
-            <button
-              onClick={handleApply}
-              className="px-4 py-2 bg-sky-500 hover:bg-sky-400 text-neutral-950 font-semibold rounded-lg text-xs transition-colors"
-            >
-              Застосувати зміни у проект
-            </button>
+            {activeTab !== 'snapshots' && (
+              <button
+                onClick={handleApply}
+                className="px-4 py-2 bg-sky-500 hover:bg-sky-400 text-neutral-950 font-semibold rounded-lg text-xs transition-colors"
+              >
+                Застосувати зміни у проект
+              </button>
+            )}
           </div>
         </div>
       </div>

@@ -38,23 +38,32 @@ import { JsonStorageModal } from './components/panels/JsonStorageModal';
 import { BlueprintUploadModal } from './components/panels/BlueprintUploadModal';
 import { BackupPowerModal } from './components/panels/BackupPowerModal';
 import { DstuDrawingAlbumModal } from './components/panels/DstuDrawingAlbumModal';
+import { ClientQuotationModal } from './components/panels/ClientQuotationModal';
 import { ThreeDViewModal } from './components/panels/ThreeDViewModal';
 import { DxfImportModal } from './components/panels/DxfImportModal';
 import { SwitchWiringDiagramModal } from './components/panels/SwitchWiringDiagramModal';
 import { LayersVisibilityModal } from './components/panels/LayersVisibilityModal';
 import { CustomLibraryModal } from './components/panels/CustomLibraryModal';
+import { AutoSocketsPlacementModal } from './components/panels/AutoSocketsPlacementModal';
+import { AutoLightingPlacementModal } from './components/panels/AutoLightingPlacementModal';
+import { WallElevationModal } from './components/panels/WallElevationModal';
+import { CableScheduleModal } from './components/panels/CableScheduleModal';
+import { PanelLabelPrinterModal } from './components/panels/PanelLabelPrinterModal';
+import { BlockStampsModal } from './components/panels/BlockStampsModal';
 import { getStoredCustomLibrary, saveStoredCustomLibrary } from './utils/customLibraryStorage';
 import {
   autoRouteProjectCables,
   autoNumberCircuitsAndCables,
   autoAssignProjectCircuitsAndCables,
   linkSwitchToLuminaires,
+  optimizeProjectCableRoutesParallel,
 } from './utils/autoRouting';
-import { BackupSystemConfig } from './types/cad';
-import { Code2, Image as ImageIcon, Zap, CheckCircle2, FileCode } from 'lucide-react';
-import { loadProjectFromLocalStorage, saveProjectToLocalStorage } from './utils/storage';
+import { BackupSystemConfig, FloorLevel } from './types/cad';
+import { Code2, Image as ImageIcon, Zap, CheckCircle2, FileCode, Building2, Plus, ChevronDown, Sparkles, Search, X } from 'lucide-react';
+import { loadProjectFromLocalStorage, saveProjectToLocalStorage, sanitizeProject } from './utils/storage';
 import { runPueAudit, applyAutoFix, applyAllAutoFixes } from './utils/pueRulesRegistry';
 import { detectRoomsFromWalls } from './utils/roomGeometry';
+import { mmToPx } from './utils/cadMath';
 
 export default function App() {
   // Main Project State initialized from LocalStorage autosave or standard template
@@ -63,7 +72,7 @@ export default function App() {
     if (loaded.project) {
       return loaded.project;
     }
-    return JSON.parse(JSON.stringify(TEMPLATES[0].project));
+    return sanitizeProject(JSON.parse(JSON.stringify(TEMPLATES[0].project)));
   });
 
   // Autosave status state
@@ -91,6 +100,11 @@ export default function App() {
   const [selectedOpeningPreset, setSelectedOpeningPreset] = useState<OpeningCatalogItem | null>(() => DOOR_OPENINGS_CATALOG[0]);
   const [selectedRoomType, setSelectedRoomType] = useState<Room['type']>('living');
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
+  const [multiSelectedElementIds, setMultiSelectedElementIds] = useState<string[]>([]);
+  const [clipboardElements, setClipboardElements] = useState<ElectricalElement[]>([]);
+  const [elementSearchOpen, setElementSearchOpen] = useState(false);
+  const [elementSearchQuery, setElementSearchQuery] = useState('');
+  const [focusRequest, setFocusRequest] = useState<{ elementId: string; ts: number } | null>(null);
   const [selectedWallId, setSelectedWallId] = useState<string | null>(null);
   const [selectedOpeningId, setSelectedOpeningId] = useState<string | null>(null);
   const [selectedWireId, setSelectedWireId] = useState<string | null>(null);
@@ -121,6 +135,7 @@ export default function App() {
   const [showHeights, setShowHeights] = useState(true);
   const [showFurniture, setShowFurniture] = useState(true);
   const [showAnnotations, setShowAnnotations] = useState(true);
+  const [showCircuitBadges, setShowCircuitBadges] = useState(true);
   const [cadStyle, setCadStyle] = useState<'autocad' | 'modern'>('autocad');
   const [gridSnapEnabled, setGridSnapEnabled] = useState(true);
   // Canvas engine: Konva.js (hardware accelerated layers) or SVG
@@ -135,8 +150,28 @@ export default function App() {
 
   // Active Overlay Modal
   const [activeModal, setActiveModal] = useState<
-    'none' | 'circuits' | 'bom' | 'audit' | 'templates' | 'export' | 'json' | 'blueprint' | 'backup' | 'dstu' | '3d' | 'dxf_import'
+    | 'none'
+    | 'circuits'
+    | 'bom'
+    | 'audit'
+    | 'templates'
+    | 'export'
+    | 'json'
+    | 'blueprint'
+    | 'backup'
+    | 'dstu'
+    | '3d'
+    | 'dxf_import'
+    | 'quotation'
+    | 'auto_sockets'
+    | 'auto_lighting'
+    | 'wall_elevation'
+    | 'cable_schedule'
+    | 'panel_labels'
+    | 'block_stamps'
   >('none');
+
+  const [elevationWallId, setElevationWallId] = useState<string | undefined>(undefined);
 
   // Autosave effect (debounced 600ms)
   useEffect(() => {
@@ -182,6 +217,13 @@ export default function App() {
     });
   }, [project, updateProjectWithHistory]);
 
+  const handleChangeDisplayUnit = useCallback((unit: 'mm' | 'cm' | 'm') => {
+    updateProjectWithHistory({
+      ...project,
+      displayUnit: unit,
+    });
+  }, [project, updateProjectWithHistory]);
+
   // Undo / Redo handlers
   const handleUndo = useCallback(() => {
     if (history.length === 0) return;
@@ -199,10 +241,176 @@ export default function App() {
     setProject(next);
   }, [redoStack, project]);
 
-  // Keyboard shortcut listener (Ctrl+Z, Ctrl+Y, S, K, L, W, V, C)
+  // Copy & Paste Clipboard, Batch Move/Delete/Align/Bulk Edit
+  const handleCopySelection = useCallback(() => {
+    const idsToCopy =
+      multiSelectedElementIds.length > 0
+        ? multiSelectedElementIds
+        : selectedElementId
+        ? [selectedElementId]
+        : [];
+    if (idsToCopy.length === 0) return;
+    const copied = project.elements.filter((el) => idsToCopy.includes(el.id));
+    if (copied.length === 0) return;
+    setClipboardElements(copied.map((el) => JSON.parse(JSON.stringify(el))));
+    setToastMessage(`📋 Скопійовано елементів: ${copied.length} шт.`);
+    setTimeout(() => setToastMessage(null), 2500);
+  }, [multiSelectedElementIds, selectedElementId, project.elements]);
+
+  const handlePasteClipboard = useCallback(() => {
+    if (clipboardElements.length === 0) return;
+    const now = Date.now();
+    const pasted: ElectricalElement[] = clipboardElements.map((el, idx) => ({
+      ...JSON.parse(JSON.stringify(el)),
+      id: `el_${now}_${idx}_${Math.random().toString(36).substring(2, 6)}`,
+      position: { x: el.position.x + 25, y: el.position.y + 25 },
+    }));
+    updateProjectWithHistory({
+      ...project,
+      elements: [...project.elements, ...pasted],
+    });
+    const newIds = pasted.map((p) => p.id);
+    if (newIds.length > 1) {
+      setMultiSelectedElementIds(newIds);
+      setSelectedElementId(newIds[0]);
+    } else if (newIds.length === 1) {
+      setMultiSelectedElementIds([]);
+      setSelectedElementId(newIds[0]);
+    }
+    setToastMessage(`📋 Вставлено елементів: ${pasted.length} шт.`);
+    setTimeout(() => setToastMessage(null), 2500);
+  }, [clipboardElements, project, updateProjectWithHistory]);
+
+  const handleMoveElementsBatch = useCallback(
+    (updates: Array<{ id: string; position: Point; rotation?: number; wallId?: string }>) => {
+      const updateMap = new Map(updates.map((u) => [u.id, u]));
+      updateProjectWithHistory({
+        ...project,
+        elements: project.elements.map((el) => {
+          const u = updateMap.get(el.id);
+          if (!u) return el;
+          return {
+            ...el,
+            position: u.position,
+            ...(u.rotation !== undefined ? { rotation: u.rotation } : {}),
+            ...(u.wallId !== undefined ? { wallId: u.wallId } : {}),
+          };
+        }),
+      });
+    },
+    [project, updateProjectWithHistory]
+  );
+
+  const handleDeleteElementsBatch = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return;
+      const idSet = new Set(ids);
+      updateProjectWithHistory({
+        ...project,
+        elements: project.elements.filter((el) => !idSet.has(el.id)),
+        wires: project.wires.filter((w) => !idSet.has(w.fromId) && !idSet.has(w.toId)),
+      });
+      setMultiSelectedElementIds([]);
+      setSelectedElementId(null);
+      setToastMessage(`🗑️ Видалено елементів: ${ids.length} шт.`);
+      setTimeout(() => setToastMessage(null), 2500);
+    },
+    [project, updateProjectWithHistory]
+  );
+
+  const handleBulkUpdateElements = useCallback(
+    (
+      ids: string[],
+      patch: Partial<Pick<ElectricalElement, 'circuitId' | 'mountingHeightMm' | 'ipRating' | 'isBackupPriority'>>
+    ) => {
+      if (ids.length === 0) return;
+      const idSet = new Set(ids);
+      updateProjectWithHistory({
+        ...project,
+        elements: project.elements.map((el) => (idSet.has(el.id) ? { ...el, ...patch } : el)),
+      });
+      setToastMessage(`✓ Оновлено властивості для ${ids.length} елементів`);
+      setTimeout(() => setToastMessage(null), 2500);
+    },
+    [project, updateProjectWithHistory]
+  );
+
+  const handleAlignElements = useCallback(
+    (ids: string[], mode: 'align_x' | 'align_y' | 'pitch_71_h' | 'pitch_71_v') => {
+      if (ids.length < 2) return;
+      const selectedList = project.elements.filter((el) => ids.includes(el.id));
+      if (selectedList.length < 2) return;
+
+      const posMap = new Map<string, Point>();
+      if (mode === 'align_x') {
+        const anchorX = selectedList[0].position.x;
+        selectedList.forEach((el) => posMap.set(el.id, { x: anchorX, y: el.position.y }));
+      } else if (mode === 'align_y') {
+        const anchorY = selectedList[0].position.y;
+        selectedList.forEach((el) => posMap.set(el.id, { x: el.position.x, y: anchorY }));
+      } else if (mode === 'pitch_71_h') {
+        const sorted = [...selectedList].sort((a, b) => a.position.x - b.position.x);
+        const startX = sorted[0].position.x;
+        const startY = sorted[0].position.y;
+        const stepPx = mmToPx(71);
+        sorted.forEach((el, idx) =>
+          posMap.set(el.id, {
+            x: Math.round((startX + idx * stepPx) * 10) / 10,
+            y: startY,
+          })
+        );
+      } else if (mode === 'pitch_71_v') {
+        const sorted = [...selectedList].sort((a, b) => a.position.y - b.position.y);
+        const startX = sorted[0].position.x;
+        const startY = sorted[0].position.y;
+        const stepPx = mmToPx(71);
+        sorted.forEach((el, idx) =>
+          posMap.set(el.id, {
+            x: startX,
+            y: Math.round((startY + idx * stepPx) * 10) / 10,
+          })
+        );
+      }
+
+      updateProjectWithHistory({
+        ...project,
+        elements: project.elements.map((el) => {
+          const nextPos = posMap.get(el.id);
+          return nextPos ? { ...el, position: nextPos } : el;
+        }),
+      });
+      setToastMessage('✓ Вирівнювання елементів виконано');
+      setTimeout(() => setToastMessage(null), 2000);
+    },
+    [project, updateProjectWithHistory]
+  );
+
+  const handleSelectAndFocusElement = useCallback((elId: string) => {
+    setActiveTool('select');
+    setMultiSelectedElementIds([]);
+    setSelectedElementId(elId);
+    setSelectedWallId(null);
+    setSelectedOpeningId(null);
+    setSelectedWireId(null);
+    setSelectedFurnitureId(null);
+    setFocusRequest({ elementId: elId, ts: Date.now() });
+    setElementSearchOpen(false);
+  }, []);
+
+  // Keyboard shortcut listener (Ctrl+Z, Ctrl+Y, Ctrl+C, Ctrl+V, Ctrl+D, Ctrl+F, S, K, L, W, V, C)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setElementSearchOpen((prev) => !prev);
+        return;
+      }
+
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
         return;
       }
 
@@ -216,6 +424,31 @@ export default function App() {
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
         e.preventDefault();
         handleRedo();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+        e.preventDefault();
+        handleCopySelection();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+        e.preventDefault();
+        handlePasteClipboard();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd') {
+        e.preventDefault();
+        if (selectedElementId) {
+          const existing = project.elements.find((el) => el.id === selectedElementId);
+          if (existing) {
+            const duplicated: ElectricalElement = {
+              ...existing,
+              id: `el_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+              name: `${existing.name} (Копія)`,
+              position: { x: existing.position.x + 25, y: existing.position.y + 25 },
+            };
+            updateProjectWithHistory({
+              ...project,
+              elements: [...project.elements, duplicated],
+            });
+            setMultiSelectedElementIds([]);
+            setSelectedElementId(duplicated.id);
+          }
+        }
       } else if (e.key === 'v' || e.key === 'V') {
         setActiveTool('select');
       } else if (e.key === 'h' || e.key === 'H') {
@@ -249,7 +482,15 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleUndo, handleRedo]);
+  }, [
+    handleUndo,
+    handleRedo,
+    handleCopySelection,
+    handlePasteClipboard,
+    selectedElementId,
+    project,
+    updateProjectWithHistory,
+  ]);
 
   // Element actions
   const handleAddElement = useCallback((element: ElectricalElement) => {
@@ -444,6 +685,8 @@ export default function App() {
         isCustom: true,
         customSymbolShape: item.symbolShape,
         customSymbolColor: item.symbolColor,
+        customSvgPath: item.customSvgPath,
+        customSvgData: item.customSvgData,
         customLibraryId: item.id,
         notes: item.notes,
       };
@@ -557,6 +800,29 @@ export default function App() {
     setToastMessage(`🔢 Автонумерація ДСТУ: присвоєно номери групам щита (Гр.1..N) та маркування кабелів (W1-01)`);
     setTimeout(() => setToastMessage(null), 4000);
   }, [project, updateProjectWithHistory]);
+
+  const handleApplyAutoSockets = useCallback((updatedProject: CadProject, message: string) => {
+    updateProjectWithHistory(updatedProject);
+    setToastMessage(message);
+    setTimeout(() => setToastMessage(null), 4500);
+  }, [updateProjectWithHistory]);
+
+  const handleApplyAutoLighting = useCallback((updatedProject: CadProject, message: string) => {
+    updateProjectWithHistory(updatedProject);
+    setToastMessage(message);
+    setTimeout(() => setToastMessage(null), 4500);
+  }, [updateProjectWithHistory]);
+
+  const handleApplyBlockStamp = useCallback((updatedProject: CadProject, message: string) => {
+    updateProjectWithHistory(updatedProject);
+    setToastMessage(message);
+    setTimeout(() => setToastMessage(null), 4000);
+  }, [updateProjectWithHistory]);
+
+  const handleOpenWallElevation = useCallback((wallId?: string) => {
+    setElevationWallId(wallId || (project.walls.length > 0 ? project.walls[0].id : undefined));
+    setActiveModal('wall_elevation');
+  }, [project.walls]);
 
   // Circuit actions
   const handleUpdateCircuits = useCallback((circuits: CircuitGroup[]) => {
@@ -686,6 +952,13 @@ export default function App() {
     }
   }, [project, updateProjectWithHistory]);
 
+  const handleOptimizeParallelWires = useCallback(() => {
+    const result = optimizeProjectCableRoutesParallel(project);
+    updateProjectWithHistory(result.project);
+    setToastMessage(`⚡ ${result.message}`);
+    setTimeout(() => setToastMessage(null), 4000);
+  }, [project, updateProjectWithHistory]);
+
   const handleUpdateBackupConfig = useCallback((config: BackupSystemConfig) => {
     updateProjectWithHistory({
       ...project,
@@ -700,6 +973,169 @@ export default function App() {
       circuits,
     });
   }, [project, updateProjectWithHistory]);
+
+  // Multi-floor management handlers (Багатоповерховість)
+  const currentFloors = useMemo<FloorLevel[]>(() => {
+    if (project.floors && project.floors.length > 0) {
+      return project.floors;
+    }
+    // Default 1st floor synthesis if not yet partitioned
+    return [
+      {
+        id: 'floor_1',
+        name: 'Поверх 1',
+        levelNumber: 1,
+        elevationMm: 0,
+        ceilingHeightMm: project.ceilingHeightMm || 2700,
+        distributionBoardName: 'ЩР-1',
+        backgroundImage: project.backgroundImage,
+        rooms: project.rooms,
+        walls: project.walls,
+        openings: project.openings,
+        elements: project.elements,
+        wires: project.wires,
+        furniture: project.furniture || [],
+      },
+    ];
+  }, [project]);
+
+  const activeFloorId = project.activeFloorId || currentFloors[0].id;
+  const activeFloor = currentFloors.find((f) => f.id === activeFloorId) || currentFloors[0];
+
+  const handleSelectFloor = useCallback((floorId: string) => {
+    if (floorId === activeFloorId) return;
+
+    // 1. Pack current floor geometry into floors array
+    const updatedFloors = currentFloors.map((fl) => {
+      if (fl.id === activeFloorId) {
+        return {
+          ...fl,
+          backgroundImage: project.backgroundImage,
+          rooms: project.rooms,
+          walls: project.walls,
+          openings: project.openings,
+          elements: project.elements,
+          wires: project.wires,
+          furniture: project.furniture || [],
+        };
+      }
+      return fl;
+    });
+
+    // 2. Extract target floor geometry
+    const targetFloor = updatedFloors.find((fl) => fl.id === floorId) || updatedFloors[0];
+
+    updateProjectWithHistory({
+      ...project,
+      floors: updatedFloors,
+      activeFloorId: floorId,
+      backgroundImage: targetFloor.backgroundImage,
+      rooms: targetFloor.rooms,
+      walls: targetFloor.walls,
+      openings: targetFloor.openings,
+      elements: targetFloor.elements,
+      wires: targetFloor.wires,
+      furniture: targetFloor.furniture,
+      ceilingHeightMm: targetFloor.ceilingHeightMm || 2700,
+    });
+
+    setSelectedElementId(null);
+    setSelectedWallId(null);
+    setSelectedOpeningId(null);
+    setSelectedWireId(null);
+    setSelectedFurnitureId(null);
+
+    setToastMessage(`🏢 Перехід на: ${targetFloor.name} (${targetFloor.distributionBoardName || 'ЩР'})`);
+    setTimeout(() => setToastMessage(null), 3000);
+  }, [activeFloorId, currentFloors, project, updateProjectWithHistory]);
+
+  const handleAddFloor = useCallback((type: 'floor_2' | 'basement' | 'mansard' | 'garage') => {
+    // Current floor snapshot
+    const updatedFloors = currentFloors.map((fl) => {
+      if (fl.id === activeFloorId) {
+        return {
+          ...fl,
+          backgroundImage: project.backgroundImage,
+          rooms: project.rooms,
+          walls: project.walls,
+          openings: project.openings,
+          elements: project.elements,
+          wires: project.wires,
+          furniture: project.furniture || [],
+        };
+      }
+      return fl;
+    });
+
+    let newName = 'Поверх 2';
+    let newLevel = 2;
+    let newElevation = 3000;
+    let boardName = 'ЩР-2';
+
+    if (type === 'floor_2') {
+      newName = 'Поверх 2';
+      newLevel = 2;
+      newElevation = 3000;
+      boardName = 'ЩР-2';
+    } else if (type === 'mansard') {
+      newName = 'Мансарда / Покрівля';
+      newLevel = 3;
+      newElevation = 6000;
+      boardName = 'ЩР-Мансарда';
+    } else if (type === 'basement') {
+      newName = 'Підвал / Цоколь';
+      newLevel = -1;
+      newElevation = -2800;
+      boardName = 'ЩР-Підвал';
+    } else if (type === 'garage') {
+      newName = 'Гараж / Майстерня';
+      newLevel = 0;
+      newElevation = 0;
+      boardName = 'ЩР-Гараж';
+    }
+
+    const newFloorId = `floor_${Date.now()}`;
+    const newFloor: FloorLevel = {
+      id: newFloorId,
+      name: newName,
+      levelNumber: newLevel,
+      elevationMm: newElevation,
+      ceilingHeightMm: 2700,
+      distributionBoardName: boardName,
+      rooms: [],
+      // Optionally copy exterior perimeter walls for fast layout
+      walls: project.walls.slice(0, 4),
+      openings: [],
+      elements: [],
+      wires: [],
+      furniture: [],
+    };
+
+    const finalFloors = [...updatedFloors, newFloor];
+
+    updateProjectWithHistory({
+      ...project,
+      floors: finalFloors,
+      activeFloorId: newFloorId,
+      backgroundImage: undefined,
+      rooms: newFloor.rooms,
+      walls: newFloor.walls,
+      openings: newFloor.openings,
+      elements: newFloor.elements,
+      wires: newFloor.wires,
+      furniture: newFloor.furniture,
+      ceilingHeightMm: 2700,
+    });
+
+    setSelectedElementId(null);
+    setSelectedWallId(null);
+    setSelectedOpeningId(null);
+    setSelectedWireId(null);
+    setSelectedFurnitureId(null);
+
+    setToastMessage(`✓ Створено новий поверх: ${newName}`);
+    setTimeout(() => setToastMessage(null), 3500);
+  }, [activeFloorId, currentFloors, project, updateProjectWithHistory]);
 
   const totalAreaM2 = useMemo(() => {
     return project.rooms.reduce((sum, r) => sum + r.areaM2, 0).toFixed(1);
@@ -723,6 +1159,9 @@ export default function App() {
         onOpenExportModal={() => setActiveModal('export')}
         onOpenBackupModal={() => setActiveModal('backup')}
         onOpenDstuAlbum={() => setActiveModal('dstu')}
+        onOpenQuotationModal={() => setActiveModal('quotation')}
+        onOpenCableSchedule={() => setActiveModal('cable_schedule')}
+        onOpenPanelLabels={() => setActiveModal('panel_labels')}
         onOpen3DView={() => setActiveModal('3d')}
         onOpenDxfImport={() => setActiveModal('dxf_import')}
         onOpenLayersModal={() => setLayersModalOpen(true)}
@@ -735,18 +1174,63 @@ export default function App() {
 
       {/* 2. Secondary Contextual Sub-bar */}
       <div className="h-10 border-b border-neutral-800 bg-neutral-900/80 px-4 flex items-center justify-between text-xs shrink-0 z-20">
-        {/* Layer View Filters */}
-        <div className="flex items-center gap-1 p-0.5 bg-neutral-950 rounded-lg border border-neutral-800">
-          <button
-            onClick={() => setViewFilter('all')}
-            className={`px-3 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
-              viewFilter === 'all'
-                ? 'bg-neutral-800 text-sky-400 font-semibold shadow-sm'
-                : 'text-neutral-400 hover:text-neutral-200'
-            }`}
-          >
-            Всі шари
-          </button>
+        {/* Multi-floor Navigator & Layer View Filters */}
+        <div className="flex items-center gap-2">
+          {/* Multi-floor Level Switcher (Поверхи проекту) */}
+          <div className="flex items-center gap-1 p-0.5 bg-neutral-950 rounded-lg border border-sky-500/30">
+            <div className="flex items-center gap-1 px-2 py-0.5 text-sky-400 font-bold">
+              <Building2 className="w-3.5 h-3.5" />
+              <span className="hidden xl:inline text-[11px]">Поверх:</span>
+            </div>
+
+            {currentFloors.map((fl) => (
+              <button
+                key={fl.id}
+                onClick={() => handleSelectFloor(fl.id)}
+                className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-all whitespace-nowrap flex items-center gap-1.5 ${
+                  fl.id === activeFloorId
+                    ? 'bg-sky-500 text-neutral-950 font-bold shadow-sm'
+                    : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+                }`}
+                title={`Перейти на ${fl.name} (${fl.distributionBoardName || 'ЩР'}) - Відмітка: ${fl.elevationMm} мм`}
+              >
+                <span>{fl.name}</span>
+                {fl.distributionBoardName && (
+                  <span
+                    className={`text-[9px] font-mono px-1 rounded ${
+                      fl.id === activeFloorId ? 'bg-sky-950/40 text-neutral-950' : 'bg-neutral-800 text-neutral-400'
+                    }`}
+                  >
+                    {fl.distributionBoardName}
+                  </span>
+                )}
+              </button>
+            ))}
+
+            {/* Quick Add Floor Buttons */}
+            <div className="flex items-center border-l border-neutral-800 pl-1 ml-0.5">
+              <button
+                onClick={() => handleAddFloor(currentFloors.length === 1 ? 'floor_2' : 'mansard')}
+                className="p-1 hover:bg-neutral-800 text-neutral-400 hover:text-sky-300 rounded transition-colors"
+                title="Додати наступний поверх (Поверх 2 / Мансарда)"
+              >
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Layer View Filters */}
+          <div className="hidden lg:flex items-center gap-1 p-0.5 bg-neutral-950 rounded-lg border border-neutral-800">
+            <button
+              onClick={() => setViewFilter('all')}
+              className={`px-3 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                viewFilter === 'all'
+                  ? 'bg-neutral-800 text-sky-400 font-semibold shadow-sm'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+            >
+              Всі шари
+            </button>
           <button
             onClick={() => setViewFilter('sockets')}
             className={`px-3 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
@@ -785,6 +1269,7 @@ export default function App() {
             <span>Шари креслення</span>
           </button>
         </div>
+      </div>
 
         {/* Quick Database, Auto-route, DXF & Blueprint Tools */}
         <div className="flex items-center gap-2">
@@ -824,6 +1309,56 @@ export default function App() {
               <span className="hidden md:inline">Трасувати</span>
             </button>
           </div>
+
+          <button
+            onClick={() => setActiveModal('auto_sockets')}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-bold border border-amber-500/50 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 hover:border-amber-400 transition-colors shadow-sm shadow-amber-950/40"
+            title="Автоматична інтелектуальна розстановка розеток за нормами ДБН В.2.5-23:2010 та ПУЕ"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+            <span className="hidden sm:inline">Розетки (ДБН)</span>
+          </button>
+
+          <button
+            onClick={() => setActiveModal('auto_lighting')}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-bold border border-yellow-500/50 bg-yellow-500/15 text-yellow-300 hover:bg-yellow-500/25 hover:border-yellow-400 transition-colors shadow-sm shadow-yellow-950/40"
+            title="Світлотехнічний розрахунок та авторозстановка освітлення за ДБН В.2.5-28:2018"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-yellow-400" />
+            <span className="hidden sm:inline">Світло (ДБН)</span>
+          </button>
+
+          <button
+            onClick={() => setActiveModal('block_stamps')}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border border-purple-500/40 bg-purple-950/30 text-purple-300 hover:bg-purple-950/50 hover:border-purple-400 transition-colors shadow-sm"
+            title="Готові блоки електроточок з міжосьовим кроком 71 мм (ТВ, робоче місце, фартух, вхід)"
+          >
+            <span className="hidden md:inline">🔲 Блоки 71мм</span>
+          </button>
+
+          <button
+            onClick={() => handleOpenWallElevation()}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border border-blue-500/40 bg-blue-950/30 text-blue-300 hover:bg-blue-950/50 hover:border-blue-400 transition-colors shadow-sm"
+            title="Розгортка стін та схема вертикальних штроб за ПУЕ §2.1"
+          >
+            <span className="hidden md:inline">📐 Розгортка стіни</span>
+          </button>
+
+          <button
+            onClick={() => setActiveModal('cable_schedule')}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border border-emerald-500/40 bg-emerald-950/30 text-emerald-300 hover:bg-emerald-950/50 hover:border-emerald-400 transition-colors shadow-sm"
+            title="Кабельний журнал за формою ДСТУ 21.608"
+          >
+            <span className="hidden md:inline">📋 Кабельний журнал</span>
+          </button>
+
+          <button
+            onClick={() => setActiveModal('panel_labels')}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border border-amber-500/40 bg-amber-950/30 text-amber-300 hover:bg-amber-950/50 hover:border-amber-400 transition-colors shadow-sm"
+            title="Маркувальні наліпки на пластрон щита 18 мм (TE)"
+          >
+            <span className="hidden lg:inline">🏷️ Наліпки щита</span>
+          </button>
 
           <button
             onClick={() => setActiveModal('dxf_import')}
@@ -883,8 +1418,86 @@ export default function App() {
           </div>
         </div>
 
-        {/* Project Metadata Summary */}
-        <div className="hidden sm:flex items-center gap-3 text-neutral-400 text-xs">
+        {/* Project Metadata Summary + Quick Element Search + Display Unit Switcher */}
+        <div className="hidden sm:flex items-center gap-3 text-neutral-400 text-xs relative">
+          <button
+            type="button"
+            onClick={() => setElementSearchOpen((prev) => !prev)}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border transition-colors ${
+              elementSearchOpen
+                ? 'bg-sky-950/60 border-sky-500 text-sky-300'
+                : 'bg-neutral-950 border-neutral-800 text-neutral-300 hover:border-neutral-700'
+            }`}
+            title="Швидкий пошук обладнання на плані (Ctrl+F)"
+          >
+            <Search className="w-3.5 h-3.5 text-sky-400" />
+            <span className="hidden lg:inline">Пошук (Ctrl+F)</span>
+          </button>
+
+          {elementSearchOpen && (
+            <div className="absolute right-0 top-9 z-50 w-80 bg-neutral-900 border border-neutral-700 rounded-xl shadow-2xl overflow-hidden">
+              <div className="p-2 border-b border-neutral-800 flex items-center gap-2">
+                <Search className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                <input
+                  type="text"
+                  autoFocus
+                  value={elementSearchQuery}
+                  onChange={(e) => setElementSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') setElementSearchOpen(false);
+                  }}
+                  placeholder="Назва, ID або Гр.1..."
+                  className="flex-1 bg-transparent text-xs text-neutral-100 focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setElementSearchOpen(false)}
+                  className="text-neutral-400 hover:text-white p-0.5"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              <div className="max-h-64 overflow-y-auto divide-y divide-neutral-800/60">
+                {project.elements
+                  .filter((el) => {
+                    const q = elementSearchQuery.trim().toLowerCase();
+                    if (!q) return true;
+                    const circuit = project.circuits.find((c) => c.id === el.circuitId);
+                    const grpStr = circuit ? `гр.${circuit.number} ${circuit.name}`.toLowerCase() : '';
+                    return (
+                      el.name.toLowerCase().includes(q) ||
+                      el.id.toLowerCase().includes(q) ||
+                      (el.label || '').toLowerCase().includes(q) ||
+                      grpStr.includes(q)
+                    );
+                  })
+                  .slice(0, 25)
+                  .map((el) => {
+                    const circuit = project.circuits.find((c) => c.id === el.circuitId);
+                    return (
+                      <button
+                        key={el.id}
+                        type="button"
+                        onClick={() => handleSelectAndFocusElement(el.id)}
+                        className="w-full px-3 py-2 text-left hover:bg-neutral-800/80 flex items-center justify-between gap-2 transition-colors"
+                      >
+                        <div className="min-w-0">
+                          <div className="text-xs font-medium text-neutral-100 truncate">{el.name}</div>
+                          <div className="text-[10px] font-mono text-neutral-500 truncate">{el.id}</div>
+                        </div>
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-neutral-950 border border-neutral-800 text-sky-400 shrink-0">
+                          {circuit ? `Гр.${circuit.number}` : `+${el.mountingHeightMm}мм`}
+                        </span>
+                      </button>
+                    );
+                  })}
+                {project.elements.length === 0 && (
+                  <div className="p-4 text-center text-xs text-neutral-500">Немає елементів на поточному поверсі</div>
+                )}
+              </div>
+            </div>
+          )}
+
           <span>{project.title}</span>
           <span aria-hidden="true">·</span>
           <span className="font-mono tabular-nums">{totalAreaM2} м²</span>
@@ -892,6 +1505,29 @@ export default function App() {
           <span className="font-mono tabular-nums">{project.elements.length} точек</span>
           <span aria-hidden="true">·</span>
           <span className="font-mono tabular-nums text-sky-400">{totalPowerKw} кВт</span>
+          <div className="flex items-center bg-neutral-950 rounded-md border border-neutral-800 overflow-hidden ml-1">
+            {(
+              [
+                { id: 'mm', label: 'мм' },
+                { id: 'cm', label: 'см' },
+                { id: 'm', label: 'м' },
+              ] as const
+            ).map((u) => (
+              <button
+                key={u.id}
+                type="button"
+                onClick={() => handleChangeDisplayUnit(u.id)}
+                className={`px-2 py-0.5 text-[11px] font-mono transition-colors ${
+                  (project.displayUnit || 'mm') === u.id
+                    ? 'bg-sky-500 text-neutral-950 font-bold'
+                    : 'text-neutral-400 hover:text-neutral-200'
+                }`}
+                title="Одиниці вимірювання проєкту"
+              >
+                {u.label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -946,8 +1582,15 @@ export default function App() {
           onUndo={handleUndo}
           onRedo={handleRedo}
           onAutoRoute={handleAutoRoute}
+          onOptimizeParallelWires={handleOptimizeParallelWires}
           autoRoutingEnabled={project.autoRoutingEnabled ?? true}
           onToggleAutoRouting={handleToggleAutoRouting}
+          onOpenAutoSocketsModal={() => setActiveModal('auto_sockets')}
+          onOpenAutoLightingModal={() => setActiveModal('auto_lighting')}
+          onOpenWallElevationModal={() => handleOpenWallElevation()}
+          onOpenCableScheduleModal={() => setActiveModal('cable_schedule')}
+          onOpenPanelLabelsModal={() => setActiveModal('panel_labels')}
+          onOpenBlockStampsModal={() => setActiveModal('block_stamps')}
         />
 
         {/* CAD Canvas Viewport: Konva.js Hardware Accelerated or SVG */}
@@ -967,6 +1610,14 @@ export default function App() {
               showHeights={showHeights}
               showFurniture={showFurniture}
               showAnnotations={showAnnotations}
+              showCircuitBadges={showCircuitBadges}
+              onToggleCircuitBadges={() => {
+                setShowCircuitBadges((prev) => {
+                  const next = !prev;
+                  setLayerVisibility((cfg) => ({ ...cfg, circuitBadges: next }));
+                  return next;
+                });
+              }}
               cadStyle={cadStyle}
               layerVisibility={layerVisibility}
               onToggleAnnotations={() => {
@@ -1030,12 +1681,26 @@ export default function App() {
               onUpdateElementPosition={handleUpdateElementPosition}
               onAddElement={handleAddElement}
               onAddWall={handleAddWall}
+              onUpdateWall={handleUpdateWall}
               onAddOpening={handleAddOpening}
               onDeleteOpening={handleDeleteOpening}
               onAddRoom={handleAddRoom}
               onAddWire={handleAddWire}
               onDeleteElement={handleDeleteElement}
               onUpdateBackgroundImage={handleUpdateBackgroundImage}
+              onChangeDisplayUnit={handleChangeDisplayUnit}
+              multiSelectedElementIds={multiSelectedElementIds}
+              onChangeMultiSelection={setMultiSelectedElementIds}
+              onMoveElementsBatch={handleMoveElementsBatch}
+              onDeleteElementsBatch={handleDeleteElementsBatch}
+              onAlignElements={handleAlignElements}
+              onDuplicateElement={handleDuplicateElement}
+              onCopySelection={handleCopySelection}
+              onPasteClipboard={handlePasteClipboard}
+              canPaste={clipboardElements.length > 0}
+              onDeleteWall={handleDeleteWall}
+              onOpenWallElevation={handleOpenWallElevation}
+              focusRequest={focusRequest}
             />
           ) : (
             <CadCanvas
@@ -1119,6 +1784,14 @@ export default function App() {
           onAutoNumberCables={handleAutoNumberCables}
           autoRoutingEnabled={project.autoRoutingEnabled ?? true}
           onToggleAutoRouting={handleToggleAutoRouting}
+          onOptimizeParallelWires={handleOptimizeParallelWires}
+          onOpenAutoSocketsModal={() => setActiveModal('auto_sockets')}
+          onOpenWallElevation={handleOpenWallElevation}
+          multiSelectedElementIds={multiSelectedElementIds}
+          onClearMultiSelection={() => setMultiSelectedElementIds([])}
+          onBulkUpdateElements={handleBulkUpdateElements}
+          onAlignElements={handleAlignElements}
+          onDeleteElementsBatch={handleDeleteElementsBatch}
         />
       </div>
 
@@ -1127,6 +1800,7 @@ export default function App() {
         <CircuitScheduleModal
           project={project}
           onUpdateCircuits={handleUpdateCircuits}
+          onUpdateProject={updateProjectWithHistory}
           onClose={() => setActiveModal('none')}
         />
       )}
@@ -1181,6 +1855,16 @@ export default function App() {
         />
       )}
 
+      {activeModal === 'quotation' && (
+        <ClientQuotationModal
+          project={project}
+          onUpdateProject={(updated) => {
+            updateProjectWithHistory(updated);
+          }}
+          onClose={() => setActiveModal('none')}
+        />
+      )}
+
       {activeModal === 'json' && (
         <JsonStorageModal
           project={project}
@@ -1208,6 +1892,64 @@ export default function App() {
         <DxfImportModal
           project={project}
           onImportWalls={handleImportDxfWalls}
+          onClose={() => setActiveModal('none')}
+        />
+      )}
+
+      {/* Auto Socket Placement Modal (ДБН В.2.5-23:2010 & ПУЕ §7.1) */}
+      {activeModal === 'auto_sockets' && (
+        <AutoSocketsPlacementModal
+          isOpen={true}
+          project={project}
+          onClose={() => setActiveModal('none')}
+          onApplySockets={handleApplyAutoSockets}
+        />
+      )}
+
+      {/* Auto Lighting Placement Modal (ДБН В.2.5-28:2018) */}
+      {activeModal === 'auto_lighting' && (
+        <AutoLightingPlacementModal
+          isOpen={true}
+          project={project}
+          onClose={() => setActiveModal('none')}
+          onApplyLighting={handleApplyAutoLighting}
+        />
+      )}
+
+      {/* Wall Elevation & Chasing Modal (ПУЕ §2.1 & ДСТУ 21.608) */}
+      {activeModal === 'wall_elevation' && (
+        <WallElevationModal
+          isOpen={true}
+          project={project}
+          initialWallId={elevationWallId}
+          onClose={() => setActiveModal('none')}
+        />
+      )}
+
+      {/* Cable Schedule Modal (ДСТУ 21.608 / ДСТУ 21.614) */}
+      {activeModal === 'cable_schedule' && (
+        <CableScheduleModal
+          isOpen={true}
+          project={project}
+          onClose={() => setActiveModal('none')}
+        />
+      )}
+
+      {/* Panel Label Printer Modal (18mm TE DIN-Rail Strips) */}
+      {activeModal === 'panel_labels' && (
+        <PanelLabelPrinterModal
+          isOpen={true}
+          project={project}
+          onClose={() => setActiveModal('none')}
+        />
+      )}
+
+      {/* Block Stamps Modal (71mm Pitch Multigang Posts) */}
+      {activeModal === 'block_stamps' && (
+        <BlockStampsModal
+          isOpen={true}
+          project={project}
+          onApplyStamp={handleApplyBlockStamp}
           onClose={() => setActiveModal('none')}
         />
       )}

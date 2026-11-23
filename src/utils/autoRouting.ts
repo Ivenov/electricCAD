@@ -1,207 +1,13 @@
 import { CadProject, ElectricalElement, Point, WireRoute } from '../types/cad';
-import { calculateCableLengthM, checkChaseIntersectsOpening } from './cadMath';
+import {
+  calculateCableLengthM,
+  checkChaseIntersectsOpening,
+  computeParallelBundleOffsets,
+  computeOrthogonalPath,
+  simplifyOrthogonalPolyline,
+} from './cadMath';
 
-/**
- * PUE Ukraine (Правила улаштування електроустановок):
- * - Всі траси прокладаються суворо під прямими кутами 90° (вертикально або горизонтально).
- * - Відступ від стелі для магістральних трас: 150–200 мм.
- * - Опуски до розеток та вимикачів здійснюються суворо вертикально над центром підрозетника.
- * - Запас кабелю на оброблення та підключення в щиті та підрозетниках: +15%.
- * - Заборонено прокладати штроби крізь дверні та віконні отвори (ПУЕ §2.1.52).
- */
-
-export interface AutoRouteResult {
-  newWires: WireRoute[];
-  totalLengthM: number;
-  routedElementsCount: number;
-}
-
-/**
-/**
- * Helper to remove redundant collinear points from a polyline.
- */
-function simplifyOrthogonalPolyline(pts: Point[]): Point[] {
-  if (pts.length <= 2) return pts;
-  const result: Point[] = [pts[0]];
-
-  for (let i = 1; i < pts.length - 1; i++) {
-    const prev = result[result.length - 1];
-    const curr = pts[i];
-    const next = pts[i + 1];
-
-    // Skip duplicate point
-    if (Math.hypot(curr.x - prev.x, curr.y - prev.y) < 1) continue;
-
-    // Check if curr is collinear between prev and next
-    const isCollinearH = Math.abs(prev.y - curr.y) < 1 && Math.abs(curr.y - next.y) < 1;
-    const isCollinearV = Math.abs(prev.x - curr.x) < 1 && Math.abs(curr.x - next.x) < 1;
-
-    if (!isCollinearH && !isCollinearV) {
-      result.push(curr);
-    }
-  }
-
-  const last = pts[pts.length - 1];
-  if (Math.hypot(last.x - result[result.length - 1].x, last.y - result[result.length - 1].y) > 0.5) {
-    result.push(last);
-  }
-
-  return result;
-}
-
-/**
- * Computes an orthogonal 90-degree rectilinear path between two points,
- * favoring wall alignment, Manhattan corridors, and strictly avoiding door/window openings
- * according to Ukrainian PUE §2.1.52.
- */
-export function computeOrthogonalPath(
-  start: Point,
-  end: Point,
-  walls: CadProject['walls'] = [],
-  openings: CadProject['openings'] = []
-): Point[] {
-  // If no walls or openings are provided, return simple orthogonal path
-  if (!walls || walls.length === 0 || !openings || openings.length === 0) {
-    if (Math.abs(start.x - end.x) < 5 || Math.abs(start.y - end.y) < 5) {
-      return [start, end];
-    }
-    const dx = Math.abs(end.x - start.x);
-    const dy = Math.abs(end.y - start.y);
-    return dx > dy
-      ? [start, { x: end.x, y: start.y }, end]
-      : [start, { x: start.x, y: end.y }, end];
-  }
-
-  // 1. Direct straight path check (when points are horizontally or vertically aligned)
-  const isCollinear = Math.abs(start.x - end.x) < 5 || Math.abs(start.y - end.y) < 5;
-  if (isCollinear) {
-    const directPath = [start, end];
-    const directColl = checkChaseIntersectsOpening(directPath, walls, openings);
-    if (!directColl.hasCollision) {
-      return directPath;
-    }
-    // If the straight segment passes through an opening (e.g. across a window),
-    // it MUST NOT be returned directly; fall through to detour routing below!
-  }
-
-  const dx = Math.abs(end.x - start.x);
-  const dy = Math.abs(end.y - start.y);
-
-  // Strategy A: Horizontal then Vertical
-  const midA: Point = { x: end.x, y: start.y };
-  const pathA = simplifyOrthogonalPolyline([start, midA, end]);
-
-  // Strategy B: Vertical then Horizontal
-  const midB: Point = { x: start.x, y: end.y };
-  const pathB = simplifyOrthogonalPolyline([start, midB, end]);
-
-  const collA = checkChaseIntersectsOpening(pathA, walls, openings);
-  const collB = checkChaseIntersectsOpening(pathB, walls, openings);
-
-  if (!collA.hasCollision && collB.hasCollision) {
-    return pathA;
-  }
-  if (collA.hasCollision && !collB.hasCollision) {
-    return pathB;
-  }
-  if (!collA.hasCollision && !collB.hasCollision && !isCollinear) {
-    return dx > dy ? pathA : pathB;
-  }
-
-  // 2. Both simple paths collide with openings (or collinear segment collides).
-  // Generate multi-candidate bypass detours around the opening(s) (ПУЕ §2.1.52).
-  const wallMap = new Map<string, CadProject['walls'][0]>();
-  walls.forEach((w) => wallMap.set(w.id, w));
-
-  const candidateDetours: Point[][] = [];
-
-  // Generate specific geometry-based bypasses for any opening that was hit
-  const hitOpenings = [collA.opening, collB.opening].filter(Boolean);
-  hitOpenings.forEach((op) => {
-    if (!op) return;
-    const wall = wallMap.get(op.wallId);
-    if (!wall) return;
-
-    const wdx = wall.end.x - wall.start.x;
-    const wdy = wall.end.y - wall.start.y;
-    const isWallHorizontal = Math.abs(wdx) >= Math.abs(wdy);
-    const wallLen = Math.hypot(wdx, wdy) || 1;
-    const halfWidthPx = (op.width / 20) / 2 + 15; // 20mm/px scale conversion + safety clearance
-    const cx = wall.start.x + wdx * op.positionRatio;
-    const cy = wall.start.y + wdy * op.positionRatio;
-
-    if (isWallHorizontal) {
-      // Bypass left of window
-      const xLeft = cx - halfWidthPx - 25;
-      candidateDetours.push(simplifyOrthogonalPolyline([start, { x: xLeft, y: start.y }, { x: xLeft, y: end.y }, end]));
-      // Bypass right of window
-      const xRight = cx + halfWidthPx + 25;
-      candidateDetours.push(simplifyOrthogonalPolyline([start, { x: xRight, y: start.y }, { x: xRight, y: end.y }, end]));
-    } else {
-      // Bypass above window
-      const yTop = cy - halfWidthPx - 25;
-      candidateDetours.push(simplifyOrthogonalPolyline([start, { x: start.x, y: yTop }, { x: end.x, y: yDetour(yTop) }, end]));
-      // Bypass below window
-      const yBottom = cy + halfWidthPx + 25;
-      candidateDetours.push(simplifyOrthogonalPolyline([start, { x: start.x, y: yBottom }, { x: end.x, y: yBottom }, end]));
-    }
-  });
-
-  function yDetour(val: number) {
-    return val;
-  }
-
-  // Standard progressive corridor offsets: ±30, ±50, ±80, ±120, ±160 px
-  const standardOffsets = [35, -35, 55, -55, 85, -85, 120, -120];
-  standardOffsets.forEach((offset) => {
-    // Detour A: offset along X
-    candidateDetours.push(
-      simplifyOrthogonalPolyline([
-        start,
-        { x: start.x + offset, y: start.y },
-        { x: start.x + offset, y: end.y },
-        end,
-      ])
-    );
-    // Detour B: offset along Y
-    candidateDetours.push(
-      simplifyOrthogonalPolyline([
-        start,
-        { x: start.x, y: start.y + offset },
-        { x: end.x, y: start.y + offset },
-        end,
-      ])
-    );
-    // Detour C: offset at middle coordinate
-    candidateDetours.push(
-      simplifyOrthogonalPolyline([
-        start,
-        { x: (start.x + end.x) / 2 + offset, y: start.y },
-        { x: (start.x + end.x) / 2 + offset, y: end.y },
-        end,
-      ])
-    );
-    candidateDetours.push(
-      simplifyOrthogonalPolyline([
-        start,
-        { x: start.x, y: (start.y + end.y) / 2 + offset },
-        { x: end.x, y: (start.y + end.y) / 2 + offset },
-        end,
-      ])
-    );
-  });
-
-  // Evaluate candidate detours: find the first collision-free detour
-  for (const cand of candidateDetours) {
-    const testColl = checkChaseIntersectsOpening(cand, walls, openings);
-    if (!testColl.hasCollision) {
-      return cand;
-    }
-  }
-
-  // If no tested candidate is 100% collision-free, pick the candidate with minimum collision
-  return dx > dy ? pathA : pathB;
-}
+export { computeOrthogonalPath, simplifyOrthogonalPolyline };
 
 /**
  * Automatically routes cables from distribution panels (ВРП / ЩРН)
@@ -1029,7 +835,7 @@ export function linkSwitchToLuminaires(
     if (!exists) {
       const lengthM = calculateCableLengthM(sw, light, project.ceilingHeightMm, 'ceiling');
       newWires.push({
-        id: `wire_sw_${Date.now()}_${idx}`,
+        id: `wire_sw_${Date.now()}_${idx}_${Math.random().toString(36).substring(2, 6)}`,
         fromId: switchId,
         toId: lightId,
         mode: 'curve',
@@ -1047,6 +853,92 @@ export function linkSwitchToLuminaires(
     ...project,
     elements: updatedElements,
     wires: newWires,
+  };
+}
+
+/**
+ * Optimizes all cable routes to run in parallel along optimal orthogonal corridors.
+ * - Recalculates shortest collision-free 90-degree orthogonal paths.
+ * - Clusters shared segments into parallel cable bundles (spacing 8-10px = 80-100mm).
+ * - Bakes parallel points directly into wire.points so all exports (DXF, SVG, Print) match.
+ */
+export function optimizeProjectCableRoutesParallel(
+  project: CadProject,
+  bundleSpacingPx: number = 8
+): { project: CadProject; optimizedCount: number; message: string } {
+  const elMap = new Map<string, ElectricalElement>();
+  project.elements.forEach((e) => elMap.set(e.id, e));
+
+  // 1. Recalculate optimal raw orthogonal paths for all non-manual wires
+  const rawWires: WireRoute[] = project.wires.map((wire) => {
+    if (wire.mode === 'curve') return wire; // Preserve switch-to-light curves
+    if (wire.isManual && wire.points && wire.points.length >= 2) return wire; // Preserve locked manual wires
+
+    const fromEl = elMap.get(wire.fromId);
+    const toEl = elMap.get(wire.toId);
+    if (!fromEl || !toEl) return wire;
+
+    const optimalPoints = computeOrthogonalPath(
+      fromEl.position,
+      toEl.position,
+      project.walls,
+      project.openings
+    );
+
+    const lengthM = calculateCableLengthM(
+      fromEl,
+      toEl,
+      project.ceilingHeightMm,
+      wire.conduit,
+      optimalPoints
+    );
+
+    return {
+      ...wire,
+      points: optimalPoints,
+      mode: 'ortho',
+      calculatedLengthM: lengthM,
+    };
+  });
+
+  // 2. Compute parallel bundle offsets across all wires
+  const parallelMap = computeParallelBundleOffsets(
+    rawWires,
+    project.elements,
+    project.walls,
+    project.openings,
+    bundleSpacingPx
+  );
+
+  // 3. Apply parallel-bundled points
+  let optimizedCount = 0;
+  const finalWires: WireRoute[] = rawWires.map((wire) => {
+    if (wire.mode === 'curve') return wire;
+    const parallelPoints = parallelMap.get(wire.id);
+    if (parallelPoints && parallelPoints.length >= 2) {
+      optimizedCount++;
+      const fromEl = elMap.get(wire.fromId);
+      const toEl = elMap.get(wire.toId);
+      const lengthM = fromEl && toEl
+        ? calculateCableLengthM(fromEl, toEl, project.ceilingHeightMm, wire.conduit, parallelPoints)
+        : wire.calculatedLengthM;
+
+      return {
+        ...wire,
+        points: parallelPoints,
+        calculatedLengthM: lengthM,
+      };
+    }
+    return wire;
+  });
+
+  return {
+    project: {
+      ...project,
+      wires: finalWires,
+    },
+    optimizedCount,
+    message: `⚡ Оптимізовано ${optimizedCount} кабельних трас: прокладено паралельними коліями з відступом ${bundleSpacingPx * 10} мм за ПУЕ.`,
   };
 }
 

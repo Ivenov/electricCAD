@@ -25,7 +25,9 @@ import {
   ViewFilterMode,
   Point,
   LayerVisibilityConfig,
+  ClientNote,
 } from '../../types/cad';
+import { detectGangBlocks, snapToGangPitch } from '../../utils/gangGrouping';
 import { KonvaElectricalSymbol } from './KonvaSymbols';
 import { KonvaFurnitureSymbol } from './KonvaFurnitureSymbols';
 import {
@@ -45,12 +47,23 @@ import {
   computeParallelBundleOffsets,
   getLongestSegmentMidpoint,
   closestPointOnSegment,
+  calculateWallLengthMm,
+  setWallLengthMm,
+  snapElementToDoorJambPue,
+  JambSnapResult,
+  analyzeElementWallDatum,
+  computeCircuitBadgesLayout,
+  alignWallOrtho,
+  reverseWall,
+  checkChaseIntersectsOpening,
 } from '../../utils/cadMath';
 import { computeOrthogonalPath } from '../../utils/autoRouting';
+import { calculateWifiHeatmap, calculateCctvFovCones } from '../../utils/lowVoltageSimulation';
 import { CatalogItem } from '../../data/electricalCatalog';
 import { OpeningCatalogItem } from '../../data/openingsCatalog';
 import { FurnitureCatalogItem } from '../../data/furnitureCatalog';
 import { calculatePolygonAreaM2 } from '../../utils/roomGeometry';
+import { formatDimensionValue, getUnitLabel } from '../../utils/projectAggregator';
 import { ROOM_PRESETS } from '../toolbar/CadTools';
 import { CadRuler } from './CadRuler';
 
@@ -75,9 +88,11 @@ interface KonvaCadCanvasProps {
   showHeights: boolean;
   showFurniture: boolean;
   showAnnotations?: boolean;
+  showCircuitBadges?: boolean;
   cadStyle?: 'autocad' | 'modern';
   layerVisibility?: LayerVisibilityConfig;
   onToggleAnnotations?: () => void;
+  onToggleCircuitBadges?: () => void;
   onToggleCadStyle?: () => void;
   onOpenSwitchWiringDiagram?: (sw?: ElectricalElement) => void;
   onOpenLayersModal?: () => void;
@@ -89,6 +104,7 @@ interface KonvaCadCanvasProps {
   onUpdateElementPosition: (id: string, newPos: Point, newRotation?: number, wallId?: string) => void;
   onAddElement: (element: ElectricalElement) => void;
   onAddWall: (wall: Wall) => void;
+  onUpdateWall?: (wall: Wall) => void;
   onAddOpening?: (opening: WallOpening) => void;
   onDeleteOpening?: (id: string) => void;
   onAddRoom?: (room: Room) => void;
@@ -99,6 +115,22 @@ interface KonvaCadCanvasProps {
   onUpdateBackgroundImage?: (updates: Partial<NonNullable<CadProject['backgroundImage']>>) => void;
   linkingSwitchId?: string | null;
   onLinkSwitchToLuminaires?: (switchId: string, lightIds: string[]) => void;
+  onChangeDisplayUnit?: (unit: 'mm' | 'cm' | 'm') => void;
+  multiSelectedElementIds?: string[];
+  onChangeMultiSelection?: (ids: string[]) => void;
+  onMoveElementsBatch?: (updates: Array<{ id: string; position: Point; rotation?: number; wallId?: string }>) => void;
+  onDeleteElementsBatch?: (ids: string[]) => void;
+  onAlignElements?: (ids: string[], mode: 'align_x' | 'align_y' | 'pitch_71_h' | 'pitch_71_v') => void;
+  onDuplicateElement?: (id: string) => void;
+  onCopySelection?: () => void;
+  onPasteClipboard?: () => void;
+  canPaste?: boolean;
+  onDeleteWall?: (id: string) => void;
+  onOpenWallElevation?: (wallId?: string) => void;
+  focusRequest?: { elementId: string; ts: number } | null;
+  onStartCalibration?: (pointA: Point, pointB: Point, pixelDistance: number) => void;
+  onAddClientNote?: (position: Point) => void;
+  onSelectClientNote?: (noteId: string) => void;
 }
 
 export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
@@ -122,9 +154,11 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   showHeights,
   showFurniture,
   showAnnotations = true,
+  showCircuitBadges = true,
   cadStyle = 'autocad',
   layerVisibility,
   onToggleAnnotations,
+  onToggleCircuitBadges,
   onToggleCadStyle,
   onOpenSwitchWiringDiagram,
   onOpenLayersModal,
@@ -136,6 +170,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   onUpdateElementPosition,
   onAddElement,
   onAddWall,
+  onUpdateWall,
   onAddOpening,
   onDeleteOpening,
   onAddRoom,
@@ -146,7 +181,24 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
   onUpdateBackgroundImage,
   linkingSwitchId,
   onLinkSwitchToLuminaires,
+  onChangeDisplayUnit,
+  multiSelectedElementIds: externalMultiIds,
+  onChangeMultiSelection,
+  onMoveElementsBatch,
+  onDeleteElementsBatch,
+  onAlignElements,
+  onDuplicateElement,
+  onCopySelection,
+  onPasteClipboard,
+  onDeleteWall,
+  onOpenWallElevation,
+  focusRequest,
+  onStartCalibration,
+  onAddClientNote,
+  onSelectClientNote,
 }) => {
+  const displayUnit = project.displayUnit || 'mm';
+  const unitLabel = getUnitLabel(displayUnit);
   const containerRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<Konva.Stage>(null);
   const transformerRef = useRef<Konva.Transformer>(null);
@@ -167,6 +219,11 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     );
   }, [project.wires, project.elements, project.walls, project.openings]);
 
+  // Non-overlapping Circuit Badges & Leader Lines for on-site installers
+  const circuitBadgeLayouts = useMemo(() => {
+    return computeCircuitBadgesLayout(project.elements, project.circuits, false);
+  }, [project.elements, project.circuits]);
+
   // Pan & Zoom
   const [scale, setScale] = useState(1.05);
   const [stagePos, setStagePos] = useState<Point>({ x: 100, y: 70 });
@@ -174,19 +231,77 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
 
   // Tool states
   const [wallStartPoint, setWallStartPoint] = useState<Point | null>(null);
+  const [wallDraftLengthInput, setWallDraftLengthInput] = useState<string>('');
   const [roomDraftPoints, setRoomDraftPoints] = useState<Point[]>([]);
   const [wireSourceElementId, setWireSourceElementId] = useState<string | null>(null);
   const [wireDraftPoints, setWireDraftPoints] = useState<Point[]>([]);
   const [hoveredWireId, setHoveredWireId] = useState<string | null>(null);
   const [measureStartPoint, setMeasureStartPoint] = useState<Point | null>(null);
+  const [calibrateStartPoint, setCalibrateStartPoint] = useState<Point | null>(null);
   const [mouseWorldPos, setMouseWorldPos] = useState<Point>({ x: 0, y: 0 });
   const [mouseScreenPos, setMouseScreenPos] = useState<Point>({ x: -100, y: -100 });
   const [isCursorInside, setIsCursorInside] = useState(false);
+
+  // Smart Gang Grouping blocks
+  const detectedGangBlocks = useMemo(() => detectGangBlocks(project.elements), [project.elements]);
 
   // Advanced Wall Snapping & Openings states
   const [wallSnapResult, setWallSnapResult] = useState<WallSnapResult | null>(null);
   const [activeOrtho, setActiveOrtho] = useState<{ point: Point; angleDeg: number; isSnapped: boolean } | null>(null);
   const [openingHoverPlacement, setOpeningHoverPlacement] = useState<ReturnType<typeof findWallOpeningPlacement> | null>(null);
+  const [activeJambSnap, setActiveJambSnap] = useState<JambSnapResult | null>(null);
+
+  // Wi-Fi Heatmap & CCTV FOV Simulations
+  const wifiHeatmapPoints = useMemo(() => {
+    if (!layerVisibility?.wifiHeatmap) return [];
+    return calculateWifiHeatmap(project, 30);
+  }, [project, layerVisibility?.wifiHeatmap]);
+
+  const cctvFovCones = useMemo(() => {
+    if (layerVisibility?.cctvFov === false) return [];
+    return calculateCctvFovCones(project);
+  }, [project, layerVisibility?.cctvFov]);
+
+  // Rubberband Box Marquee Selection (synced with App if provided)
+  const [boxSelectionStart, setBoxSelectionStart] = useState<Point | null>(null);
+  const [boxSelectionEnd, setBoxSelectionEnd] = useState<Point | null>(null);
+  const [localMultiIds, setLocalMultiIds] = useState<string[]>([]);
+  const multiSelectedElementIds = externalMultiIds ?? localMultiIds;
+  const setMultiSelectedElementIds = useCallback(
+    (next: string[]) => {
+      if (onChangeMultiSelection) onChangeMultiSelection(next);
+      else setLocalMultiIds(next);
+    },
+    [onChangeMultiSelection]
+  );
+
+  // Group Drag origin tracking
+  const dragGroupRef = useRef<{
+    anchorId: string;
+    anchorStartPos: Point;
+    initialPositions: Map<string, Point>;
+  } | null>(null);
+
+  // Right-click Context Menu state
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    targetType: 'element' | 'wire' | 'wall' | 'multi' | 'canvas';
+    targetId?: string;
+  } | null>(null);
+
+  // Focus viewport on element when triggered by quick search
+  useEffect(() => {
+    if (!focusRequest) return;
+    const target = project.elements.find((e) => e.id === focusRequest.elementId);
+    if (!target) return;
+    const targetScale = Math.max(scale, 1.15);
+    setScale(targetScale);
+    setStagePos({
+      x: Math.round(stageDimensions.width / 2 - target.position.x * targetScale),
+      y: Math.round(stageDimensions.height / 2 - target.position.y * targetScale),
+    });
+  }, [focusRequest?.elementId, focusRequest?.ts]);
 
   // Background image element
   const [bgHtmlImage, setBgHtmlImage] = useState<HTMLImageElement | null>(null);
@@ -381,22 +496,73 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     completeWireConnection,
   ]);
 
+  // Commit Wall with exact millimeter length (AutoCAD / Revit style dimension input)
+  const commitWallWithLength = useCallback(
+    (explicitMm?: number) => {
+      if (!wallStartPoint) return;
+      const targetMm = explicitMm ?? Number(wallDraftLengthInput);
+      if (!isNaN(targetMm) && targetMm >= 50) {
+        let currentP = mouseWorldPos;
+        if (wallSnapResult) {
+          currentP = wallSnapResult.snappedPoint;
+        } else if (activeOrtho?.isSnapped) {
+          currentP = activeOrtho.point;
+        } else if (gridSnapEnabled) {
+          currentP = snapPointToGrid(mouseWorldPos, 10);
+        }
+        let dx = currentP.x - wallStartPoint.x;
+        let dy = currentP.y - wallStartPoint.y;
+        if (Math.hypot(dx, dy) < 0.001) {
+          dx = 1;
+          dy = 0;
+        }
+        const curDist = Math.hypot(dx, dy) || 1;
+        const ux = dx / curDist;
+        const uy = dy / curDist;
+        const targetPx = mmToPx(targetMm);
+        const targetEnd: Point = {
+          x: Math.round((wallStartPoint.x + ux * targetPx) * 10) / 10,
+          y: Math.round((wallStartPoint.y + uy * targetPx) * 10) / 10,
+        };
+        const newWall: Wall = {
+          id: 'wall_' + Date.now(),
+          start: wallStartPoint,
+          end: targetEnd,
+          thickness: 150,
+          type: 'partition',
+        };
+        onAddWall(newWall);
+        setWallStartPoint(targetEnd);
+        setWallDraftLengthInput('');
+      }
+    },
+    [wallStartPoint, wallDraftLengthInput, mouseWorldPos, wallSnapResult, activeOrtho, gridSnapEnabled, onAddWall]
+  );
+
   // Spacebar pan and shortcuts listener
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'Space' && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)) {
         setIsSpacePressed(true);
       } else if (e.key === 'Escape') {
+        setContextMenu(null);
         setWallStartPoint(null);
+        setWallDraftLengthInput('');
         setRoomDraftPoints([]);
         setWireSourceElementId(null);
         setWireDraftPoints([]);
         setMeasureStartPoint(null);
+        setMultiSelectedElementIds([]);
         onSelectElement(null);
         onSelectWall(null);
         onSelectOpening?.(null);
         onSelectWire?.(null);
       } else if (e.key === 'Enter') {
+        // Exact wall dimension creation via keyboard input
+        if (activeTool === 'wall' && wallStartPoint && wallDraftLengthInput.length > 0) {
+          commitWallWithLength();
+          return;
+        }
         if (activeTool === 'room' && roomDraftPoints.length >= 3) {
           const area = calculatePolygonAreaM2(roomDraftPoints);
           const preset = ROOM_PRESETS.find((r) => r.type === selectedRoomType) || ROOM_PRESETS[0];
@@ -412,6 +578,22 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         } else if (activeTool === 'wire' && wireSourceElementId) {
           handleFinishDraftWire();
         }
+      } else if (
+        activeTool === 'wall' &&
+        wallStartPoint &&
+        e.key >= '0' &&
+        e.key <= '9' &&
+        !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)
+      ) {
+        setWallDraftLengthInput((prev) => prev + e.key);
+      } else if (
+        activeTool === 'wall' &&
+        wallStartPoint &&
+        e.key === 'Backspace' &&
+        wallDraftLengthInput.length > 0 &&
+        !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)
+      ) {
+        setWallDraftLengthInput((prev) => prev.slice(0, -1));
       } else if (e.key === 'Backspace' && wireSourceElementId) {
         // Step back intermediate waypoint
         setWireDraftPoints((prev) => {
@@ -421,7 +603,15 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         });
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         if (!(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)) {
-          if (selectedElementId) {
+          if (multiSelectedElementIds.length > 0) {
+            if (onDeleteElementsBatch) {
+              onDeleteElementsBatch(multiSelectedElementIds);
+            } else {
+              multiSelectedElementIds.forEach((id) => onDeleteElement(id));
+            }
+            setMultiSelectedElementIds([]);
+            onSelectElement(null);
+          } else if (selectedElementId) {
             onDeleteElement(selectedElementId);
           } else if (selectedOpeningId && onDeleteOpening) {
             onDeleteOpening(selectedOpeningId);
@@ -447,6 +637,13 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     };
   }, [
     activeTool,
+    wallStartPoint,
+    wallDraftLengthInput,
+    mouseWorldPos,
+    wallSnapResult,
+    activeOrtho,
+    gridSnapEnabled,
+    onAddWall,
     roomDraftPoints,
     selectedRoomType,
     onAddRoom,
@@ -454,6 +651,9 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     selectedOpeningId,
     selectedWireId,
     wireSourceElementId,
+    multiSelectedElementIds,
+    onDeleteElementsBatch,
+    setMultiSelectedElementIds,
     onDeleteElement,
     onDeleteOpening,
     onDeleteWire,
@@ -548,6 +748,10 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
       if (!isCursorInside) setIsCursorInside(true);
     }
 
+    if (boxSelectionStart) {
+      setBoxSelectionEnd(worldPos);
+    }
+
     if (activeTool === 'wall') {
       // 1. Magnetic geometry snap
       const snap = snapToWallGeometry(worldPos, project.walls, 25);
@@ -564,22 +768,30 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
       } else {
         setActiveOrtho(null);
       }
-      setOpeningHoverPlacement(null);
     } else if (activeTool === 'door' || activeTool === 'window') {
       setWallSnapResult(null);
       setActiveOrtho(null);
+      setActiveJambSnap(null);
       const opWidthMm = selectedOpeningPreset?.widthMm || (activeTool === 'door' ? 900 : 1200);
       const placement = findWallOpeningPlacement(worldPos, project.walls, opWidthMm, 35);
       setOpeningHoverPlacement(placement);
+    } else if (['socket', 'switch', 'light', 'panel', 'junction'].includes(activeTool)) {
+      setWallSnapResult(null);
+      setActiveOrtho(null);
+      setOpeningHoverPlacement(null);
+      const jambSnap = snapElementToDoorJambPue(worldPos, project.walls, project.openings || [], 32, project.rooms);
+      setActiveJambSnap(jambSnap);
     } else {
       setWallSnapResult(null);
       setActiveOrtho(null);
       setOpeningHoverPlacement(null);
+      setActiveJambSnap(null);
     }
   };
 
   // Stage click (canvas background or placing elements)
   const handleStageClick = (e: Konva.KonvaEventObject<MouseEvent>) => {
+    setContextMenu(null);
     // Door / Window placement on stage click near a wall
     if ((activeTool === 'door' || activeTool === 'window') && openingHoverPlacement) {
       handlePlaceOpening();
@@ -696,12 +908,19 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         let finalRotation = 0;
         let finalWallId: string | undefined = undefined;
 
-        // Auto snap to nearest wall
-        const wallSnap = snapToNearestWall(effectivePos, project.walls, 25);
-        if (wallSnap) {
-          finalPos = wallSnap.snappedPoint;
-          finalRotation = wallSnap.rotation;
-          finalWallId = wallSnap.wallId;
+        // 1. First priority: Intelligent Door Jamb PUE Snap (100mm / 150mm from door opening)
+        if (activeJambSnap) {
+          finalPos = activeJambSnap.snappedPoint;
+          finalRotation = activeJambSnap.rotation;
+          finalWallId = activeJambSnap.wallId;
+        } else {
+          // 2. Second priority: Nearest wall snap
+          const wallSnap = snapToNearestWall(effectivePos, project.walls, 25, project.rooms);
+          if (wallSnap) {
+            finalPos = wallSnap.snappedPoint;
+            finalRotation = wallSnap.rotation;
+            finalWallId = wallSnap.wallId;
+          }
         }
 
         const isLightingCategory =
@@ -778,9 +997,10 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     }
   };
 
-  // Electrical element click / tap handler
+  // Electrical element click / tap handler (with Shift+Click multi-select)
   const handleElementClick = (e: Konva.KonvaEventObject<MouseEvent>, el: ElectricalElement) => {
     e.cancelBubble = true;
+    setContextMenu(null);
 
     // 0. LINKING SWITCH TO LUMINAIRE (from Inspector)
     if (linkingSwitchId) {
@@ -804,23 +1024,124 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
       return;
     }
 
-    // SELECT TOOL: Select element
+    // SELECT TOOL: Select single or toggle Shift+Click multi-select
     if (activeTool === 'select') {
-      onSelectElement(el.id);
+      if (e.evt.shiftKey) {
+        const baseIds = multiSelectedElementIds.length > 0
+          ? multiSelectedElementIds
+          : selectedElementId
+          ? [selectedElementId]
+          : [];
+        const exists = baseIds.includes(el.id);
+        const updated = exists ? baseIds.filter((id) => id !== el.id) : [...baseIds, el.id];
+        setMultiSelectedElementIds(updated);
+        onSelectElement(updated.length > 0 ? updated[0] : null);
+      } else {
+        setMultiSelectedElementIds([]);
+        onSelectElement(el.id);
+      }
       onSelectWall(null);
       onSelectOpening?.(null);
       onSelectWire?.(null);
     }
   };
 
+  // Element Drag Start (tracks multi-selection group offsets)
+  const handleElementDragStart = (el: ElectricalElement) => {
+    setContextMenu(null);
+    if (multiSelectedElementIds.length > 1 && multiSelectedElementIds.includes(el.id)) {
+      const initialPositions = new Map<string, Point>();
+      project.elements.forEach((item) => {
+        if (multiSelectedElementIds.includes(item.id)) {
+          initialPositions.set(item.id, { ...item.position });
+        }
+      });
+      dragGroupRef.current = {
+        anchorId: el.id,
+        anchorStartPos: { ...el.position },
+        initialPositions,
+      };
+    } else {
+      dragGroupRef.current = null;
+    }
+  };
+
+  // Element Drag Move (Group move or Intelligent Door Jamb Snap with PUE guides)
+  const handleElementDragMove = (e: Konva.KonvaEventObject<DragEvent>, el: ElectricalElement) => {
+    const targetPos = { x: e.target.x(), y: e.target.y() };
+
+    if (dragGroupRef.current && dragGroupRef.current.anchorId === el.id) {
+      const dx = targetPos.x - dragGroupRef.current.anchorStartPos.x;
+      const dy = targetPos.y - dragGroupRef.current.anchorStartPos.y;
+      const stage = stageRef.current;
+      if (stage) {
+        dragGroupRef.current.initialPositions.forEach((initPos, id) => {
+          if (id === el.id) return;
+          const node = stage.findOne(`#el_${id}`);
+          if (node) {
+            node.x(initPos.x + dx);
+            node.y(initPos.y + dy);
+          }
+        });
+      }
+      return;
+    }
+
+    const jambSnap = snapElementToDoorJambPue(targetPos, project.walls, project.openings || [], 32, project.rooms);
+    if (jambSnap) {
+      setActiveJambSnap(jambSnap);
+      e.target.x(jambSnap.snappedPoint.x);
+      e.target.y(jambSnap.snappedPoint.y);
+      return;
+    }
+    if (activeJambSnap) {
+      setActiveJambSnap(null);
+    }
+  };
+
   // Element Drag End
   const handleElementDragEnd = (e: Konva.KonvaEventObject<DragEvent>, el: ElectricalElement) => {
     let targetPos = { x: e.target.x(), y: e.target.y() };
+
+    if (dragGroupRef.current && dragGroupRef.current.anchorId === el.id) {
+      const groupState = dragGroupRef.current;
+      dragGroupRef.current = null;
+      if (gridSnapEnabled) {
+        targetPos = snapPointToGrid(targetPos, 10);
+      }
+      const dx = targetPos.x - groupState.anchorStartPos.x;
+      const dy = targetPos.y - groupState.anchorStartPos.y;
+      const updates: Array<{ id: string; position: Point }> = [];
+      groupState.initialPositions.forEach((initPos, id) => {
+        updates.push({
+          id,
+          position: {
+            x: Math.round((initPos.x + dx) * 10) / 10,
+            y: Math.round((initPos.y + dy) * 10) / 10,
+          },
+        });
+      });
+      if (onMoveElementsBatch) {
+        onMoveElementsBatch(updates);
+      } else {
+        updates.forEach((u) => onUpdateElementPosition(u.id, u.position));
+      }
+      return;
+    }
+
+    const jambSnap = snapElementToDoorJambPue(targetPos, project.walls, project.openings || [], 32, project.rooms);
+    setActiveJambSnap(null);
+
+    if (jambSnap) {
+      onUpdateElementPosition(el.id, jambSnap.snappedPoint, jambSnap.rotation, jambSnap.wallId);
+      return;
+    }
+
     if (gridSnapEnabled) {
       targetPos = snapPointToGrid(targetPos, 10);
     }
 
-    const wallSnap = snapToNearestWall(targetPos, project.walls, 25);
+    const wallSnap = snapToNearestWall(targetPos, project.walls, 25, project.rooms);
     if (wallSnap) {
       onUpdateElementPosition(el.id, wallSnap.snappedPoint, wallSnap.rotation, wallSnap.wallId);
     } else {
@@ -882,11 +1203,28 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
     }
   };
 
+  const openCanvasContextMenuAt = (clientX: number, clientY: number, targetType: 'element' | 'wire' | 'wall' | 'multi' | 'canvas', targetId?: string) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    const relX = rect ? clientX - rect.left : clientX;
+    const relY = rect ? clientY - rect.top : clientY;
+    const clampedX = Math.max(8, Math.min(relX, Math.max(8, stageDimensions.width - 230)));
+    const clampedY = Math.max(8, Math.min(relY, Math.max(8, stageDimensions.height - 230)));
+    setContextMenu({ x: clampedX, y: clampedY, targetType, targetId });
+  };
+
   return (
     <div
       ref={containerRef}
       onMouseEnter={() => setIsCursorInside(true)}
       onMouseLeave={() => setIsCursorInside(false)}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        if (multiSelectedElementIds.length > 1) {
+          openCanvasContextMenuAt(e.clientX, e.clientY, 'multi');
+        } else {
+          openCanvasContextMenuAt(e.clientX, e.clientY, 'canvas');
+        }
+      }}
       className={`relative w-full h-full overflow-hidden select-none ${
         cadStyle === 'autocad' ? 'bg-[#0c0d10]' : 'cad-grid-dark'
       } ${isSpacePressed || activeTool === 'pan' ? 'cursor-grab' : 'cursor-crosshair'}`}
@@ -925,6 +1263,43 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         onClick={handleStageClick}
         onDblClick={handleStageDblClick}
         onMouseMove={handleStagePointerMove}
+        onMouseDown={(e) => {
+          if (activeTool === 'select' && e.target === stageRef.current && !isSpacePressed) {
+            const worldPos = getWorldPointerPos();
+            setBoxSelectionStart(worldPos);
+            setBoxSelectionEnd(worldPos);
+            setMultiSelectedElementIds([]);
+            onSelectElement(null);
+            onSelectWall(null);
+            onSelectOpening?.(null);
+            onSelectWire?.(null);
+            onSelectFurniture?.(null);
+          }
+        }}
+        onMouseUp={() => {
+          if (boxSelectionStart && boxSelectionEnd) {
+            const minX = Math.min(boxSelectionStart.x, boxSelectionEnd.x);
+            const maxX = Math.max(boxSelectionStart.x, boxSelectionEnd.x);
+            const minY = Math.min(boxSelectionStart.y, boxSelectionEnd.y);
+            const maxY = Math.max(boxSelectionStart.y, boxSelectionEnd.y);
+
+            if (maxX - minX > 5 && maxY - minY > 5) {
+              const enclosed = project.elements.filter(
+                (el) =>
+                  el.position.x >= minX &&
+                  el.position.x <= maxX &&
+                  el.position.y >= minY &&
+                  el.position.y <= maxY
+              );
+              if (enclosed.length > 0) {
+                setMultiSelectedElementIds(enclosed.map((el) => el.id));
+                onSelectElement(enclosed[0].id);
+              }
+            }
+            setBoxSelectionStart(null);
+            setBoxSelectionEnd(null);
+          }
+        }}
         onDragEnd={(e) => {
           if (e.target === stageRef.current) {
             setStagePos({ x: e.target.x(), y: e.target.y() });
@@ -1051,6 +1426,55 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             );
           })}
 
+          {/* Wi-Fi 2.4/5GHz Signal Heatmap Coverage Simulation */}
+          {(layerVisibility?.wifiHeatmap ?? false) && wifiHeatmapPoints.length > 0 && (
+            <Group listening={false} opacity={0.65}>
+              {wifiHeatmapPoints.map((pt, idx) => (
+                <Circle
+                  key={`wifi_pt_${idx}`}
+                  x={pt.x}
+                  y={pt.y}
+                  radius={18}
+                  fill={pt.color}
+                />
+              ))}
+            </Group>
+          )}
+
+          {/* CCTV Video Surveillance Field of View (FOV) Cones with Wall Occlusion */}
+          {(layerVisibility?.cctvFov ?? true) && cctvFovCones.length > 0 && (
+            <Group listening={false}>
+              {cctvFovCones.map((cone) => {
+                const flatPoints = cone.points.flatMap((p) => [p.x, p.y]);
+                return (
+                  <Group key={`cctv_cone_${cone.cameraId}`} opacity={0.55}>
+                    <Line
+                      points={flatPoints}
+                      closed
+                      fill="rgba(59, 130, 246, 0.22)"
+                      stroke="#3b82f6"
+                      strokeWidth={1.5}
+                      dash={[4, 2]}
+                    />
+                    {cone.points.length > 2 && (
+                      <Line
+                        points={[
+                          cone.origin.x,
+                          cone.origin.y,
+                          cone.points[Math.floor(cone.points.length / 2)].x,
+                          cone.points[Math.floor(cone.points.length / 2)].y,
+                        ]}
+                        stroke="#60a5fa"
+                        strokeWidth={1}
+                        dash={[2, 2]}
+                      />
+                    )}
+                  </Group>
+                );
+              })}
+            </Group>
+          )}
+
           {/* Active room polygon drawing draft */}
           {roomDraftPoints.length > 0 && (
             <Group listening={false}>
@@ -1110,6 +1534,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                 key={wall.id}
                 onClick={(e) => {
                   e.cancelBubble = true;
+                  setContextMenu(null);
                   if ((activeTool === 'door' || activeTool === 'window') && openingHoverPlacement) {
                     handlePlaceOpening();
                     return;
@@ -1120,7 +1545,25 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                     onSelectOpening?.(null);
                   }
                 }}
+                onContextMenu={(e) => {
+                  e.evt.preventDefault();
+                  e.cancelBubble = true;
+                  onSelectWall(wall.id);
+                  onSelectElement(null);
+                  onSelectOpening?.(null);
+                  openCanvasContextMenuAt(e.evt.clientX, e.evt.clientY, 'wall', wall.id);
+                }}
               >
+                {/* Wall selection halo */}
+                {isSelected && (
+                  <Line
+                    points={[wall.start.x, wall.start.y, wall.end.x, wall.end.y]}
+                    stroke="#38bdf8"
+                    strokeWidth={strokeW + 6}
+                    opacity={0.35}
+                    lineCap="square"
+                  />
+                )}
                 {/* Wall core */}
                 <Line
                   points={[wall.start.x, wall.start.y, wall.end.x, wall.end.y]}
@@ -1136,31 +1579,82 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                 />
 
                 {/* Wall length dimension tag */}
-                {(layerVisibility ? layerVisibility.dimensions : showDimensions) && wallLengthMm > 400 && (
+                {(layerVisibility ? layerVisibility.dimensions : showDimensions) && wallLengthMm > 300 && (
                   <Group
                     x={(wall.start.x + wall.end.x) / 2}
                     y={(wall.start.y + wall.end.y) / 2}
                     listening={false}
                   >
                     <Rect
-                      x={-24}
-                      y={-8}
-                      width={48}
-                      height={16}
+                      x={isSelected ? -34 : -24}
+                      y={isSelected ? -10 : -8}
+                      width={isSelected ? 68 : 48}
+                      height={isSelected ? 20 : 16}
                       cornerRadius={3}
-                      fill="#0f172a"
-                      stroke="rgba(255,255,255,0.15)"
-                      strokeWidth={0.8}
+                      fill={isSelected ? '#0284c7' : '#0f172a'}
+                      stroke={isSelected ? '#e0f2fe' : 'rgba(255,255,255,0.15)'}
+                      strokeWidth={isSelected ? 1.2 : 0.8}
                     />
                     <Text
-                      x={-24}
-                      y={-5}
-                      width={48}
-                      text={`${wallLengthMm}`}
-                      fontSize={9}
-                      fill="#e2e8f0"
+                      x={isSelected ? -34 : -24}
+                      y={isSelected ? -5 : -5}
+                      width={isSelected ? 68 : 48}
+                      text={
+                        isSelected
+                          ? formatDimensionValue(wallLengthMm, displayUnit, true)
+                          : formatDimensionValue(wallLengthMm, displayUnit, false)
+                      }
+                      fontSize={isSelected ? 10 : 9}
+                      fontStyle={isSelected ? 'bold' : 'normal'}
+                      fill={isSelected ? '#ffffff' : '#e2e8f0'}
                       fontFamily="monospace"
                       align="center"
+                    />
+                  </Group>
+                )}
+
+                {/* Draggable endpoint handles when wall is selected */}
+                {isSelected && onUpdateWall && (
+                  <Group>
+                    {/* Start handle P1 */}
+                    <Circle
+                      x={wall.start.x}
+                      y={wall.start.y}
+                      radius={6}
+                      fill="#38bdf8"
+                      stroke="#ffffff"
+                      strokeWidth={2}
+                      draggable={activeTool === 'select'}
+                      onDragMove={(e) => {
+                        let p = { x: e.target.x(), y: e.target.y() };
+                        if (gridSnapEnabled) p = snapPointToGrid(p, 10);
+                        onUpdateWall({ ...wall, start: p });
+                      }}
+                      onDragEnd={(e) => {
+                        let p = { x: e.target.x(), y: e.target.y() };
+                        if (gridSnapEnabled) p = snapPointToGrid(p, 10);
+                        onUpdateWall({ ...wall, start: p });
+                      }}
+                    />
+                    {/* End handle P2 */}
+                    <Circle
+                      x={wall.end.x}
+                      y={wall.end.y}
+                      radius={6}
+                      fill="#38bdf8"
+                      stroke="#ffffff"
+                      strokeWidth={2}
+                      draggable={activeTool === 'select'}
+                      onDragMove={(e) => {
+                        let p = { x: e.target.x(), y: e.target.y() };
+                        if (gridSnapEnabled) p = snapPointToGrid(p, 10);
+                        onUpdateWall({ ...wall, end: p });
+                      }}
+                      onDragEnd={(e) => {
+                        let p = { x: e.target.x(), y: e.target.y() };
+                        if (gridSnapEnabled) p = snapPointToGrid(p, 10);
+                        onUpdateWall({ ...wall, end: p });
+                      }}
                     />
                   </Group>
                 )}
@@ -1309,8 +1803,11 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             const curvedPathData = `M ${fromEl.position.x} ${fromEl.position.y} Q ${ctrlX} ${ctrlY} ${toEl.position.x} ${toEl.position.y}`;
 
             // Orthogonal polyline with bundle separation offsets
-            const rawPoints = wire.points && wire.points.length >= 2
-              ? wire.points
+            const hasExplicitPoints = Boolean(wire.points && wire.points.length >= 2);
+            const explicitPointsColliding = hasExplicitPoints && !wire.isManual && checkChaseIntersectsOpening(wire.points!, project.walls, project.openings).hasCollision;
+
+            const rawPoints = (hasExplicitPoints && !explicitPointsColliding)
+              ? wire.points!
               : computeOrthogonalPath(fromEl.position, toEl.position, project.walls, project.openings);
 
             const isSwitchFrom = fromEl.category === 'switch';
@@ -1327,11 +1824,15 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             const isSwitchedPhaseToLight = (isSwitchFrom && isLightTo) || (isLightFrom && isSwitchTo) || (isJunctionOrPanelFrom && isLightTo && Boolean(wire.switchGroupId));
 
             // Use bundled offset path to prevent cables from overlapping on top of each other!
-            // When actively editing/dragging the selected wire, use its direct wire.points
+            // Strictly verify that the bundled trace never penetrates door or window openings
             const bundledPoints = bundleOffsetMap.get(wire.id);
+            const safeBundledPoints = bundledPoints && !checkChaseIntersectsOpening(bundledPoints, project.walls, project.openings).hasCollision
+              ? bundledPoints
+              : undefined;
+
             const effectivePoints = isSelected && wire.points && wire.points.length >= 2
               ? wire.points
-              : (bundledPoints || rawPoints);
+              : (safeBundledPoints || rawPoints);
 
             const orthoFlatPoints = effectivePoints.flatMap((p) => [p.x, p.y]);
 
@@ -1372,7 +1873,18 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             const badgeH = 26;
 
             return (
-              <Group key={wire.id}>
+              <Group
+                key={wire.id}
+                onContextMenu={(e) => {
+                  e.evt.preventDefault();
+                  e.cancelBubble = true;
+                  onSelectWire?.(wire.id);
+                  onSelectElement(null);
+                  onSelectWall(null);
+                  onSelectOpening?.(null);
+                  openCanvasContextMenuAt(e.evt.clientX, e.evt.clientY, 'wire', wire.id);
+                }}
+              >
                 {/* 1. SELECTION & HOVER GLOW AURA */}
                 {(isSelected || isHovered) && (
                   isLighting ? (
@@ -1849,7 +2361,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
 
           {/* B. Electrical Symbols */}
           {filteredElements.map((el) => {
-            const isSelected = selectedElementId === el.id;
+            const isSelected = selectedElementId === el.id || multiSelectedElementIds.includes(el.id);
             const circuit = project.circuits.find((c) => c.id === el.circuitId);
             const elColor = circuit?.color || (el.category === 'light' ? '#f59e0b' : '#38bdf8');
 
@@ -1862,6 +2374,22 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                 rotation={el.rotation}
                 draggable={activeTool === 'select'}
                 onClick={(e) => handleElementClick(e, el)}
+                onContextMenu={(e) => {
+                  e.evt.preventDefault();
+                  e.cancelBubble = true;
+                  if (multiSelectedElementIds.length > 1 && multiSelectedElementIds.includes(el.id)) {
+                    openCanvasContextMenuAt(e.evt.clientX, e.evt.clientY, 'multi');
+                  } else {
+                    setMultiSelectedElementIds([]);
+                    onSelectElement(el.id);
+                    onSelectWall(null);
+                    onSelectOpening?.(null);
+                    onSelectWire?.(null);
+                    openCanvasContextMenuAt(e.evt.clientX, e.evt.clientY, 'element', el.id);
+                  }
+                }}
+                onDragStart={() => handleElementDragStart(el)}
+                onDragMove={(e) => handleElementDragMove(e, el)}
                 onDragEnd={(e) => handleElementDragEnd(e, el)}
               >
                 <KonvaElectricalSymbol
@@ -1876,6 +2404,7 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                   isBackupPriority={Boolean(el.isBackupPriority || circuit?.isBackupPriority)}
                   customSymbolShape={el.customSymbolShape}
                   customSymbolColor={el.customSymbolColor}
+                  customSvgPath={el.customSvgPath}
                 />
 
                 {/* Switch group indicator tag for lighting circuits */}
@@ -1942,6 +2471,60 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
               </Group>
             );
           })}
+
+          {/* CIRCUIT BADGES & LEADERS (ANTI-COLLISION FOR INSTALLERS) */}
+          {(layerVisibility ? layerVisibility.circuitBadges !== false : true) && showCircuitBadges && showAnnotations && (
+            <Group listening={false}>
+              {circuitBadgeLayouts.map((b) => (
+                <Group key={`badge_${b.elementId}`}>
+                  {/* Leader Line with anchor dot */}
+                  {b.hasLeader && (
+                    <Group>
+                      <Line
+                        points={b.leaderPoints}
+                        stroke={b.circuitColor}
+                        strokeWidth={1.2}
+                        dash={[3, 2]}
+                        opacity={0.85}
+                      />
+                      <Circle
+                        x={b.elementPos.x}
+                        y={b.elementPos.y}
+                        radius={2.5}
+                        fill={b.circuitColor}
+                      />
+                    </Group>
+                  )}
+                  {/* Badge Pill */}
+                  <Rect
+                    x={b.badgePos.x - b.badgeWidth / 2}
+                    y={b.badgePos.y - b.badgeHeight / 2}
+                    width={b.badgeWidth}
+                    height={b.badgeHeight}
+                    cornerRadius={3}
+                    fill="#090d16"
+                    stroke={b.circuitColor}
+                    strokeWidth={1.2}
+                    shadowColor="black"
+                    shadowBlur={4}
+                    shadowOpacity={0.8}
+                  />
+                  {/* Badge Text */}
+                  <Text
+                    x={b.badgePos.x - b.badgeWidth / 2}
+                    y={b.badgePos.y - 4}
+                    width={b.badgeWidth}
+                    text={b.badgeText}
+                    fontSize={8.5}
+                    fontStyle="bold"
+                    fontFamily="monospace"
+                    fill={b.circuitColor}
+                    align="center"
+                  />
+                </Group>
+              ))}
+            </Group>
+          )}
         </Layer>
 
         {/* ======================================================== */}
@@ -2075,6 +2658,116 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
             </Group>
           )}
 
+          {/* Active Door Jamb PUE Snap Guide Preview (during drag or placement) */}
+          {activeJambSnap && (
+            <Group listening={false}>
+              {/* Leader guide line from door jamb to element */}
+              <Line
+                points={activeJambSnap.guideLine}
+                stroke="#10b981"
+                strokeWidth={2}
+                dash={[4, 2]}
+              />
+              {/* Jamb Anchor indicator */}
+              <Circle
+                x={activeJambSnap.guideLine[0]}
+                y={activeJambSnap.guideLine[1]}
+                radius={4.5}
+                fill="#10b981"
+                stroke="#ffffff"
+                strokeWidth={1.5}
+              />
+              {/* Snapped Target Point */}
+              <Circle
+                x={activeJambSnap.snappedPoint.x}
+                y={activeJambSnap.snappedPoint.y}
+                radius={5.5}
+                fill="#10b981"
+                stroke="#ffffff"
+                strokeWidth={2}
+              />
+              {/* Floating Dimension Tag */}
+              <Group
+                x={(activeJambSnap.guideLine[0] + activeJambSnap.snappedPoint.x) / 2}
+                y={(activeJambSnap.guideLine[1] + activeJambSnap.snappedPoint.y) / 2 - 18}
+              >
+                <Rect
+                  x={-95}
+                  y={-10}
+                  width={190}
+                  height={20}
+                  cornerRadius={4}
+                  fill="#0f172a"
+                  stroke="#10b981"
+                  strokeWidth={1.5}
+                />
+                <Text
+                  x={-95}
+                  y={-5}
+                  width={190}
+                  text={`🚪 ${activeJambSnap.distanceFromJambMm} мм (Норматив ПУЕ/ДБН)`}
+                  fontSize={9.5}
+                  fontStyle="bold"
+                  fill="#10b981"
+                  align="center"
+                />
+              </Group>
+            </Group>
+          )}
+
+          {/* Selected Element Door Jamb & Wall Face Dimension Leader */}
+          {selectedElementId && !activeJambSnap && (() => {
+            const el = project.elements.find((e) => e.id === selectedElementId);
+            if (!el) return null;
+            const datum = analyzeElementWallDatum(el.position, project.walls, project.openings || []);
+            if (!datum || !datum.closestOpening) return null;
+
+            const op = datum.closestOpening.opening;
+            const wall = datum.wall;
+            const dx = wall.end.x - wall.start.x;
+            const dy = wall.end.y - wall.start.y;
+            const wallLenPx = Math.hypot(dx, dy) || 1;
+            const ux = dx / wallLenPx;
+            const uy = dy / wallLenPx;
+            const opCenterPx = {
+              x: wall.start.x + op.positionRatio * dx,
+              y: wall.start.y + op.positionRatio * dy,
+            };
+            const halfW = mmToPx(op.width || 900) / 2;
+            const jambPt =
+              datum.closestOpening.closestJamb === 'left'
+                ? { x: opCenterPx.x - ux * halfW, y: opCenterPx.y - uy * halfW }
+                : { x: opCenterPx.x + ux * halfW, y: opCenterPx.y + uy * halfW };
+
+            return (
+              <Group listening={false}>
+                <Line
+                  points={[jambPt.x, jambPt.y, el.position.x, el.position.y]}
+                  stroke="#38bdf8"
+                  strokeWidth={1.5}
+                  dash={[3, 3]}
+                />
+                <Circle x={jambPt.x} y={jambPt.y} radius={3.5} fill="#38bdf8" stroke="#ffffff" strokeWidth={1} />
+                <Group
+                  x={(jambPt.x + el.position.x) / 2}
+                  y={(jambPt.y + el.position.y) / 2 - 14}
+                >
+                  <Rect x={-60} y={-8} width={120} height={16} cornerRadius={3} fill="#0f172a" stroke="#38bdf8" strokeWidth={1} />
+                  <Text
+                    x={-60}
+                    y={-4}
+                    width={120}
+                    text={`🚪 ${datum.closestOpening.distanceFromClosestJambMm} мм від укосу`}
+                    fontSize={9}
+                    fontStyle="bold"
+                    fill="#38bdf8"
+                    align="center"
+                  />
+                </Group>
+              </Group>
+            );
+          })()}
+
           {/* In-progress Wall Drawing preview */}
           {wallStartPoint &&
             (() => {
@@ -2087,16 +2780,30 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                 currentP = snapPointToGrid(mouseWorldPos, 10);
               }
 
-              const lenMm = pxToMm(distance(wallStartPoint, currentP));
+              // Check if user typed numeric dimension via keyboard
+              const typedVal = parseFloat(wallDraftLengthInput);
+              const isTyped = !isNaN(typedVal) && typedVal > 0;
+              let effectiveP = currentP;
+              let lenMm = pxToMm(distance(wallStartPoint, currentP));
               const angleDeg = Math.round((Math.atan2(currentP.y - wallStartPoint.y, currentP.x - wallStartPoint.x) * 180) / Math.PI);
               const normAngle = (angleDeg + 360) % 360;
+
+              if (isTyped) {
+                lenMm = Math.round(typedVal);
+                const angleRad = (normAngle * Math.PI) / 180;
+                const lenPx = mmToPx(typedVal);
+                effectiveP = {
+                  x: Math.round(wallStartPoint.x + Math.cos(angleRad) * lenPx),
+                  y: Math.round(wallStartPoint.y + Math.sin(angleRad) * lenPx),
+                };
+              }
 
               return (
                 <Group listening={false}>
                   {/* Ortho Guide line */}
                   {activeOrtho?.isSnapped && (
                     <Line
-                      points={[wallStartPoint.x, wallStartPoint.y, currentP.x, currentP.y]}
+                      points={[wallStartPoint.x, wallStartPoint.y, effectiveP.x, effectiveP.y]}
                       stroke="#06b6d4"
                       strokeWidth={1}
                       dash={[4, 4]}
@@ -2104,23 +2811,36 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                   )}
                   {/* Wall body preview */}
                   <Line
-                    points={[wallStartPoint.x, wallStartPoint.y, currentP.x, currentP.y]}
-                    stroke="#38bdf8"
+                    points={[wallStartPoint.x, wallStartPoint.y, effectiveP.x, effectiveP.y]}
+                    stroke={isTyped ? '#10b981' : '#38bdf8'}
                     strokeWidth={15}
-                    dash={[6, 4]}
+                    dash={isTyped ? [8, 2] : [6, 4]}
                     lineCap="square"
                   />
                   {/* Dimension badge */}
-                  <Group x={(wallStartPoint.x + currentP.x) / 2} y={(wallStartPoint.y + currentP.y) / 2 - 18}>
-                    <Rect x={-45} y={-10} width={90} height={20} cornerRadius={4} fill="#0f172a" stroke="#38bdf8" strokeWidth={1} />
+                  <Group x={(wallStartPoint.x + effectiveP.x) / 2} y={(wallStartPoint.y + effectiveP.y) / 2 - 18}>
+                    <Rect
+                      x={-60}
+                      y={-10}
+                      width={120}
+                      height={20}
+                      cornerRadius={4}
+                      fill="#0f172a"
+                      stroke={isTyped ? '#10b981' : '#38bdf8'}
+                      strokeWidth={1}
+                    />
                     <Text
-                      x={-45}
+                      x={-60}
                       y={-5}
-                      width={90}
-                      text={`${lenMm} мм  ${normAngle}°`}
+                      width={120}
+                      text={
+                        isTyped
+                          ? `📏 ${formatDimensionValue(lenMm, displayUnit, true)} [Enter]`
+                          : `${formatDimensionValue(lenMm, displayUnit, true)}  ${normAngle}°`
+                      }
                       fontSize={9.5}
                       fontStyle="bold"
-                      fill="#38bdf8"
+                      fill={isTyped ? '#10b981' : '#38bdf8'}
                       fontFamily="monospace"
                       align="center"
                     />
@@ -2144,8 +2864,18 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
                   <Circle x={measureStartPoint.x} y={measureStartPoint.y} radius={4} fill="#fbbf24" />
                   <Circle x={mouseWorldPos.x} y={mouseWorldPos.y} radius={4} fill="#fbbf24" />
                   <Group x={(measureStartPoint.x + mouseWorldPos.x) / 2} y={(measureStartPoint.y + mouseWorldPos.y) / 2 - 15}>
-                    <Rect x={-35} y={-10} width={70} height={20} cornerRadius={4} fill="#0f172a" stroke="#fbbf24" strokeWidth={1} />
-                    <Text x={-35} y={-5} width={70} text={`${distMm} мм`} fontSize={10} fontStyle="bold" fill="#fbbf24" fontFamily="monospace" align="center" />
+                    <Rect x={-42} y={-10} width={84} height={20} cornerRadius={4} fill="#0f172a" stroke="#fbbf24" strokeWidth={1} />
+                    <Text
+                      x={-42}
+                      y={-5}
+                      width={84}
+                      text={formatDimensionValue(distMm, displayUnit, true)}
+                      fontSize={10}
+                      fontStyle="bold"
+                      fill="#fbbf24"
+                      fontFamily="monospace"
+                      align="center"
+                    />
                   </Group>
                 </Group>
               );
@@ -2238,13 +2968,51 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
               );
             })()}
 
-          {/* Switch linking banner */}
-          {linkingSwitchId && (
-            <Group x={stageDimensions.width / 2 - 160} y={20} listening={false}>
-              <Rect x={0} y={0} width={320} height={28} cornerRadius={6} fill="#0284c7" stroke="#38bdf8" strokeWidth={1.5} />
-              <Text x={10} y={7} width={300} text="🔗 Режим зв'язування: клікніть світильник на плані" fontSize={11} fontStyle="bold" fill="#ffffff" align="center" />
-            </Group>
-          )}
+          {/* Rubberband Box Marquee Selection Rect */}
+          {boxSelectionStart && boxSelectionEnd && (() => {
+            const minX = Math.min(boxSelectionStart.x, boxSelectionEnd.x);
+            const minY = Math.min(boxSelectionStart.y, boxSelectionEnd.y);
+            const width = Math.abs(boxSelectionEnd.x - boxSelectionStart.x);
+            const height = Math.abs(boxSelectionEnd.y - boxSelectionStart.y);
+            return (
+              <Group listening={false}>
+                <Rect
+                  x={minX}
+                  y={minY}
+                  width={width}
+                  height={height}
+                  fill="rgba(56, 189, 248, 0.12)"
+                  stroke="#38bdf8"
+                  strokeWidth={1.5}
+                  dash={[4, 3]}
+                />
+                {multiSelectedElementIds.length > 0 && (
+                  <Group x={minX + width / 2} y={minY - 18}>
+                    <Rect
+                      x={-55}
+                      y={-9}
+                      width={110}
+                      height={18}
+                      cornerRadius={4}
+                      fill="#0f172a"
+                      stroke="#38bdf8"
+                      strokeWidth={1}
+                    />
+                    <Text
+                      x={-55}
+                      y={-5}
+                      width={110}
+                      text={`Обрано: ${multiSelectedElementIds.length} об'єктів`}
+                      fontSize={9}
+                      fontStyle="bold"
+                      fill="#38bdf8"
+                      align="center"
+                    />
+                  </Group>
+                )}
+              </Group>
+            );
+          })()}
         </Layer>
       </Stage>
 
@@ -2269,19 +3037,42 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-1.5 text-neutral-300">
             <span className="text-neutral-500">X:</span>
-            <span className="tabular-nums font-semibold text-sky-400">{pxToMm(mouseWorldPos.x).toFixed(1)}</span>
-            <span className="text-neutral-600">мм</span>
+            <span className="tabular-nums font-semibold text-sky-400">
+              {formatDimensionValue(pxToMm(mouseWorldPos.x), displayUnit, false)}
+            </span>
+            <span className="text-neutral-600">{unitLabel}</span>
             <span className="text-neutral-500 ml-1">Y:</span>
-            <span className="tabular-nums font-semibold text-sky-400">{pxToMm(mouseWorldPos.y).toFixed(1)}</span>
-            <span className="text-neutral-600">мм</span>
+            <span className="tabular-nums font-semibold text-sky-400">
+              {formatDimensionValue(pxToMm(mouseWorldPos.y), displayUnit, false)}
+            </span>
+            <span className="text-neutral-600">{unitLabel}</span>
             <span className="text-neutral-500 ml-1">Z:</span>
-            <span className="tabular-nums text-neutral-400">0.0</span>
-            <span className="text-neutral-600">мм</span>
+            <span className="tabular-nums text-neutral-400">0</span>
+            <span className="text-neutral-600">{unitLabel}</span>
           </div>
           <div className="h-3 w-px bg-neutral-800" />
           <span className="text-[10px] text-neutral-400 bg-neutral-900 px-1.5 py-0.5 rounded border border-neutral-800">
             М 1:100
           </span>
+          {onChangeDisplayUnit && (
+            <div className="flex items-center bg-neutral-900 rounded border border-neutral-800 overflow-hidden">
+              {(['mm', 'cm', 'm'] as const).map((u) => (
+                <button
+                  key={u}
+                  type="button"
+                  onClick={() => onChangeDisplayUnit(u)}
+                  className={`px-1.5 py-0.5 text-[10px] font-mono transition-colors ${
+                    displayUnit === u
+                      ? 'bg-sky-500 text-neutral-950 font-bold'
+                      : 'text-neutral-400 hover:text-neutral-200'
+                  }`}
+                  title={`Одиниці вимірювання: ${getUnitLabel(u)}`}
+                >
+                  {getUnitLabel(u)}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Center/Right: AutoCAD Status Controls & Toggles */}
@@ -2312,6 +3103,20 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
               title="Показати або приховати примітки, виноски та бірки кабелів на кресленні"
             >
               ПРИМІТКИ {showAnnotations ? 'ON' : 'OFF'}
+            </button>
+          )}
+
+          {onToggleCircuitBadges && (
+            <button
+              onClick={onToggleCircuitBadges}
+              className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
+                showCircuitBadges
+                  ? 'bg-sky-950/80 text-sky-300 border border-sky-500/80'
+                  : 'bg-neutral-900 text-neutral-500 border border-neutral-800 hover:text-neutral-300'
+              }`}
+              title="Показати або приховати мітки та номери електричних груп (ЩР/Гр.) біля приладів на кресленні"
+            >
+              МІТКИ ГРУП {showCircuitBadges ? 'ON' : 'OFF'}
             </button>
           )}
 
@@ -2434,6 +3239,342 @@ export const KonvaCadCanvas: React.FC<KonvaCadCanvasProps> = ({
           >
             <span>✕ Скасувати (Esc)</span>
           </button>
+        </div>
+      )}
+
+      {/* Floating Interactive Wall Drafting HUD */}
+      {activeTool === 'wall' && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-40 bg-neutral-900/95 border border-sky-500/60 shadow-2xl rounded-2xl px-4 py-2.5 flex items-center gap-3 backdrop-blur-md">
+          <div className="flex items-center gap-2 text-xs">
+            <span className={`w-2.5 h-2.5 rounded-full ${wallStartPoint ? 'bg-emerald-400 animate-pulse' : 'bg-sky-400'}`} />
+            <span className="font-semibold text-neutral-100">
+              {wallStartPoint ? 'Креслення стіни:' : 'Клікніть для початку стіни (кут 90°)'}
+            </span>
+          </div>
+
+          {wallStartPoint && (
+            <>
+              <div className="h-4 w-px bg-neutral-700" />
+              <div className="flex items-center gap-1.5 bg-neutral-950 px-2 py-1 rounded-lg border border-neutral-700">
+                <span className="text-[11px] text-neutral-400 font-medium">Довжина:</span>
+                <input
+                  type="number"
+                  min={100}
+                  max={50000}
+                  step={50}
+                  value={wallDraftLengthInput}
+                  onChange={(e) => setWallDraftLengthInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      commitWallWithLength();
+                    }
+                  }}
+                  placeholder="напр. 3500"
+                  className="w-24 bg-transparent text-emerald-400 font-mono text-xs font-bold focus:outline-none"
+                  autoFocus
+                />
+                <span className="text-[11px] text-neutral-500 font-mono">мм</span>
+              </div>
+
+              {/* Quick preset lengths */}
+              <div className="hidden sm:flex items-center gap-1">
+                {[1500, 2500, 3000, 4000, 5000].map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => {
+                      setWallDraftLengthInput(String(preset));
+                    }}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors ${
+                      wallDraftLengthInput === String(preset)
+                        ? 'bg-emerald-600 text-white font-bold'
+                        : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300'
+                    }`}
+                  >
+                    {preset}
+                  </button>
+                ))}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => commitWallWithLength()}
+                className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1 shadow-md transition-all active:scale-95"
+                title="Створити стіну заданої довжини (Enter)"
+              >
+                <span>✓ Задати (Enter)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setWallStartPoint(null);
+                  setWallDraftLengthInput('');
+                }}
+                className="px-2.5 py-1 bg-neutral-800 hover:bg-red-950/60 hover:text-red-300 text-neutral-400 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+                title="Скасувати (Esc)"
+              >
+                <span>✕ Скасувати (Esc)</span>
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Right-Click Floating CAD Context Menu */}
+      {contextMenu && (
+        <div
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute z-50 w-56 bg-neutral-900/95 backdrop-blur-md border border-neutral-700 rounded-xl shadow-2xl py-1.5 text-xs text-neutral-200 animate-in fade-in zoom-in-95 duration-100"
+        >
+          {contextMenu.targetType === 'multi' && (
+            <>
+              <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-sky-400 border-b border-neutral-800 mb-1">
+                Група ({multiSelectedElementIds.length} об'єктів)
+              </div>
+              {onAlignElements && (
+                <>
+                  <button
+                    onClick={() => {
+                      onAlignElements(multiSelectedElementIds, 'align_x');
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+                  >
+                    Вирівняти по осі X
+                  </button>
+                  <button
+                    onClick={() => {
+                      onAlignElements(multiSelectedElementIds, 'align_y');
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+                  >
+                    Вирівняти по осі Y
+                  </button>
+                  <button
+                    onClick={() => {
+                      onAlignElements(multiSelectedElementIds, 'pitch_71_h');
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 text-sky-300 transition-colors"
+                  >
+                    Блок крок 71 мм (Горизонтально)
+                  </button>
+                  <button
+                    onClick={() => {
+                      onAlignElements(multiSelectedElementIds, 'pitch_71_v');
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 text-sky-300 transition-colors"
+                  >
+                    Блок крок 71 мм (Вертикально)
+                  </button>
+                </>
+              )}
+              {onCopySelection && (
+                <button
+                  onClick={() => {
+                    onCopySelection();
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 border-t border-neutral-800 mt-1 pt-1.5 transition-colors"
+                >
+                  Копіювати групу (Ctrl+C)
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  if (onDeleteElementsBatch) {
+                    onDeleteElementsBatch(multiSelectedElementIds);
+                  } else {
+                    multiSelectedElementIds.forEach((id) => onDeleteElement(id));
+                  }
+                  setMultiSelectedElementIds([]);
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 hover:bg-rose-950/60 text-rose-400 font-semibold transition-colors"
+              >
+                Видалити виділені (Del)
+              </button>
+            </>
+          )}
+
+          {contextMenu.targetType === 'element' && contextMenu.targetId && (() => {
+            const el = project.elements.find((item) => item.id === contextMenu.targetId);
+            if (!el) return null;
+            return (
+              <>
+                <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-amber-400 border-b border-neutral-800 mb-1 truncate">
+                  {el.name}
+                </div>
+                <button
+                  onClick={() => {
+                    onUpdateElementPosition(el.id, el.position, (el.rotation + 90) % 360, el.wallId);
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+                >
+                  Повернути +90°
+                </button>
+                {onDuplicateElement && (
+                  <button
+                    onClick={() => {
+                      onDuplicateElement(el.id);
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+                  >
+                    Дублювати (Ctrl+D)
+                  </button>
+                )}
+                {onCopySelection && (
+                  <button
+                    onClick={() => {
+                      onCopySelection();
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+                  >
+                    Копіювати (Ctrl+C)
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    onDeleteElement(el.id);
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-rose-950/60 text-rose-400 font-semibold border-t border-neutral-800 mt-1 pt-1.5 transition-colors"
+                >
+                  Видалити елемент (Del)
+                </button>
+              </>
+            );
+          })()}
+
+          {contextMenu.targetType === 'wire' && contextMenu.targetId && (
+            <>
+              <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-sky-400 border-b border-neutral-800 mb-1">
+                Кабельна траса
+              </div>
+              <button
+                onClick={() => {
+                  onOpenSwitchWiringDiagram?.();
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 text-amber-300 transition-colors"
+              >
+                Схема підключення L ➔ L'
+              </button>
+              <button
+                onClick={() => {
+                  onDeleteWire?.(contextMenu.targetId!);
+                  onSelectWire?.(null);
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 hover:bg-rose-950/60 text-rose-400 font-semibold border-t border-neutral-800 mt-1 pt-1.5 transition-colors"
+              >
+                Видалити трасу (Del)
+              </button>
+            </>
+          )}
+
+          {contextMenu.targetType === 'wall' && contextMenu.targetId && (() => {
+            const w = project.walls.find((item) => item.id === contextMenu.targetId);
+            if (!w) return null;
+            return (
+              <>
+                <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-neutral-400 border-b border-neutral-800 mb-1">
+                  Стіна ({w.thickness} мм)
+                </div>
+                {onUpdateWall && (
+                  <>
+                    <button
+                      onClick={() => {
+                        onUpdateWall(alignWallOrtho(w));
+                        setContextMenu(null);
+                      }}
+                      className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+                    >
+                      Вирівняти 90° (Орто)
+                    </button>
+                    <button
+                      onClick={() => {
+                        onUpdateWall(reverseWall(w));
+                        setContextMenu(null);
+                      }}
+                      className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+                    >
+                      Розвернути напрямок (⇄)
+                    </button>
+                  </>
+                )}
+                {onOpenWallElevation && (
+                  <button
+                    onClick={() => {
+                      onOpenWallElevation(w.id);
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 text-sky-300 transition-colors"
+                  >
+                    Розгортка стіни та штроби
+                  </button>
+                )}
+                {onDeleteWall && (
+                  <button
+                    onClick={() => {
+                      onDeleteWall(w.id);
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-rose-950/60 text-rose-400 font-semibold border-t border-neutral-800 mt-1 pt-1.5 transition-colors"
+                  >
+                    Видалити стіну
+                  </button>
+                )}
+              </>
+            );
+          })()}
+
+          {contextMenu.targetType === 'canvas' && (
+            <>
+              <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-neutral-400 border-b border-neutral-800 mb-1">
+                Робоче поле CAD
+              </div>
+              {onPasteClipboard && (
+                <button
+                  disabled={!canPaste}
+                  onClick={() => {
+                    onPasteClipboard();
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 disabled:opacity-40 transition-colors"
+                >
+                  Вставити з буфера (Ctrl+V)
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  setScale(1.05);
+                  setStagePos({ x: 100, y: 70 });
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+              >
+                Скинути масштаб (100%)
+              </button>
+              <button
+                onClick={() => {
+                  setShowRulers(!showRulers);
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 transition-colors"
+              >
+                {showRulers ? 'Приховати лінійки CAD' : 'Показати лінійки CAD'}
+              </button>
+            </>
+          )}
         </div>
       )}
     </div>

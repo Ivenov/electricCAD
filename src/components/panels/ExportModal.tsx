@@ -9,7 +9,9 @@ import { CadProject } from '../../types/cad';
 import { downloadDxfFile } from '../../utils/dxfExport';
 import { downloadIfcFile } from '../../utils/ifcExport';
 import { generateCadProjectSvg } from '../../utils/svgExport';
+import { exportDstuAlbumToPdf } from '../../utils/pdfExport';
 import { validateAndParseProjectJson } from '../../utils/storage';
+import { exportComprehensiveProjectToExcel, exportBomToCsv } from '../../utils/excelCsvUtils';
 
 interface ExportModalProps {
   project: CadProject;
@@ -118,9 +120,15 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     img.src = url;
   };
 
-  // 5. Print layout
-  const handlePrint = () => {
-    window.print();
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
+
+  const handleExportPdfAlbum = async () => {
+    setIsExportingPdf(true);
+    try {
+      await exportDstuAlbumToPdf(project);
+    } finally {
+      setIsExportingPdf(false);
+    }
   };
 
   return (
@@ -249,6 +257,76 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
               <Download className="w-4 h-4 text-sky-400 group-hover:translate-x-1 transition-transform" />
             </button>
+
+            {/* DSTU 10-Sheet PDF Album Export */}
+            <button
+              onClick={handleExportPdfAlbum}
+              disabled={isExportingPdf}
+              className="col-span-2 p-4 rounded-xl border border-amber-500/40 bg-amber-950/20 hover:bg-amber-900/40 disabled:opacity-60 transition-all text-left group flex items-center justify-between"
+            >
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-lg bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400">
+                  <Printer className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-xs font-bold text-white">Альбом ДСТУ (10 аркушів А3)</h4>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold border border-amber-500/30">.PDF</span>
+                  </div>
+                  <p className="text-[11px] text-neutral-300 mt-0.5">
+                    {isExportingPdf ? 'Генерація багатосторінкового PDF...' : 'Повний пакет креслень ЕОМ, однолінійна схема, кабельний журнал та БОМ'}
+                  </p>
+                </div>
+              </div>
+              <Download className="w-4 h-4 text-amber-400" />
+            </button>
+
+            {/* Excel / CSV Engineering BOM Export */}
+            <div className="col-span-2 grid grid-cols-2 gap-2">
+              <button
+                onClick={() => {
+                  exportComprehensiveProjectToExcel(project);
+                  onClose();
+                }}
+                className="p-3.5 rounded-xl border border-emerald-500/40 bg-emerald-950/20 hover:bg-emerald-900/40 transition-all text-left group flex items-center justify-between"
+              >
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                    <FileSpreadsheet className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <h4 className="text-xs font-bold text-white">Кошторис / БОМ</h4>
+                      <span className="text-[10px] font-mono px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-semibold">.XLSX</span>
+                    </div>
+                    <p className="text-[10px] text-neutral-400">Специфікація кабелів, рамок та щита</p>
+                  </div>
+                </div>
+                <Download className="w-3.5 h-3.5 text-emerald-400 group-hover:translate-y-0.5 transition-transform" />
+              </button>
+
+              <button
+                onClick={() => {
+                  exportBomToCsv(project);
+                  onClose();
+                }}
+                className="p-3.5 rounded-xl border border-neutral-800 bg-neutral-950 hover:bg-neutral-800/80 hover:border-emerald-500/40 transition-all text-left group flex items-center justify-between"
+              >
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-neutral-800 flex items-center justify-center text-neutral-300">
+                    <FileSpreadsheet className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <h4 className="text-xs font-bold text-neutral-200">Таблиця CSV</h4>
+                      <span className="text-[10px] font-mono px-1 py-0.2 rounded bg-neutral-800 text-neutral-300 font-semibold">.CSV</span>
+                    </div>
+                    <p className="text-[10px] text-neutral-400">UTF-8 для 1С та імпорту в таблиці</p>
+                  </div>
+                </div>
+                <Download className="w-3.5 h-3.5 text-neutral-400 group-hover:translate-y-0.5 transition-transform" />
+              </button>
+            </div>
           </div>
 
           {/* Import JSON File */}

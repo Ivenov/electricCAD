@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Trash2,
   Copy,
@@ -15,9 +15,39 @@ import {
   Check,
   Layers,
   Sofa,
+  Ruler,
+  ArrowRightLeft,
+  Compass,
+  Move,
+  Split,
+  RefreshCw,
+  AlertTriangle,
+  CheckCircle2,
 } from 'lucide-react';
 import { CadProject, ElectricalElement, Wall, WallOpening, WireRoute, FurnitureItem } from '../../types/cad';
-import { pxToMm, distance, getCableDisplayName, getCableCrossSection, calculateCableLengthM } from '../../utils/cadMath';
+import {
+  pxToMm,
+  mmToPx,
+  distance,
+  getCableDisplayName,
+  getCableCrossSection,
+  calculateCableLengthM,
+  calculateWallLengthMm,
+  calculateWallAngleDeg,
+  setWallLengthMm,
+  setWallAngleDeg,
+  alignWallOrtho,
+  reverseWall,
+  analyzeElementWallDatum,
+  positionElementByWallDatum,
+} from '../../utils/cadMath';
+import { computeOrthogonalPath } from '../../utils/autoRouting';
+import {
+  formatDimensionValue,
+  getUnitLabel,
+  convertDisplayUnitToMm,
+  convertMmToDisplayUnit,
+} from '../../utils/projectAggregator';
 
 interface PropertyInspectorProps {
   project: CadProject;
@@ -47,6 +77,17 @@ interface PropertyInspectorProps {
   onAutoNumberCables?: () => void;
   autoRoutingEnabled?: boolean;
   onToggleAutoRouting?: () => void;
+  onOptimizeParallelWires?: () => void;
+  onOpenAutoSocketsModal?: () => void;
+  onOpenWallElevation?: (wallId?: string) => void;
+  multiSelectedElementIds?: string[];
+  onClearMultiSelection?: () => void;
+  onBulkUpdateElements?: (
+    ids: string[],
+    patch: Partial<Pick<ElectricalElement, 'circuitId' | 'mountingHeightMm' | 'ipRating' | 'isBackupPriority'>>
+  ) => void;
+  onAlignElements?: (ids: string[], mode: 'align_x' | 'align_y' | 'pitch_71_h' | 'pitch_71_v') => void;
+  onDeleteElementsBatch?: (ids: string[]) => void;
 }
 
 export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
@@ -77,13 +118,38 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   onAutoNumberCables,
   autoRoutingEnabled = true,
   onToggleAutoRouting,
+  onOptimizeParallelWires,
+  onOpenAutoSocketsModal,
+  onOpenWallElevation,
+  multiSelectedElementIds = [],
+  onClearMultiSelection,
+  onBulkUpdateElements,
+  onAlignElements,
+  onDeleteElementsBatch,
 }) => {
+  const [wallAnchor, setWallAnchor] = useState<'start' | 'center' | 'end'>('start');
+  const [bulkCircuitId, setBulkCircuitId] = useState<string>('');
+  const [bulkHeightInput, setBulkHeightInput] = useState<string>('300');
+  const displayUnit = project.displayUnit || 'mm';
+  const unitLabel = getUnitLabel(displayUnit);
+
   const selectedElement = project.elements.find((el) => el.id === selectedElementId);
+  const multiSelectedElements = useMemo(
+    () => project.elements.filter((el) => multiSelectedElementIds.includes(el.id)),
+    [project.elements, multiSelectedElementIds]
+  );
+  const isMultiSelected = multiSelectedElements.length > 1;
   const selectedWall = project.walls.find((w) => w.id === selectedWallId);
   const selectedOpening = project.openings.find((op) => op.id === selectedOpeningId);
   const selectedWire = project.wires.find((w) => w.id === selectedWireId);
   const selectedFurniture = project.furniture?.find((f) => f.id === selectedFurnitureId);
   const openingWall = selectedOpening ? project.walls.find((w) => w.id === selectedOpening.wallId) : null;
+
+  // Geometric Datum Analysis (Centerline, Plaster Faces, and Door Jambs like Electro-Planner)
+  const wallDatum = useMemo(() => {
+    if (!selectedElement) return null;
+    return analyzeElementWallDatum(selectedElement.position, project.walls, project.openings || []);
+  }, [selectedElement, project.walls, project.openings]);
 
   // Common mounting height quick picks in mm
   const HEIGHT_PRESETS = [
@@ -194,9 +260,29 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
       {/* Panel Header */}
       <div className="h-12 border-b border-neutral-800 px-4 flex items-center justify-between">
         <span className="text-xs font-bold tracking-wide uppercase text-neutral-300">
-          Властивості об'єкта
+          {isMultiSelected ? `Група (${multiSelectedElements.length} елементів)` : "Властивості об'єкта"}
         </span>
-        {selectedElement && (
+        {isMultiSelected && onDeleteElementsBatch && (
+          <div className="flex items-center gap-1">
+            {onClearMultiSelection && (
+              <button
+                onClick={onClearMultiSelection}
+                title="Зняти групове виділення"
+                className="px-2 py-1 text-[10px] text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded transition-colors"
+              >
+                Скинути
+              </button>
+            )}
+            <button
+              onClick={() => onDeleteElementsBatch(multiSelectedElements.map((e) => e.id))}
+              title="Видалити всі виділені елементи (Del)"
+              className="p-1.5 text-rose-400 hover:text-rose-300 hover:bg-rose-950/40 rounded transition-colors"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+        {!isMultiSelected && selectedElement && (
           <div className="flex items-center gap-1">
             <button
               onClick={() => onDuplicateElement(selectedElement.id)}
@@ -325,15 +411,15 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             {/* Coordinates & Rotation */}
             <div className="grid grid-cols-3 gap-2">
               <div>
-                <label className="text-[11px] text-neutral-400 block mb-1">X (мм)</label>
+                <label className="text-[11px] text-neutral-400 block mb-1">X ({unitLabel})</label>
                 <div className="bg-neutral-950 border border-neutral-800 rounded px-2 py-1.5 font-mono text-neutral-300">
-                  {pxToMm(selectedFurniture.position.x)}
+                  {formatDimensionValue(pxToMm(selectedFurniture.position.x), displayUnit, false)}
                 </div>
               </div>
               <div>
-                <label className="text-[11px] text-neutral-400 block mb-1">Y (мм)</label>
+                <label className="text-[11px] text-neutral-400 block mb-1">Y ({unitLabel})</label>
                 <div className="bg-neutral-950 border border-neutral-800 rounded px-2 py-1.5 font-mono text-neutral-300">
-                  {pxToMm(selectedFurniture.position.y)}
+                  {formatDimensionValue(pxToMm(selectedFurniture.position.y), displayUnit, false)}
                 </div>
               </div>
               <div>
@@ -420,8 +506,203 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
           </div>
         )}
 
-        {/* CASE 1: ELECTRICAL ELEMENT SELECTED */}
-        {selectedElement ? (
+        {/* CASE 0.5: MULTI-SELECTION BULK EDITOR */}
+        {isMultiSelected ? (
+          <div className="space-y-4">
+            <div className="p-3 rounded-xl bg-sky-950/30 border border-sky-500/40 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-sky-400">
+                  Мультивиділення ({multiSelectedElements.length} шт.)
+                </span>
+                <span className="text-[10px] font-mono text-neutral-400">
+                  {multiSelectedElements.reduce((s, e) => s + (e.powerWatts || 0), 0)} Вт
+                </span>
+              </div>
+              <p className="text-[10px] text-neutral-400">
+                Перетягуйте будь-який виділений елемент на полотні для синхронного переміщення групи. Ctrl+C / Ctrl+V для копіювання.
+              </p>
+            </div>
+
+            {/* Alignment & 71mm Modular Pitch */}
+            {onAlignElements && (
+              <div className="p-3 rounded-xl bg-neutral-950 border border-neutral-800 space-y-2">
+                <label className="text-[11px] font-bold text-neutral-300 block uppercase tracking-wide">
+                  Вирівнювання та крок 71 мм
+                </label>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => onAlignElements(multiSelectedElements.map((e) => e.id), 'align_x')}
+                    className="py-1.5 px-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 rounded text-[11px] text-neutral-200 font-medium transition-colors"
+                  >
+                    Вирівняти по X
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onAlignElements(multiSelectedElements.map((e) => e.id), 'align_y')}
+                    className="py-1.5 px-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 rounded text-[11px] text-neutral-200 font-medium transition-colors"
+                  >
+                    Вирівняти по Y
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onAlignElements(multiSelectedElements.map((e) => e.id), 'pitch_71_h')}
+                    className="py-1.5 px-2 bg-sky-950/50 hover:bg-sky-900/60 border border-sky-700/60 rounded text-[11px] text-sky-300 font-semibold transition-colors"
+                    title="Згрупувати в горизонтальний блок механізмів з міжосьовим кроком 71 мм"
+                  >
+                    Крок 71 мм (Гориз.)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onAlignElements(multiSelectedElements.map((e) => e.id), 'pitch_71_v')}
+                    className="py-1.5 px-2 bg-sky-950/50 hover:bg-sky-900/60 border border-sky-700/60 rounded text-[11px] text-sky-300 font-semibold transition-colors"
+                    title="Згрупувати у вертикальний блок механізмів з міжосьовим кроком 71 мм"
+                  >
+                    Крок 71 мм (Верт.)
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Bulk Group Assignment */}
+            {onBulkUpdateElements && (
+              <div className="p-3 rounded-xl bg-neutral-950 border border-neutral-800 space-y-2.5">
+                <label className="text-[11px] font-bold text-neutral-300 block uppercase tracking-wide">
+                  Групове призначення параметрів
+                </label>
+
+                <div>
+                  <span className="text-[10px] text-neutral-400 block mb-1">Електрична група щита:</span>
+                  <div className="flex gap-1.5">
+                    <select
+                      value={bulkCircuitId}
+                      onChange={(e) => setBulkCircuitId(e.target.value)}
+                      className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-sky-500"
+                    >
+                      <option value="">— Оберіть групу —</option>
+                      {project.circuits.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          Гр.{c.number} · {c.name} ({c.breakerRatingA}A)
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={!bulkCircuitId}
+                      onClick={() =>
+                        onBulkUpdateElements(
+                          multiSelectedElements.map((e) => e.id),
+                          { circuitId: bulkCircuitId }
+                        )
+                      }
+                      className="px-2.5 py-1.5 bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-neutral-950 font-bold rounded text-[11px] transition-colors"
+                    >
+                      OK
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <span className="text-[10px] text-neutral-400 block mb-1">
+                    Висота монтажу (мм від чистої підлоги):
+                  </span>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="number"
+                      min={0}
+                      max={project.ceilingHeightMm}
+                      step={50}
+                      value={bulkHeightInput}
+                      onChange={(e) => setBulkHeightInput(e.target.value)}
+                      className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 font-mono text-xs text-neutral-100 focus:outline-none focus:border-sky-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const h = Math.max(0, Number(bulkHeightInput) || 0);
+                        onBulkUpdateElements(
+                          multiSelectedElements.map((e) => e.id),
+                          { mountingHeightMm: h }
+                        );
+                      }}
+                      className="px-2.5 py-1.5 bg-sky-500 hover:bg-sky-400 text-neutral-950 font-bold rounded text-[11px] transition-colors"
+                    >
+                      Задати
+                    </button>
+                  </div>
+                  <div className="flex gap-1 mt-1.5 flex-wrap">
+                    {[300, 900, 1050, 2200, 2700].map((h) => (
+                      <button
+                        key={h}
+                        type="button"
+                        onClick={() => {
+                          setBulkHeightInput(String(h));
+                          onBulkUpdateElements(
+                            multiSelectedElements.map((e) => e.id),
+                            { mountingHeightMm: h }
+                          );
+                        }}
+                        className="px-1.5 py-0.5 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded text-[10px] font-mono text-neutral-300"
+                      >
+                        +{h}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <span className="text-[10px] text-neutral-400 block mb-1">Ступінь захисту (IP):</span>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(['IP20', 'IP44', 'IP65'] as const).map((ip) => (
+                      <button
+                        key={ip}
+                        type="button"
+                        onClick={() =>
+                          onBulkUpdateElements(
+                            multiSelectedElements.map((e) => e.id),
+                            { ipRating: ip }
+                          )
+                        }
+                        className="py-1 bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 rounded text-[10px] font-mono text-neutral-200"
+                      >
+                        {ip}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* List of selected elements */}
+            <div className="border border-neutral-800 rounded-xl bg-neutral-950 overflow-hidden">
+              <div className="px-3 py-2 border-b border-neutral-800 text-[10px] font-semibold uppercase tracking-wider text-neutral-400">
+                Обрані об'єкти ({multiSelectedElements.length})
+              </div>
+              <div className="max-h-48 overflow-y-auto divide-y divide-neutral-800/60">
+                {multiSelectedElements.map((el) => (
+                  <div key={el.id} className="px-3 py-1.5 flex items-center justify-between text-[11px]">
+                    <span className="text-neutral-200 truncate">{el.name}</span>
+                    <span className="font-mono text-[10px] text-neutral-500 shrink-0 ml-2">
+                      +{el.mountingHeightMm} мм
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {onDeleteElementsBatch && (
+              <button
+                type="button"
+                onClick={() => onDeleteElementsBatch(multiSelectedElements.map((e) => e.id))}
+                className="w-full py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 border border-rose-500/50 text-rose-300 font-semibold text-xs flex items-center justify-center gap-2 transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Видалити всі ({multiSelectedElements.length})</span>
+              </button>
+            )}
+          </div>
+        ) : /* CASE 1: ELECTRICAL ELEMENT SELECTED */
+        selectedElement ? (
           <div className="space-y-4">
             {/* Element Title & Type */}
             <div>
@@ -437,15 +718,15 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             {/* Coordinates and Rotation */}
             <div className="grid grid-cols-3 gap-2">
               <div>
-                <label className="text-[11px] text-neutral-500 block mb-1">X (мм)</label>
+                <label className="text-[11px] text-neutral-500 block mb-1">X ({unitLabel})</label>
                 <div className="bg-neutral-950 border border-neutral-800 rounded px-2 py-1.5 font-mono text-neutral-300 tabular-nums">
-                  {pxToMm(selectedElement.position.x)}
+                  {formatDimensionValue(pxToMm(selectedElement.position.x), displayUnit, false)}
                 </div>
               </div>
               <div>
-                <label className="text-[11px] text-neutral-500 block mb-1">Y (мм)</label>
+                <label className="text-[11px] text-neutral-500 block mb-1">Y ({unitLabel})</label>
                 <div className="bg-neutral-950 border border-neutral-800 rounded px-2 py-1.5 font-mono text-neutral-300 tabular-nums">
-                  {pxToMm(selectedElement.position.y)}
+                  {formatDimensionValue(pxToMm(selectedElement.position.y), displayUnit, false)}
                 </div>
               </div>
               <div>
@@ -469,21 +750,21 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             {/* Mounting Height Setting */}
             <div>
               <div className="flex items-center justify-between mb-1">
-                <label className="text-[11px] text-neutral-500">Висота монтажу (мм)</label>
+                <label className="text-[11px] text-neutral-500">Висота монтажу ({unitLabel})</label>
                 <span className="font-mono text-sky-400 font-semibold tabular-nums">
-                  +{selectedElement.mountingHeightMm} мм
+                  +{formatDimensionValue(selectedElement.mountingHeightMm, displayUnit, true)}
                 </span>
               </div>
               <input
                 type="number"
-                step="50"
+                step={displayUnit === 'm' ? '0.05' : displayUnit === 'cm' ? '5' : '50'}
                 min="0"
-                max={project.ceilingHeightMm}
-                value={selectedElement.mountingHeightMm}
+                max={convertMmToDisplayUnit(project.ceilingHeightMm, displayUnit)}
+                value={convertMmToDisplayUnit(selectedElement.mountingHeightMm, displayUnit)}
                 onChange={(e) =>
                   onUpdateElement({
                     ...selectedElement,
-                    mountingHeightMm: Number(e.target.value) || 0,
+                    mountingHeightMm: convertDisplayUnitToMm(Number(e.target.value) || 0, displayUnit),
                   })
                 }
                 className="w-full bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 text-neutral-100 font-mono focus:outline-none focus:border-sky-500"
@@ -511,6 +792,378 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                 ))}
               </div>
             </div>
+
+            {/* WALL & DOOR DATUM (ELECTRO-PLANNER STYLE: CENTERLINE, INNER PLASTER FACE, DOOR JAMB) */}
+            {wallDatum ? (
+              <div className="bg-neutral-950/80 border border-sky-500/30 rounded-xl p-3 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-bold text-sky-300 flex items-center gap-1.5 uppercase tracking-wide">
+                    <Compass className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Прив'язка до стіни та укосу</span>
+                  </label>
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-950 text-sky-300 border border-sky-800">
+                    Стіна {wallDatum.wallThicknessMm} мм
+                  </span>
+                </div>
+
+                {/* Reference selector: Centerline, Inner Face A, Outer Face B */}
+                <div>
+                  <span className="text-[10px] text-neutral-400 block mb-1.5">
+                    База відліку (Reference Datum):
+                  </span>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {/* 1. Centerline */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const { newPos, newRotation } = positionElementByWallDatum(
+                          selectedElement.position,
+                          wallDatum.wall,
+                          {
+                            reference: 'centerline',
+                            targetFace: 'centerline',
+                          }
+                        );
+                        onUpdateElement({
+                          ...selectedElement,
+                          position: newPos,
+                          rotation: newRotation,
+                          wallId: wallDatum.wall.id,
+                          datumBinding: {
+                            wallId: wallDatum.wall.id,
+                            reference: 'centerline',
+                            offsetFromWallMm: 0,
+                          },
+                        });
+                      }}
+                      className={`px-1.5 py-1.5 text-[10px] font-medium rounded-lg border transition-colors flex flex-col items-center gap-0.5 text-center ${
+                        wallDatum.distanceToCenterlineMm < 20
+                          ? 'bg-sky-600 text-white font-bold border-sky-400 shadow-md'
+                          : 'bg-neutral-900 border-neutral-800 text-neutral-300 hover:text-white hover:border-neutral-700'
+                      }`}
+                      title="Осьова лінія стіни (0 мм від осі)"
+                    >
+                      <span className="font-semibold">☲ Осьова лінія</span>
+                      <span className="text-[9px] font-mono opacity-80">
+                        {wallDatum.distanceToCenterlineMm === 0
+                          ? '0 мм'
+                          : `${wallDatum.offsetFromCenterMm > 0 ? '+' : ''}${wallDatum.offsetFromCenterMm} мм`}
+                      </span>
+                    </button>
+
+                    {/* 2. Inner Plaster Face A */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const { newPos, newRotation } = positionElementByWallDatum(
+                          selectedElement.position,
+                          wallDatum.wall,
+                          {
+                            reference: 'face_inner',
+                            targetFace: 'face_inner',
+                          }
+                        );
+                        onUpdateElement({
+                          ...selectedElement,
+                          position: newPos,
+                          rotation: newRotation,
+                          wallId: wallDatum.wall.id,
+                          datumBinding: {
+                            wallId: wallDatum.wall.id,
+                            reference: 'face_inner',
+                            offsetFromWallMm: Math.round(wallDatum.wallThicknessMm / 2),
+                          },
+                        });
+                      }}
+                      className={`px-1.5 py-1.5 text-[10px] font-medium rounded-lg border transition-colors flex flex-col items-center gap-0.5 text-center ${
+                        wallDatum.distanceToInnerFaceMm < 20
+                          ? 'bg-emerald-600 text-white font-bold border-emerald-400 shadow-md'
+                          : 'bg-neutral-900 border-neutral-800 text-neutral-300 hover:text-white hover:border-neutral-700'
+                      }`}
+                      title={`Внутрішня чистова грань (штукатурка +${Math.round(wallDatum.wallThicknessMm / 2)} мм від осі)`}
+                    >
+                      <span className="font-semibold">◧ Грань А (чистова)</span>
+                      <span className="text-[9px] font-mono opacity-80">
+                        +{Math.round(wallDatum.wallThicknessMm / 2)} мм
+                      </span>
+                    </button>
+
+                    {/* 3. Outer Plaster Face B */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const { newPos, newRotation } = positionElementByWallDatum(
+                          selectedElement.position,
+                          wallDatum.wall,
+                          {
+                            reference: 'face_outer',
+                            targetFace: 'face_outer',
+                          }
+                        );
+                        onUpdateElement({
+                          ...selectedElement,
+                          position: newPos,
+                          rotation: newRotation,
+                          wallId: wallDatum.wall.id,
+                          datumBinding: {
+                            wallId: wallDatum.wall.id,
+                            reference: 'face_outer',
+                            offsetFromWallMm: -Math.round(wallDatum.wallThicknessMm / 2),
+                          },
+                        });
+                      }}
+                      className={`px-1.5 py-1.5 text-[10px] font-medium rounded-lg border transition-colors flex flex-col items-center gap-0.5 text-center ${
+                        wallDatum.distanceToOuterFaceMm < 20
+                          ? 'bg-emerald-600 text-white font-bold border-emerald-400 shadow-md'
+                          : 'bg-neutral-900 border-neutral-800 text-neutral-300 hover:text-white hover:border-neutral-700'
+                      }`}
+                      title={`Зовнішня чистова грань (штукатурка -${Math.round(wallDatum.wallThicknessMm / 2)} мм від осі)`}
+                    >
+                      <span className="font-semibold">◨ Грань Б (чистова)</span>
+                      <span className="text-[9px] font-mono opacity-80">
+                        -{Math.round(wallDatum.wallThicknessMm / 2)} мм
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Door Jamb Datum (Offset from Door/Opening Edge) */}
+                {wallDatum.closestOpening ? (
+                  <div className="pt-2 border-t border-neutral-800/80 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-neutral-300 font-medium flex items-center gap-1.5">
+                        <DoorOpen className="w-3.5 h-3.5 text-amber-400" />
+                        <span>
+                          Від укосу {wallDatum.closestOpening.opening.type === 'door' ? 'дверей' : 'вікна'}:
+                        </span>
+                      </span>
+                      <span
+                        className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded ${
+                          wallDatum.closestOpening.isPueCompliantSwitchZone
+                            ? 'bg-emerald-950 text-emerald-300 border border-emerald-600'
+                            : wallDatum.closestOpening.isTooCloseToJamb
+                            ? 'bg-rose-950 text-rose-300 border border-rose-600'
+                            : 'bg-neutral-900 text-neutral-300 border border-neutral-800'
+                        }`}
+                      >
+                        {wallDatum.closestOpening.distanceFromClosestJambMm} мм (
+                        {wallDatum.closestOpening.closestJamb === 'left' ? 'лівий' : 'правий'})
+                      </span>
+                    </div>
+
+                    {/* PUE/DBN Notice */}
+                    {wallDatum.closestOpening.isPueCompliantSwitchZone && (
+                      <div className="p-2 bg-emerald-950/40 border border-emerald-800/60 rounded-lg text-[10px] text-emerald-300 flex items-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+                        <span>✓ Норматив ДБН В.2.5-23:2010 (100–150 мм від укосу з боку ручки дверей).</span>
+                      </div>
+                    )}
+                    {wallDatum.closestOpening.isTooCloseToJamb && (
+                      <div className="p-2 bg-rose-950/40 border border-rose-800/60 rounded-lg text-[10px] text-rose-300 flex items-center gap-1.5">
+                        <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-rose-400" />
+                        <span>⚠️ Увага: &lt; 80 мм від укосу! Ризик потрапляння під наличник дверної коробки.</span>
+                      </div>
+                    )}
+
+                    {/* Presets from Door Jamb */}
+                    <div>
+                      <span className="text-[9.5px] text-neutral-400 block mb-1">
+                        Швидка нормативна фіксація від дверного укосу:
+                      </span>
+                      <div className="grid grid-cols-4 gap-1">
+                        {[
+                          { dist: 100, label: '100 мм ★' },
+                          { dist: 150, label: '150 мм ★' },
+                          { dist: 200, label: '200 мм' },
+                          { dist: 250, label: '250 мм' },
+                        ].map((preset) => (
+                          <button
+                            key={preset.dist}
+                            type="button"
+                            onClick={() => {
+                              const { newPos, newRotation } = positionElementByWallDatum(
+                                selectedElement.position,
+                                wallDatum.wall,
+                                {
+                                  reference: 'door_jamb',
+                                  doorOpening: wallDatum.closestOpening!.opening,
+                                  jambSide: wallDatum.closestOpening!.closestJamb,
+                                  distanceFromJambMm: preset.dist,
+                                  targetFace: wallDatum.closestFace,
+                                }
+                              );
+                              onUpdateElement({
+                                ...selectedElement,
+                                position: newPos,
+                                rotation: newRotation,
+                                wallId: wallDatum.wall.id,
+                                datumBinding: {
+                                  wallId: wallDatum.wall.id,
+                                  reference: 'door_jamb',
+                                  doorOpeningId: wallDatum.closestOpening!.opening.id,
+                                  doorJambSide: wallDatum.closestOpening!.closestJamb,
+                                  distanceFromJambMm: preset.dist,
+                                  offsetFromWallMm: wallDatum.offsetFromCenterMm,
+                                },
+                              });
+                            }}
+                            className={`px-1 py-1 text-[10px] font-mono rounded border transition-colors ${
+                              wallDatum.closestOpening!.distanceFromClosestJambMm === preset.dist
+                                ? 'bg-amber-500 text-neutral-950 font-bold border-amber-400'
+                                : 'bg-neutral-900 border-neutral-800 text-neutral-300 hover:text-white hover:border-neutral-700'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Direct numeric input for exact custom distance (e.g. 250 мм від лівого укосу) */}
+                    <div className="pt-1.5 border-t border-neutral-800/60 flex items-center gap-2">
+                      <div className="flex-1">
+                        <label className="text-[9.5px] text-neutral-400 block mb-0.5">
+                          Точний відступ від укосу (мм):
+                        </label>
+                        <div className="relative">
+                          <input
+                            type="number"
+                            min="10"
+                            max="3000"
+                            step="10"
+                            value={wallDatum.closestOpening.distanceFromClosestJambMm}
+                            onChange={(e) => {
+                              const newDist = Math.max(10, Number(e.target.value) || 0);
+                              const { newPos, newRotation } = positionElementByWallDatum(
+                                selectedElement.position,
+                                wallDatum.wall,
+                                {
+                                  reference: 'door_jamb',
+                                  doorOpening: wallDatum.closestOpening!.opening,
+                                  jambSide: wallDatum.closestOpening!.closestJamb,
+                                  distanceFromJambMm: newDist,
+                                  targetFace: wallDatum.closestFace,
+                                }
+                              );
+                              onUpdateElement({
+                                ...selectedElement,
+                                position: newPos,
+                                rotation: newRotation,
+                                wallId: wallDatum.wall.id,
+                                datumBinding: {
+                                  wallId: wallDatum.wall.id,
+                                  reference: 'door_jamb',
+                                  doorOpeningId: wallDatum.closestOpening!.opening.id,
+                                  doorJambSide: wallDatum.closestOpening!.closestJamb,
+                                  distanceFromJambMm: newDist,
+                                  offsetFromWallMm: wallDatum.offsetFromCenterMm,
+                                },
+                              });
+                            }}
+                            className="w-full bg-neutral-900 border border-neutral-700 rounded px-2.5 py-1 text-xs text-neutral-100 font-mono font-bold focus:outline-none focus:border-amber-500"
+                          />
+                          <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-neutral-500 font-mono pointer-events-none">
+                            мм
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Jamb side switch: Left / Right */}
+                      <div className="shrink-0">
+                        <label className="text-[9.5px] text-neutral-400 block mb-0.5">Укіс:</label>
+                        <div className="flex rounded border border-neutral-700 overflow-hidden text-[10px] font-mono">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const { newPos, newRotation } = positionElementByWallDatum(
+                                selectedElement.position,
+                                wallDatum.wall,
+                                {
+                                  reference: 'door_jamb',
+                                  doorOpening: wallDatum.closestOpening!.opening,
+                                  jambSide: 'left',
+                                  distanceFromJambMm: wallDatum.closestOpening!.distanceFromClosestJambMm,
+                                  targetFace: wallDatum.closestFace,
+                                }
+                              );
+                              onUpdateElement({
+                                ...selectedElement,
+                                position: newPos,
+                                rotation: newRotation,
+                                wallId: wallDatum.wall.id,
+                                datumBinding: {
+                                  wallId: wallDatum.wall.id,
+                                  reference: 'door_jamb',
+                                  doorOpeningId: wallDatum.closestOpening!.opening.id,
+                                  doorJambSide: 'left',
+                                  distanceFromJambMm: wallDatum.closestOpening!.distanceFromClosestJambMm,
+                                  offsetFromWallMm: wallDatum.offsetFromCenterMm,
+                                },
+                              });
+                            }}
+                            className={`px-2 py-1 ${
+                              wallDatum.closestOpening.closestJamb === 'left'
+                                ? 'bg-amber-500 text-neutral-950 font-bold'
+                                : 'bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                            }`}
+                          >
+                            Лівий
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const { newPos, newRotation } = positionElementByWallDatum(
+                                selectedElement.position,
+                                wallDatum.wall,
+                                {
+                                  reference: 'door_jamb',
+                                  doorOpening: wallDatum.closestOpening!.opening,
+                                  jambSide: 'right',
+                                  distanceFromJambMm: wallDatum.closestOpening!.distanceFromClosestJambMm,
+                                  targetFace: wallDatum.closestFace,
+                                }
+                              );
+                              onUpdateElement({
+                                ...selectedElement,
+                                position: newPos,
+                                rotation: newRotation,
+                                wallId: wallDatum.wall.id,
+                                datumBinding: {
+                                  wallId: wallDatum.wall.id,
+                                  reference: 'door_jamb',
+                                  doorOpeningId: wallDatum.closestOpening!.opening.id,
+                                  doorJambSide: 'right',
+                                  distanceFromJambMm: wallDatum.closestOpening!.distanceFromClosestJambMm,
+                                  offsetFromWallMm: wallDatum.offsetFromCenterMm,
+                                },
+                              });
+                            }}
+                            className={`px-2 py-1 ${
+                              wallDatum.closestOpening.closestJamb === 'right'
+                                ? 'bg-amber-500 text-neutral-950 font-bold'
+                                : 'bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                            }`}
+                          >
+                            Правий
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="pt-2 border-t border-neutral-800/80 text-[10px] text-neutral-500">
+                    На цій стіні немає дверного отвору для прив'язки укосу.
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="p-2.5 bg-neutral-950/60 border border-neutral-800 rounded-xl text-[10px] text-neutral-500 flex items-center gap-2">
+                <Compass className="w-4 h-4 text-neutral-600 shrink-0" />
+                <span>
+                  Прилад у вільному полі. Перетягніть його до стіни для прив'язки до штукатурки чи дверей.
+                </span>
+              </div>
+            )}
 
             {/* Circuit Breaker Group Assignment */}
             <div>
@@ -906,6 +1559,60 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               </p>
             </div>
 
+            {/* Optimal Orthogonal Path Button & Parallel Lane Tuning */}
+            {selectedWire.mode !== 'curve' && (
+              <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 space-y-2">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-neutral-300 font-semibold flex items-center gap-1.5">
+                    <Split className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Паралельне та оптимальне трасування</span>
+                  </span>
+                </div>
+
+                {/* Recalculate along optimal path */}
+                <button
+                  onClick={() => {
+                    if (!wireFromEl || !wireToEl) return;
+                    const optimal = computeOrthogonalPath(
+                      wireFromEl.position,
+                      wireToEl.position,
+                      project.walls,
+                      project.openings
+                    );
+                    const newLen = calculateCableLengthM(
+                      wireFromEl,
+                      wireToEl,
+                      project.ceilingHeightMm,
+                      selectedWire.conduit,
+                      optimal
+                    );
+                    onUpdateWire?.({
+                      ...selectedWire,
+                      points: optimal,
+                      mode: 'ortho',
+                      isManual: false,
+                      calculatedLengthM: newLen,
+                    });
+                  }}
+                  className="w-full py-1.5 px-2 bg-sky-950/50 hover:bg-sky-900/60 border border-sky-500/50 text-sky-200 rounded text-[11px] font-semibold flex items-center justify-center gap-1.5 transition-colors shadow-sm"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 text-sky-400" />
+                  <span>⚡ Прокласти за найкоротшим оптимальним шляхом</span>
+                </button>
+
+                {/* Optimize all parallel wires in project */}
+                {onOptimizeParallelWires && (
+                  <button
+                    onClick={onOptimizeParallelWires}
+                    className="w-full py-1.5 px-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded text-neutral-300 hover:text-sky-300 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <Split className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Оптимізувати всі траси паралельними пучками</span>
+                  </button>
+                )}
+              </div>
+            )}
+
             {/* Circuit Group Selector */}
             <div>
               <label className="text-[11px] text-neutral-500 block mb-1">
@@ -1148,46 +1855,384 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             </button>
           </div>
         ) : selectedWall ? (
-          /* CASE 3: WALL SELECTED */
-          <div className="space-y-4">
-            <div className="flex items-center gap-2 text-sky-400 font-semibold">
-              <span className="w-2 h-2 rounded-full bg-sky-400" />
-              <span>Обрана стіна #{selectedWall.id}</span>
-            </div>
+          /* CASE 3: WALL SELECTED (Повний контроль розмірів, довжини, кута та координат стіни) */
+          (() => {
+            const currentLengthMm = calculateWallLengthMm(selectedWall);
+            const currentAngleDeg = calculateWallAngleDeg(selectedWall);
+            const hostedOpenings = project.openings.filter((op) => op.wallId === selectedWall.id);
 
-            <div>
-              <label className="text-[11px] text-neutral-500 block mb-1">Тип стіни</label>
-              <select
-                value={selectedWall.type || 'partition'}
-                onChange={(e) =>
-                  onUpdateWall({
-                    ...selectedWall,
-                    type: e.target.value as 'bearing' | 'partition',
-                  })
-                }
-                className="w-full bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 text-neutral-100"
-              >
-                <option value="bearing">Несуча стіна (Бетон / Цегла)</option>
-                <option value="partition">Міжкімнатна перегородка (ГКЛ / Газоблок)</option>
-              </select>
-            </div>
+            return (
+              <div className="space-y-4">
+                {/* Header & Quick Actions */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-sky-400 font-semibold text-xs">
+                    <Ruler className="w-4 h-4 text-sky-400" />
+                    <span>Стіна #{selectedWall.id.slice(-6)}</span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => onUpdateWall(reverseWall(selectedWall))}
+                      title="Поміняти початок і кінець місцями (⇄)"
+                      className="p-1 text-neutral-400 hover:text-sky-300 hover:bg-neutral-800 rounded transition-colors"
+                    >
+                      <ArrowRightLeft className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={() => onUpdateWall(alignWallOrtho(selectedWall))}
+                      title="Вирівняти суворо під 90° (Орто)"
+                      className="p-1 text-neutral-400 hover:text-sky-300 hover:bg-neutral-800 rounded transition-colors font-mono text-xs font-bold"
+                    >
+                      ⊥
+                    </button>
+                    <button
+                      onClick={() => onDeleteWall(selectedWall.id)}
+                      title="Видалити стіну (Del)"
+                      className="p-1 text-rose-400 hover:text-rose-300 hover:bg-rose-950/40 rounded transition-colors"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
 
-            <div>
-              <label className="text-[11px] text-neutral-500 block mb-1">Товщина стіни (мм)</label>
-              <input
-                type="number"
-                step="10"
-                value={selectedWall.thickness}
-                onChange={(e) =>
-                  onUpdateWall({
-                    ...selectedWall,
-                    thickness: Number(e.target.value) || 100,
-                  })
-                }
-                className="w-full bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 text-neutral-100 font-mono"
-              />
-            </div>
-          </div>
+                {/* Wall Elevation & Chasing button */}
+                {onOpenWallElevation && (
+                  <button
+                    onClick={() => onOpenWallElevation(selectedWall.id)}
+                    className="w-full py-2 px-3 rounded-lg bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/50 text-blue-300 text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-blue-950/30"
+                  >
+                    <Layers className="w-4 h-4 text-blue-400" />
+                    <span>📐 Відкрити розгортку стіни & Штроби (ПУЕ)</span>
+                  </button>
+                )}
+
+                {/* 1. WALL LENGTH (Розмір стіни у вибраних одиницях) */}
+                <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] font-semibold text-neutral-300 flex items-center gap-1.5">
+                      <Ruler className="w-3.5 h-3.5 text-sky-400" />
+                      <span>Розмір (Довжина) стіни</span>
+                    </label>
+                    <span className="font-mono text-xs font-bold text-sky-400 tabular-nums">
+                      {formatDimensionValue(currentLengthMm, displayUnit, true)}
+                    </span>
+                  </div>
+
+                  {/* Main Length Input */}
+                  <div className="relative">
+                    <input
+                      type="number"
+                      step={displayUnit === 'm' ? '0.05' : displayUnit === 'cm' ? '5' : '50'}
+                      min={displayUnit === 'm' ? '0.1' : displayUnit === 'cm' ? '10' : '100'}
+                      value={convertMmToDisplayUnit(currentLengthMm, displayUnit)}
+                      onChange={(e) => {
+                        const rawVal = Number(e.target.value);
+                        const valMm = convertDisplayUnitToMm(rawVal, displayUnit);
+                        if (valMm > 0) {
+                          onUpdateWall(setWallLengthMm(selectedWall, valMm, wallAnchor));
+                        }
+                      }}
+                      className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-neutral-100 font-mono text-base font-bold pr-12 focus:outline-none focus:border-sky-500 shadow-inner"
+                    />
+                    <span className="absolute right-3 top-2.5 text-neutral-400 text-xs font-mono font-medium">
+                      {unitLabel}
+                    </span>
+                  </div>
+
+                  {/* Secondary Units Indicator */}
+                  <div className="flex items-center justify-between text-[10px] text-neutral-500 font-mono px-0.5">
+                    <span>{(currentLengthMm / 10).toFixed(1)} см</span>
+                    <span>{(currentLengthMm / 1000).toFixed(2)} м</span>
+                  </div>
+
+                  {/* Anchor Point Selector */}
+                  <div className="pt-1.5 border-t border-neutral-800/80">
+                    <div className="text-[10px] text-neutral-400 mb-1 flex items-center justify-between">
+                      <span>Точка фіксації при зміні довжини:</span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {[
+                        { id: 'start' as const, label: 'Початок' },
+                        { id: 'center' as const, label: 'Центр' },
+                        { id: 'end' as const, label: 'Кінець' },
+                      ].map((anc) => (
+                        <button
+                          key={anc.id}
+                          onClick={() => setWallAnchor(anc.id)}
+                          className={`py-1 text-[10px] rounded border transition-colors ${
+                            wallAnchor === anc.id
+                              ? 'bg-sky-950/60 border-sky-500 text-sky-300 font-bold'
+                              : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                          }`}
+                        >
+                          {anc.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Quick delta adjustment buttons */}
+                  <div className="grid grid-cols-4 gap-1 pt-1">
+                    {[-500, -100, 100, 500].map((delta) => (
+                      <button
+                        key={delta}
+                        onClick={() =>
+                          onUpdateWall(
+                            setWallLengthMm(selectedWall, currentLengthMm + delta, wallAnchor)
+                          )
+                        }
+                        className="py-1 px-1 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded text-[10px] font-mono text-neutral-300 transition-colors"
+                      >
+                        {delta > 0 ? `+${delta}` : delta}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Standard Architectural Presets */}
+                  <div className="flex items-center gap-1 flex-wrap pt-1">
+                    {[1000, 1500, 2000, 2500, 3000, 3500, 4000, 5000, 6000].map((presetMm) => (
+                      <button
+                        key={presetMm}
+                        onClick={() =>
+                          onUpdateWall(setWallLengthMm(selectedWall, presetMm, wallAnchor))
+                        }
+                        className={`px-1.5 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                          currentLengthMm === presetMm
+                            ? 'bg-sky-900/60 border-sky-400 text-sky-200 font-bold'
+                            : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+                        }`}
+                      >
+                        {presetMm}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 2. WALL THICKNESS & TYPE */}
+                <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] text-neutral-400 font-semibold">
+                      Товщина стіни
+                    </label>
+                    <span className="font-mono text-xs text-sky-400 font-bold">
+                      {selectedWall.thickness} мм
+                    </span>
+                  </div>
+
+                  <input
+                    type="number"
+                    step="10"
+                    min="50"
+                    max="1000"
+                    value={selectedWall.thickness}
+                    onChange={(e) =>
+                      onUpdateWall({
+                        ...selectedWall,
+                        thickness: Number(e.target.value) || 100,
+                      })
+                    }
+                    className="w-full bg-neutral-900 border border-neutral-800 rounded px-2.5 py-1.5 text-neutral-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                  />
+
+                  {/* Thickness quick presets */}
+                  <div className="grid grid-cols-3 gap-1">
+                    {[
+                      { val: 100, label: '100 (ГКЛ)' },
+                      { val: 150, label: '150 (Блок)' },
+                      { val: 200, label: '200 (Кв.)' },
+                      { val: 250, label: '250 (1 цегла)' },
+                      { val: 380, label: '380 (1.5 цегли)' },
+                      { val: 510, label: '510 (2 цегли)' },
+                    ].map((th) => (
+                      <button
+                        key={th.val}
+                        onClick={() =>
+                          onUpdateWall({
+                            ...selectedWall,
+                            thickness: th.val,
+                          })
+                        }
+                        className={`py-1 px-1 rounded text-[10px] font-mono border transition-colors ${
+                          selectedWall.thickness === th.val
+                            ? 'bg-sky-950/60 border-sky-500 text-sky-300 font-bold'
+                            : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                        }`}
+                      >
+                        {th.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Wall Classification Type */}
+                  <div className="pt-1.5 border-t border-neutral-800/80">
+                    <label className="text-[10px] text-neutral-400 block mb-1">
+                      Конструктивний тип стіни
+                    </label>
+                    <select
+                      value={selectedWall.type || 'partition'}
+                      onChange={(e) =>
+                        onUpdateWall({
+                          ...selectedWall,
+                          type: e.target.value as 'bearing' | 'partition',
+                        })
+                      }
+                      className="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1 text-xs text-neutral-200 focus:outline-none focus:border-sky-500"
+                    >
+                      <option value="bearing">Несуча стіна (Залізобетон / Цегла)</option>
+                      <option value="partition">Міжкімнатна перегородка (ГКЛ / Газоблок)</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* 3. WALL ORIENTATION & ANGLE */}
+                <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 space-y-2">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-neutral-400 font-semibold flex items-center gap-1.5">
+                      <Compass className="w-3.5 h-3.5 text-sky-400" />
+                      <span>Кут нахилу стіни</span>
+                    </span>
+                    <span className="font-mono text-xs font-bold text-sky-400">
+                      {currentAngleDeg}°
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-5 gap-1">
+                    {[0, 45, 90, 180, 270].map((deg) => (
+                      <button
+                        key={deg}
+                        onClick={() => onUpdateWall(setWallAngleDeg(selectedWall, deg, 'start'))}
+                        className={`py-1 text-[10px] font-mono rounded border transition-colors ${
+                          Math.abs(currentAngleDeg - deg) < 0.5
+                            ? 'bg-sky-950/60 border-sky-500 text-sky-300 font-bold'
+                            : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                        }`}
+                      >
+                        {deg}°
+                      </button>
+                    ))}
+                  </div>
+
+                  <button
+                    onClick={() => onUpdateWall(alignWallOrtho(selectedWall))}
+                    className="w-full py-1.5 px-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded text-sky-300 text-[11px] font-semibold flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <span>⊥ Вирівняти по ортогоналі (0° / 90° / 180°)</span>
+                  </button>
+                </div>
+
+                {/* 4. EXACT ENDPOINT COORDINATES (X1, Y1, X2, Y2) */}
+                <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 space-y-2 text-xs">
+                  <div className="text-[10px] text-neutral-400 font-semibold uppercase tracking-wider flex items-center gap-1">
+                    <Move className="w-3 h-3 text-sky-400" />
+                    <span>Координати вершин (мм)</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <span className="text-[10px] text-neutral-500 block mb-0.5">Початок P1:</span>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-neutral-500">X:</span>
+                        <input
+                          type="number"
+                          value={pxToMm(selectedWall.start.x)}
+                          onChange={(e) =>
+                            onUpdateWall({
+                              ...selectedWall,
+                              start: {
+                                ...selectedWall.start,
+                                x: mmToPx(Number(e.target.value) || 0),
+                              },
+                            })
+                          }
+                          className="w-full bg-neutral-900 border border-neutral-800 rounded px-1.5 py-0.5 text-neutral-200 font-mono text-[11px]"
+                        />
+                        <span className="text-[10px] text-neutral-500">Y:</span>
+                        <input
+                          type="number"
+                          value={pxToMm(selectedWall.start.y)}
+                          onChange={(e) =>
+                            onUpdateWall({
+                              ...selectedWall,
+                              start: {
+                                ...selectedWall.start,
+                                y: mmToPx(Number(e.target.value) || 0),
+                              },
+                            })
+                          }
+                          className="w-full bg-neutral-900 border border-neutral-800 rounded px-1.5 py-0.5 text-neutral-200 font-mono text-[11px]"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <span className="text-[10px] text-neutral-500 block mb-0.5">Кінець P2:</span>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-neutral-500">X:</span>
+                        <input
+                          type="number"
+                          value={pxToMm(selectedWall.end.x)}
+                          onChange={(e) =>
+                            onUpdateWall({
+                              ...selectedWall,
+                              end: {
+                                ...selectedWall.end,
+                                x: mmToPx(Number(e.target.value) || 0),
+                              },
+                            })
+                          }
+                          className="w-full bg-neutral-900 border border-neutral-800 rounded px-1.5 py-0.5 text-neutral-200 font-mono text-[11px]"
+                        />
+                        <span className="text-[10px] text-neutral-500">Y:</span>
+                        <input
+                          type="number"
+                          value={pxToMm(selectedWall.end.y)}
+                          onChange={(e) =>
+                            onUpdateWall({
+                              ...selectedWall,
+                              end: {
+                                ...selectedWall.end,
+                                y: mmToPx(Number(e.target.value) || 0),
+                              },
+                            })
+                          }
+                          className="w-full bg-neutral-900 border border-neutral-800 rounded px-1.5 py-0.5 text-neutral-200 font-mono text-[11px]"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 5. HOSTED OPENINGS (Двері та вікна на стіні) */}
+                {hostedOpenings.length > 0 && (
+                  <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5 space-y-1.5">
+                    <div className="text-[10px] text-neutral-400 font-semibold uppercase tracking-wider flex items-center justify-between">
+                      <span>Отвори на стіні ({hostedOpenings.length})</span>
+                    </div>
+                    <div className="space-y-1">
+                      {hostedOpenings.map((op) => (
+                        <div
+                          key={op.id}
+                          className="flex items-center justify-between bg-neutral-900 border border-neutral-800 rounded px-2 py-1 text-[11px]"
+                        >
+                          <span className="text-neutral-300 flex items-center gap-1.5">
+                            {op.type === 'door' ? (
+                              <DoorOpen className="w-3.5 h-3.5 text-sky-400" />
+                            ) : (
+                              <AppWindow className="w-3.5 h-3.5 text-sky-400" />
+                            )}
+                            <span>{op.type === 'door' ? 'Двері' : 'Вікно'}</span>
+                            <span className="font-mono text-neutral-400">({op.width} мм)</span>
+                          </span>
+                          <span className="font-mono text-[10px] text-neutral-500">
+                            {Math.round(op.positionRatio * 100)}% довжини
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })()
         ) : selectedOpening ? (
           /* CASE 4: OPENING (DOOR OR WINDOW) SELECTED */
           <div className="space-y-4">
@@ -1410,6 +2455,26 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   Присвоює систематичні номери групам щита (Гр.1..N [QF1..N]) та маркування кабелям (W1-01, W2-01) за ДСТУ.
                 </p>
               </button>
+
+              {/* 3. Auto Sockets Placement according to DBN */}
+              {onOpenAutoSocketsModal && (
+                <button
+                  onClick={onOpenAutoSocketsModal}
+                  className="w-full p-2.5 rounded-lg border border-amber-500/50 bg-gradient-to-r from-amber-950/70 to-orange-950/40 hover:from-amber-900/80 hover:to-orange-900/50 text-left transition-all shadow-sm group"
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    <div className="p-1 rounded bg-amber-500 text-neutral-950 font-bold group-hover:scale-105 transition-transform">
+                      <Sparkles className="w-3.5 h-3.5" />
+                    </div>
+                    <span className="text-xs font-semibold text-amber-200">
+                      ⚡ Авторозстановка розеток за ДБН
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-neutral-400 leading-tight">
+                    Розрахунок за площею (1 шт/6м²), розміщення по периметру стін та біля меблів з нормативними відступами.
+                  </p>
+                </button>
+              )}
             </div>
 
             <div className="space-y-2 border-t border-neutral-800 pt-3">

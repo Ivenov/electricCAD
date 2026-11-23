@@ -10,13 +10,11 @@ import { CadProject, AuditIssue, ElectricalElement, CircuitGroup, WireRoute } fr
 import { isPointInPolygon } from './roomGeometry';
 import {
   CABLE_SPECS,
-  calculateLineCurrent,
-  calculateVoltageDrop,
-  calculateShortCircuitCheck,
+  analyzeCircuit,
   autoBalancePhases,
   calculateProjectElectricalSummary,
-  calculatePhaseBalance,
 } from './electricalCalculations';
+import { getAggregatedProjectData } from './projectAggregator';
 import { distance, pxToMm, checkChaseIntersectsOpening } from './cadMath';
 
 export interface NormativeRuleDefinition {
@@ -186,88 +184,229 @@ export function runPueAudit(project: CadProject): {
   warningCount: number;
 } {
   const issues: AuditIssue[] = [];
-  const bathroomRooms = project.rooms.filter((r) => r.type === 'bathroom');
+  const agg = getAggregatedProjectData(project);
+  const multiFloor = agg.syncedFloors.length > 1;
+  const grounding = project.groundingSystem || 'TN-C-S';
 
-  // Rule 1 & 2: Bathrooms IP rating and RCD (True Point-in-Polygon check)
-  project.elements.forEach((el) => {
-    if (el.category === 'socket') {
-      const inBath = bathroomRooms.some((room) => isPointInPolygon(el.position, room.points));
+  // Floor-scoped spatial geometry checks (Bathrooms, Wet Zones, Wall Chases, Orphaned Lights, Switch/Socket connections)
+  agg.syncedFloors.forEach((floor) => {
+    const floorPrefix = multiFloor ? `[${floor.name}] ` : '';
+    const floorRooms = floor.rooms || [];
+    const floorElements = floor.elements || [];
+    const floorWires = floor.wires || [];
+    const floorFurniture = floor.furniture || [];
+    const floorWalls = floor.walls || [];
+    const floorOpenings = floor.openings || [];
 
-      if (inBath) {
-        if (el.ipRating !== 'IP44' && el.ipRating !== 'IP65') {
+    const bathroomRooms = floorRooms.filter((r) => r.type === 'bathroom');
+
+    // Rule 1 & 2: Bathrooms IP rating and RCD (True Point-in-Polygon check)
+    floorElements.forEach((el) => {
+      if (el.category === 'socket') {
+        const inBath = bathroomRooms.some((room) => isPointInPolygon(el.position, room.points));
+
+        if (inBath) {
+          if (el.ipRating !== 'IP44' && el.ipRating !== 'IP65') {
+            issues.push({
+              id: `fix_ip_${el.id}`,
+              severity: 'error',
+              title: `[ПУЕ 7.1.48] ${floorPrefix}Розетка без IP44 у ванній: «${el.name}»`,
+              description: `Розетка розташована у межах полігону санвузла, проте має ступінь захисту ${el.ipRating}. Потрібно встановити вологозахищену розетку IP44 з кришкою.`,
+              elementId: el.id,
+              autoFixAvailable: true,
+            });
+          }
+
+          const circuit = project.circuits.find((c) => c.id === el.circuitId);
+          if (circuit && circuit.rcdType === 'none') {
+            if (!issues.some((i) => i.id === `fix_rcd_bath_${circuit.id}`)) {
+              issues.push({
+                id: `fix_rcd_bath_${circuit.id}`,
+                severity: 'error',
+                title: `[ПУЕ 7.1.82] ${floorPrefix}Лінія санвузла «${circuit.name}» без ПЗВ`,
+                description: 'Кола ванних кімнат вимагають обов’язкового диференційного захисту IΔn ≤ 10-30 мА для захисту людини від ураження струмом.',
+                circuitId: circuit.id,
+                autoFixAvailable: true,
+              });
+            }
+          }
+        }
+      }
+    });
+
+    // Rule 9: Orphaned luminaires (no switch or switch group on floor)
+    const switches = floorElements.filter((e) => e.category === 'switch');
+    const switchGroups = new Set(switches.map((s) => s.switchGroupId).filter(Boolean));
+    const wiredTargetIds = new Set(floorWires.map((w) => w.toId));
+
+    floorElements.forEach((el) => {
+      if (el.category === 'light') {
+        const hasSwitchGroup = el.switchGroupId && switchGroups.has(el.switchGroupId);
+        const hasWire = wiredTargetIds.has(el.id);
+
+        if (!hasSwitchGroup && !hasWire) {
           issues.push({
-            id: `fix_ip_${el.id}`,
-            severity: 'error',
-            title: `[ПУЕ 7.1.48] Розетка без IP44 у ванній: «${el.name}»`,
-            description: `Розетка розташована у межах полігону санвузла, проте має ступінь захисту ${el.ipRating}. Потрібно встановити вологозахищену розетку IP44 з кришкою.`,
+            id: `fix_orphan_light_${el.id}`,
+            severity: 'warning',
+            title: `[ДБН 3.18] ${floorPrefix}Світильник без прив’язки до вимикача: «${el.name}»`,
+            description: 'У світильника не призначено групу вмикання (S1, S2 тощо) і відсутня сполучна лінія до вимикача.',
             elementId: el.id,
             autoFixAvailable: true,
           });
         }
+      }
+    });
 
-        const circuit = project.circuits.find((c) => c.id === el.circuitId);
-        if (circuit && circuit.rcdType === 'none') {
+    // Rule 12: Zone 0 & Zone 1 bathtub proximity check
+    const wetSanitaryItems = floorFurniture.filter((f) => f.type === 'bath' || f.type === 'shower');
+    wetSanitaryItems.forEach((bath) => {
+      floorElements.forEach((el) => {
+        if (el.category === 'socket' || el.category === 'switch') {
+          const distMm = pxToMm(distance(el.position, bath.position));
+          if (distMm < 600) {
+            issues.push({
+              id: `fix_wet_zone_dist_${el.id}`,
+              severity: 'error',
+              title: `[ПУЕ 7.1.47] ${floorPrefix}Електроточка «${el.name}» у небезпечній Зоні 1 ванни (${distMm} мм < 600 мм)`,
+              description: 'Встановлення розеток та вимикачів ближче ніж 600 мм від краю ванни або душового піддону суворо заборонено правилами безпеки.',
+              elementId: el.id,
+            });
+          }
+        }
+      });
+    });
+
+    // 13. Штроблення через дверні або віконні отвори (ПУЕ 2.1.52, ДБН В.2.5-23:2010)
+    if (floorOpenings.length > 0) {
+      floorWires.forEach((wire) => {
+        if (wire.conduit === 'wall_chase') {
+          const fromEl = floorElements.find((e) => e.id === wire.fromId);
+          const toEl = floorElements.find((e) => e.id === wire.toId);
+          const pts = wire.points && wire.points.length >= 2
+            ? wire.points
+            : fromEl && toEl
+            ? [fromEl.position, toEl.position]
+            : [];
+
+          if (pts.length >= 2) {
+            const collision = checkChaseIntersectsOpening(pts, floorWalls, floorOpenings);
+            if (collision.hasCollision) {
+              const opType = collision.opening?.type === 'door' ? 'дверний' : 'віконний';
+              issues.push({
+                id: `fix_chase_opening_${wire.id}`,
+                severity: 'error',
+                title: `[ПУЕ 2.1.52] ${floorPrefix}Штроба через ${opType} отвір (${wire.cableTag || 'кабель'})`,
+                description: `Кабельна лінія у штробі [${wire.cableTag || wire.id}] перетинає ${opType} отвір у стіні. За ДБН та ПУЕ §2.1.52 руйнування отворів заборонено. Рекомендується перевести трасу на стелю у гофротрубі.`,
+                autoFixAvailable: true,
+              });
+            }
+          }
+        }
+      });
+    }
+
+    // 14. Заборона з'єднання розеток та вимикачів (ПУЕ 7.1.50)
+    floorWires.forEach((wire) => {
+      const fromEl = floorElements.find((e) => e.id === wire.fromId);
+      const toEl = floorElements.find((e) => e.id === wire.toId);
+      if (fromEl && toEl) {
+        const isSocketToSwitch =
+          (fromEl.category === 'socket' && toEl.category === 'switch') ||
+          (fromEl.category === 'switch' && toEl.category === 'socket');
+        if (isSocketToSwitch) {
           issues.push({
-            id: `fix_rcd_bath_${circuit.id}`,
+            id: `fix_socket_switch_${wire.id}`,
             severity: 'error',
-            title: `[ПУЕ 7.1.82] Лінія санвузла «${circuit.name}» без ПЗВ`,
-            description: 'Кола ванних кімнат вимагають обов’язкового диференційного захисту IΔn ≤ 10-30 мА для захисту людини від ураження струмом.',
-            circuitId: circuit.id,
+            title: `[ПУЕ 7.1.50] ${floorPrefix}Неприпустиме з'єднання розетки та вимикача (${wire.cableTag || wire.id})`,
+            description: `Кабель з'єднує розетку «${fromEl.name}» та вимикач «${toEl.name}». За ПУЕ розеточні групи 16А (2.5мм²) та лінії освітлення 10А (1.5мм²) повинні бути суворо розділені.`,
+            elementId: fromEl.id,
             autoFixAvailable: true,
           });
         }
       }
+    });
+
+    // Перевірка: чи не призначено вимикач на 16А силову лінію розеток
+    floorElements.forEach((el) => {
+      if (el.category === 'switch') {
+        const c = project.circuits.find((item) => item.id === el.circuitId);
+        if (c && (c.breakerRatingA >= 16 || c.cableType === 'VVGng_3x2.5')) {
+          issues.push({
+            id: `fix_switch_circuit_${el.id}`,
+            severity: 'error',
+            title: `[ПУЕ 7.1.50] ${floorPrefix}Вимикач «${el.name}» призначено на силову розеточну групу (${c.name}, ${c.breakerRatingA}А)`,
+            description: `Вимикач освітлення призначено на розеточну групу ${c.breakerRatingA}А з кабелем ${c.cableType}. За ПУЕ комутаційні апарати освітлення мають захищатися автоматом 10А з кабелем 1.5мм².`,
+            elementId: el.id,
+            autoFixAvailable: true,
+          });
+        }
+      }
+    });
+
+    // 15. Перевірка шини KNX на замкнені кільця
+    const knxWires = floorWires.filter((w) => w.cableType === 'KNX_Bus' || w.busType === 'knx');
+    if (knxWires.length >= 3) {
+      const adj = new Map<string, string[]>();
+      knxWires.forEach((w) => {
+        if (!adj.has(w.fromId)) adj.set(w.fromId, []);
+        if (!adj.has(w.toId)) adj.set(w.toId, []);
+        adj.get(w.fromId)!.push(w.toId);
+        adj.get(w.toId)!.push(w.fromId);
+      });
+
+      const visited = new Set<string>();
+      let hasCycle = false;
+
+      const dfs = (node: string, parent: string | null): boolean => {
+        visited.add(node);
+        const neighbors = adj.get(node) || [];
+        for (const n of neighbors) {
+          if (n === parent) continue;
+          if (visited.has(n)) return true;
+          if (dfs(n, node)) return true;
+        }
+        return false;
+      };
+
+      for (const node of adj.keys()) {
+        if (!visited.has(node)) {
+          if (dfs(node, null)) {
+            hasCycle = true;
+            break;
+          }
+        }
+      }
+
+      if (hasCycle) {
+        issues.push({
+          id: `fix_knx_loop_${floor.id}`,
+          severity: 'error',
+          title: `[KNX ISO 14543] ${floorPrefix}Виявлено замкнене кільце в шині автоматизації KNX`,
+          description: 'У шині KNX категорично заборонено утворювати замкнені петлі/кільця. Дозволена виключно топологія дерево, лінія або зірка.',
+        });
+      }
     }
   });
 
-  // Rule 3: Breaker rating vs Cable ampacity (In <= Idd)
-  project.circuits.forEach((circuit) => {
-    const spec = CABLE_SPECS[circuit.cableType] || CABLE_SPECS['VVGng_3x2.5'];
-    if (circuit.breakerRatingA > spec.ampacityA) {
+  // Circuit-wide & multi-floor aggregated checks (Rules 3..8 + TT grounding)
+  project.circuits.forEach((c) => {
+    const analysis = analyzeCircuit(c, agg.allElements, agg.allWires, project.supplyPhase, grounding);
+    const spec = CABLE_SPECS[c.cableType] || CABLE_SPECS['VVGng_3x2.5'];
+
+    // Rule 3: Breaker rating vs effective derated cable ampacity (In <= Idd_eff)
+    if (!analysis.isCableProtectedByBreaker) {
       issues.push({
-        id: `fix_breaker_cable_${circuit.id}`,
+        id: `fix_breaker_cable_${c.id}`,
         severity: 'error',
-        title: `[ПУЕ 1.3.4] Автомат ${circuit.breakerRatingA}А перевищує допустимий струм кабелю ${spec.ampacityA}А (${circuit.cableType})`,
-        description: `Автомат лінії «${circuit.name}» не захистить кабель від перегріву та оплавлення ізоляції. Необхідно знизити номінал автомата до ${spec.recommendedBreakerA}А або збільшити переріз кабелю.`,
-        circuitId: circuit.id,
+        title: `[ПУЕ 1.3.4] Автомат ${c.breakerRatingA}А перевищує допустимий струм кабелю ${analysis.cableAmpacityA}А (${c.cableType})`,
+        description: `З урахуванням поправкових коефіцієнтів (K=${analysis.deratingFactorTotal}) допустимий струм кабелю становить ${analysis.cableAmpacityA}А. Знизьте номінал автомата або збільште переріз.`,
+        circuitId: c.id,
         autoFixAvailable: true,
       });
     }
-  });
 
-  // Rule 4: Cooker / Hob high-power sizing
-  const cookerSockets = project.elements.filter(
-    (e) => e.type === 'socket_cooker' || e.type === 'hob_induction'
-  );
-  cookerSockets.forEach((sk) => {
-    const circuit = project.circuits.find((c) => c.id === sk.circuitId);
-    if (circuit) {
-      if (circuit.breakerRatingA < 32 && project.supplyPhase !== '3-phase') {
-        issues.push({
-          id: `fix_cooker_breaker_${circuit.id}`,
-          severity: 'error',
-          title: `[ДБН 4.28] Занижений автомат варильної поверхні: ${circuit.breakerRatingA}А (потрібно 32А)`,
-          description: `Для варильної поверхні 7-7.4 кВт (однофазне живлення) автомат повинен бути 32 А, щоб уникнути помилкових спрацьовувань при роботі всіх конфорок.`,
-          circuitId: circuit.id,
-          autoFixAvailable: true,
-        });
-      }
-      if (circuit.cableType !== 'VVGng_3x6' && project.supplyPhase !== '3-phase') {
-        issues.push({
-          id: `fix_cooker_cable_${circuit.id}`,
-          severity: 'error',
-          title: `[ПУЕ 1.3.4] Недостатній переріз кабелю плити: ${circuit.cableType} (потрібно ВВГнгд 3х6)`,
-          description: `Струм варильної поверхні досягає 31.3 А. Переріз 3х6 мм² (мідь) є обов’язковим згідно з ПУЕ для тривалого навантаження.`,
-          circuitId: circuit.id,
-          autoFixAvailable: true,
-        });
-      }
-    }
-  });
-
-  // Rule 5: Lighting protection (max 16A, recommended 10A)
-  project.circuits.forEach((c) => {
-    const connected = project.elements.filter((e) => e.circuitId === c.id);
+    // Rule 5: Lighting protection (max 16A, recommended 10A)
+    const connected = analysis.connectedElements;
     const hasOnlyLights = connected.length > 0 && connected.every((e) => e.category === 'light');
     if (hasOnlyLights && c.breakerRatingA > 16) {
       issues.push({
@@ -279,251 +418,117 @@ export function runPueAudit(project: CadProject): {
         autoFixAvailable: true,
       });
     }
-  });
 
-  // Rule 6: General sockets RCD protection
-  project.circuits.forEach((c) => {
-    const connected = project.elements.filter((e) => e.circuitId === c.id);
-    const hasSockets = connected.some((e) => e.category === 'socket');
-    if (hasSockets && c.rcdType === 'none') {
+    // Rule 6 & TT grounding RCD requirement
+    if (analysis.isGroundingProtectionMissing) {
       issues.push({
         id: `fix_socket_rcd_${c.id}`,
-        severity: 'warning',
-        title: `[ПУЕ 7.1.72] Відсутній диференційний захист (ПЗВ) на групі розеток: «${c.name}»`,
-        description: 'За нормами ПУЕ всі загальні розеткові групи житлових приміщень повинні мати захист ПЗВ 30 мА.',
+        severity: 'error',
+        title: `[ПУЕ 1.7.59] Система TT вимагає ПЗВ для лінії «${c.name}»`,
+        description: 'У системі заземлення TT кожна відхідна лінія обов’язково повинна мати диференційний захист ≤ 30 мА (ПЗВ або дифавтомат).',
         circuitId: c.id,
         autoFixAvailable: true,
       });
+    } else {
+      const hasSockets = connected.some((e) => e.category === 'socket');
+      if (hasSockets && c.rcdType === 'none') {
+        issues.push({
+          id: `fix_socket_rcd_${c.id}`,
+          severity: 'warning',
+          title: `[ПУЕ 7.1.72] Відсутній диференційний захист (ПЗВ) на групі розеток: «${c.name}»`,
+          description: 'За нормами ПУЕ всі загальні розеткові групи житлових приміщень повинні мати захист ПЗВ 30 мА.',
+          circuitId: c.id,
+          autoFixAvailable: true,
+        });
+      }
     }
-  });
 
-  // Rule 7 & 8: Overload current (Ib <= In) & Voltage drop (ΔU <= 4%)
-  project.circuits.forEach((c) => {
-    const connected = project.elements.filter((e) => e.circuitId === c.id);
-    const totalWatts = connected.reduce((sum, e) => sum + (e.powerWatts || 0), 0);
-    const currentA = calculateLineCurrent(totalWatts, false, 0.92);
-
-    if (currentA > c.breakerRatingA) {
+    // Rule 7 & 8: Overload current (Ib <= In) & Voltage drop (ΔU <= 4%)
+    if (analysis.isBreakerOverloaded) {
       issues.push({
         id: `fix_overload_${c.id}`,
         severity: 'error',
-        title: `[ПУЕ 3.1.9] Перевантаження лінії «${c.name}»: ${currentA}А > ${c.breakerRatingA}А (${(totalWatts / 1000).toFixed(2)} кВт)`,
-        description: `Струм навантаження перевищує номінал автомата. Рекомендовано розподілити точки на дві окремі групи або знизити підключену потужність.`,
+        title: `[ПУЕ 3.1.9] Перевантаження лінії «${c.name}»: ${analysis.calculatedCurrentA}А > ${c.breakerRatingA}А (${(analysis.totalInstalledWatts / 1000).toFixed(2)} кВт)`,
+        description: `Струм навантаження (${analysis.isThreePhaseLine ? '3Ф 400В' : '1Ф 230В'}) перевищує номінал автомата. Рекомендовано розподілити точки на дві окремі групи або знизити потужність.`,
         circuitId: c.id,
       });
     }
 
-    // Довжина кабелю
-    const circuitWires = project.wires.filter((w) => w.circuitId === c.id);
-    const lengthM = circuitWires.reduce((sum, w) => sum + (w.calculatedLengthM || 0), 0) || Math.max(12, connected.length * 4.5);
-    const spec = CABLE_SPECS[c.cableType] || CABLE_SPECS['VVGng_3x2.5'];
-    const vDrop = calculateVoltageDrop(currentA, lengthM, spec.crossSectionMm2, false, 0.92);
-
-    if (!vDrop.isAcceptable) {
+    if (analysis.isVoltageDropExceeded) {
       issues.push({
         id: `fix_vdrop_${c.id}`,
         severity: 'warning',
-        title: `[ДБН 2.18] Падіння напруги ${vDrop.deltaPercent}% у лінії «${c.name}» перевищує норму 4%`,
-        description: `При довжині траси ${lengthM.toFixed(1)} м падіння напруги становить ${vDrop.deltaVolts} В. Рекомендовано збільшити переріз кабелю до наступного номіналу.`,
+        title: `[ДБН 2.18] Падіння напруги ${analysis.voltageDrop.deltaPercent}% у лінії «${c.name}» перевищує норму 4%`,
+        description: `При довжині траси ${analysis.totalCableLengthM} м падіння напруги становить ${analysis.voltageDrop.deltaVolts} В. Рекомендовано збільшити переріз кабелю до наступного номіналу.`,
         circuitId: c.id,
         autoFixAvailable: true,
       });
     }
 
-    // Перевірка чутливості спрацювання розчіплювача автомата при КЗ (ПУЕ §1.7.79)
-    const ikzCheck = calculateShortCircuitCheck(
-      lengthM,
-      spec.crossSectionMm2,
-      c.breakerRatingA,
-      c.breakerCurve || 'C'
-    );
-    if (!ikzCheck.isTrippingAssured) {
+    if (analysis.isShortCircuitTrippingUnsafe) {
       issues.push({
         id: `fix_ikz_curve_${c.id}`,
         severity: 'warning',
-        title: `[ПУЕ 1.7.79] Чутливість захисту лінії «${c.name}» (Ikz = ${ikzCheck.ikzCurrentA} А < ${ikzCheck.requiredIkzA} А)`,
-        description: `Струм КЗ наприкінці лінії (${ikzCheck.ikzCurrentA} А) менший за 1.1·Iinst автомата ${c.breakerCurve || 'C'}${c.breakerRatingA}А (${ikzCheck.requiredIkzA} А). ${ikzCheck.recommendation || ''}`,
+        title: `[ПУЕ 1.7.79] Чутливість захисту лінії «${c.name}» (Ikz = ${analysis.shortCircuit.ikzCurrentA} А < ${analysis.shortCircuit.requiredIkzA} А)`,
+        description: `Струм КЗ наприкінці лінії (${analysis.shortCircuit.ikzCurrentA} А) менший за 1.1·Iinst автомата ${c.breakerCurve || 'C'}${c.breakerRatingA}А (${analysis.shortCircuit.requiredIkzA} А). ${analysis.shortCircuit.recommendation || ''}`,
         circuitId: c.id,
         autoFixAvailable: true,
       });
     }
   });
 
-  // Rule 9: Orphaned luminaires (no switch or switch group)
-  const switches = project.elements.filter((e) => e.category === 'switch');
-  const switchGroups = new Set(switches.map((s) => s.switchGroupId).filter(Boolean));
-  const wiredTargetIds = new Set(project.wires.map((w) => w.toId));
-
-  project.elements.forEach((el) => {
-    if (el.category === 'light') {
-      const hasSwitchGroup = el.switchGroupId && switchGroups.has(el.switchGroupId);
-      const hasWire = wiredTargetIds.has(el.id);
-
-      if (!hasSwitchGroup && !hasWire) {
+  // Rule 4: Cooker / Hob high-power sizing (across all floors)
+  const cookerSockets = agg.allElements.filter(
+    (e) => e.type === 'socket_cooker' || e.type === 'hob_induction'
+  );
+  cookerSockets.forEach((sk) => {
+    const circuit = project.circuits.find((c) => c.id === sk.circuitId);
+    if (circuit) {
+      const is3PhLine = circuit.phase === '3P' || circuit.cableType.startsWith('VVGng_5x');
+      if (!is3PhLine && circuit.breakerRatingA < 32 && project.supplyPhase !== '3-phase') {
         issues.push({
-          id: `fix_orphan_light_${el.id}`,
-          severity: 'warning',
-          title: `[ДБН 3.18] Світильник без прив’язки до вимикача: «${el.name}»`,
-          description: 'У світильника не призначено групу вмикання (S1, S2 тощо) і відсутня сполучна лінія до вимикача.',
-          elementId: el.id,
+          id: `fix_cooker_breaker_${circuit.id}`,
+          severity: 'error',
+          title: `[ДБН 4.28] Занижений автомат варильної поверхні: ${circuit.breakerRatingA}А (потрібно 32А)`,
+          description: `Для варильної поверхні 7-7.4 кВт (однофазне живлення) автомат повинен бути 32 А.`,
+          circuitId: circuit.id,
+          autoFixAvailable: true,
+        });
+      }
+      if (!is3PhLine && circuit.cableType !== 'VVGng_3x6' && project.supplyPhase !== '3-phase') {
+        issues.push({
+          id: `fix_cooker_cable_${circuit.id}`,
+          severity: 'error',
+          title: `[ПУЕ 1.3.4] Недостатній переріз кабелю плити: ${circuit.cableType} (потрібно ВВГнгд 3х6)`,
+          description: `Струм варильної поверхні досягає 31.3 А. Переріз 3х6 мм² (мідь) є обов’язковим згідно з ПУЕ.`,
+          circuitId: circuit.id,
           autoFixAvailable: true,
         });
       }
     }
   });
 
-  // Rule 10: Main breaker rating vs total design load
+  // Rule 10: Main breaker rating vs total design load (all floors)
   const summary = calculateProjectElectricalSummary(project);
   if (summary.isMainBreakerOverloaded) {
     issues.push({
       id: 'fix_main_breaker',
       severity: 'error',
       title: `[ДБН 3.1] Ввідний автомат ${project.mainBreakerRatingA}А перевантажений: розрахунковий струм ${summary.mainCurrentA}А`,
-      description: `Розрахункова потужність об’єкта (${summary.designPowerKw} кВт з коефіцієнтом попиту ${summary.demandFactor}) вимагає встановлення ввідного автомата номіналом не менше ${Math.ceil(summary.mainCurrentA / 5) * 5} А.`,
+      description: `Розрахункова потужність об’єкта (${summary.designPowerKw} кВт з Kп=${summary.demandFactor}) вимагає ввідного автомата не менше ${Math.ceil(summary.mainCurrentA / 5) * 5} А.`,
       autoFixAvailable: true,
     });
   }
 
-  // Rule 11: Phase balance in 3-phase systems
+  // Rule 11: Phase balance in 3-phase systems (all floors)
   if (project.supplyPhase === '3-phase' && summary.phaseBalance) {
     if (!summary.phaseBalance.isBalanced && summary.phaseBalance.unbalancePercent > 15) {
       issues.push({
         id: 'fix_phase_unbalance',
         severity: 'warning',
         title: `[ДБН 3.7] Асиметрія фаз: ${summary.phaseBalance.unbalancePercent}% (норма ≤ 15%)`,
-        description: `Розподіл навантажень: L1=${(summary.phaseBalance.l1Watts / 1000).toFixed(1)} кВт, L2=${(summary.phaseBalance.l2Watts / 1000).toFixed(1)} кВт, L3=${(summary.phaseBalance.l3Watts / 1000).toFixed(1)} кВт. Потрібно перерозподілити лінії між фазами.`,
+        description: `Розподіл навантажень: L1=${(summary.phaseBalance.l1Watts / 1000).toFixed(1)} кВт, L2=${(summary.phaseBalance.l2Watts / 1000).toFixed(1)} кВт, L3=${(summary.phaseBalance.l3Watts / 1000).toFixed(1)} кВт.`,
         autoFixAvailable: true,
-      });
-    }
-  }
-
-  // Rule 12: Zone 0 & Zone 1 bathtub proximity check
-  const wetSanitaryItems = project.furniture.filter((f) => f.type === 'bath' || f.type === 'shower');
-  wetSanitaryItems.forEach((bath) => {
-    project.elements.forEach((el) => {
-      if (el.category === 'socket' || el.category === 'switch') {
-        const distMm = pxToMm(distance(el.position, bath.position));
-        // Зона 1: до 600 мм від краю ванни
-        if (distMm < 600) {
-          issues.push({
-            id: `fix_wet_zone_dist_${el.id}`,
-            severity: 'error',
-            title: `[ПУЕ 7.1.47] Електроточка «${el.name}» у небезпечній Зоні 1 ванни (${distMm} мм < 600 мм)`,
-            description: 'Встановлення розеток та вимикачів ближче ніж 600 мм від краю ванни або душового піддону суворо заборонено правилами безпеки.',
-            elementId: el.id,
-          });
-        }
-      }
-    });
-  });
-
-  // 13. Штроблення через дверні або віконні отвори (ПУЕ 2.1.52, ДБН В.2.5-23:2010)
-  if (project.openings && project.openings.length > 0) {
-    project.wires.forEach((wire) => {
-      if (wire.conduit === 'wall_chase') {
-        const fromEl = project.elements.find((e) => e.id === wire.fromId);
-        const toEl = project.elements.find((e) => e.id === wire.toId);
-        const pts = wire.points && wire.points.length >= 2
-          ? wire.points
-          : fromEl && toEl
-          ? [fromEl.position, toEl.position]
-          : [];
-
-        if (pts.length >= 2) {
-          const collision = checkChaseIntersectsOpening(pts, project.walls, project.openings);
-          if (collision.hasCollision) {
-            const opType = collision.opening?.type === 'door' ? 'дверний' : 'віконний';
-            issues.push({
-              id: `fix_chase_opening_${wire.id}`,
-              severity: 'error',
-              title: `[ПУЕ 2.1.52] Штроба через ${opType} отвір (${wire.cableTag || 'кабель'})`,
-              description: `Кабельна лінія у штробі [${wire.cableTag || wire.id}] перетинає ${opType} отвір у стіні. За ДБН та ПУЕ §2.1.52 руйнування отворів заборонено. Рекомендується перевести трасу на стелю у гофротрубі.`,
-              autoFixAvailable: true,
-            });
-          }
-        }
-      }
-    });
-  }
-
-  // 14. Заборона з'єднання розеток та вимикачів (ПУЕ 7.1.50)
-  project.wires.forEach((wire) => {
-    const fromEl = project.elements.find((e) => e.id === wire.fromId);
-    const toEl = project.elements.find((e) => e.id === wire.toId);
-    if (fromEl && toEl) {
-      const isSocketToSwitch =
-        (fromEl.category === 'socket' && toEl.category === 'switch') ||
-        (fromEl.category === 'switch' && toEl.category === 'socket');
-      if (isSocketToSwitch) {
-        issues.push({
-          id: `fix_socket_switch_${wire.id}`,
-          severity: 'error',
-          title: `[ПУЕ 7.1.50] Неприпустиме з'єднання розетки та вимикача (${wire.cableTag || wire.id})`,
-          description: `Кабель з'єднує розетку «${fromEl.name}» та вимикач «${toEl.name}». За ПУЕ розеточні групи 16А (2.5мм²) та лінії освітлення 10А (1.5мм²) повинні бути суворо розділені. З'єднання їх в один шлейф заборонено!`,
-          elementId: fromEl.id,
-          autoFixAvailable: true,
-        });
-      }
-    }
-  });
-
-  // Перевірка: чи не призначено вимикач на 16А силову лінію розеток
-  project.elements.forEach((el) => {
-    if (el.category === 'switch') {
-      const c = project.circuits.find((item) => item.id === el.circuitId);
-      if (c && (c.breakerRatingA >= 16 || c.cableType === 'VVGng_3x2.5')) {
-        issues.push({
-          id: `fix_switch_circuit_${el.id}`,
-          severity: 'error',
-          title: `[ПУЕ 7.1.50] Вимикач «${el.name}» призначено на силову розеточну групу (${c.name}, ${c.breakerRatingA}А)`,
-          description: `Вимикач освітлення призначено на розеточну групу ${c.breakerRatingA}А з кабелем ${c.cableType}. За ПУЕ комутаційні апарати освітлення мають захищатися автоматом 10А з кабелем 1.5мм².`,
-          elementId: el.id,
-          autoFixAvailable: true,
-        });
-      }
-    }
-  });
-
-  // 15. Перевірка шини KNX на замкнені кільця (KNX Standard ISO/IEC 14543-3)
-  const knxWires = project.wires.filter((w) => w.cableType === 'KNX_Bus' || w.busType === 'knx');
-  if (knxWires.length >= 3) {
-    const adj = new Map<string, string[]>();
-    knxWires.forEach((w) => {
-      if (!adj.has(w.fromId)) adj.set(w.fromId, []);
-      if (!adj.has(w.toId)) adj.set(w.toId, []);
-      adj.get(w.fromId)!.push(w.toId);
-      adj.get(w.toId)!.push(w.fromId);
-    });
-
-    const visited = new Set<string>();
-    let hasCycle = false;
-
-    const dfs = (node: string, parent: string | null): boolean => {
-      visited.add(node);
-      const neighbors = adj.get(node) || [];
-      for (const n of neighbors) {
-        if (n === parent) continue;
-        if (visited.has(n)) return true;
-        if (dfs(n, node)) return true;
-      }
-      return false;
-    };
-
-    for (const node of adj.keys()) {
-      if (!visited.has(node)) {
-        if (dfs(node, null)) {
-          hasCycle = true;
-          break;
-        }
-      }
-    }
-
-    if (hasCycle) {
-      issues.push({
-        id: 'fix_knx_loop',
-        severity: 'error',
-        title: '[KNX ISO 14543] Виявлено замкнене кільце в шині автоматизації KNX',
-        description: 'У шині KNX категорично заборонено утворювати замкнені петлі/кільця. Дозволена виключно топологія дерево, лінія або зірка. Розірвіть зворотне з’єднання.',
       });
     }
   }
@@ -546,15 +551,32 @@ export function applyAutoFix(project: CadProject, issueId: string): { updatedPro
   let updated = JSON.parse(JSON.stringify(project)) as CadProject;
   let message = 'Виправлення виконано';
 
+  const syncElementAcrossFloors = (fn: (el: ElectricalElement) => ElectricalElement) => {
+    updated.elements = updated.elements.map(fn);
+    if (updated.floors) {
+      updated.floors = updated.floors.map((fl) => ({
+        ...fl,
+        elements: (fl.elements || []).map(fn),
+      }));
+    }
+  };
+
+  const syncWiresAcrossFloors = (fn: (wires: WireRoute[]) => WireRoute[]) => {
+    updated.wires = fn(updated.wires);
+    if (updated.floors) {
+      updated.floors = updated.floors.map((fl) => ({
+        ...fl,
+        wires: fn(fl.wires || []),
+      }));
+    }
+  };
+
   // Fix 1: Bathroom IP rating
   if (issueId.startsWith('fix_ip_')) {
     const elId = issueId.replace('fix_ip_', '');
-    updated.elements = updated.elements.map((el) => {
-      if (el.id === elId) {
-        return { ...el, ipRating: 'IP44', name: el.name.replace(/IP\d+/, 'IP44') };
-      }
-      return el;
-    });
+    syncElementAcrossFloors((el) =>
+      el.id === elId ? { ...el, ipRating: 'IP44', name: el.name.replace(/IP\d+/, 'IP44') } : el
+    );
     message = 'Ступінь захисту розетки успішно підвищено до IP44';
   }
 
@@ -650,10 +672,11 @@ export function applyAutoFix(project: CadProject, issueId: string): { updatedPro
   // Fix 9: Orphaned light auto-linking
   else if (issueId.startsWith('fix_orphan_light_')) {
     const lightId = issueId.replace('fix_orphan_light_', '');
-    const light = updated.elements.find((e) => e.id === lightId);
+    const allEls = getAggregatedProjectData(updated).allElements;
+    const light = allEls.find((e) => e.id === lightId);
     if (light) {
-      // Знаходимо найближчий вимикач
-      const switches = updated.elements.filter((e) => e.category === 'switch');
+      const floorSwitches = allEls.filter((e) => e.category === 'switch' && e.floorId === light.floorId);
+      const switches = floorSwitches.length > 0 ? floorSwitches : allEls.filter((e) => e.category === 'switch');
       let nearestSw: ElectricalElement | null = null;
       let minDist = Infinity;
       switches.forEach((sw) => {
@@ -666,12 +689,7 @@ export function applyAutoFix(project: CadProject, issueId: string): { updatedPro
 
       if (nearestSw) {
         const targetGroup = (nearestSw as ElectricalElement).switchGroupId || 'S1';
-        updated.elements = updated.elements.map((e) => {
-          if (e.id === lightId) {
-            return { ...e, switchGroupId: targetGroup };
-          }
-          return e;
-        });
+        syncElementAcrossFloors((e) => (e.id === lightId ? { ...e, switchGroupId: targetGroup } : e));
         message = `Світильник успішно прив’язано до вимикача (${targetGroup})`;
       }
     }
@@ -689,7 +707,8 @@ export function applyAutoFix(project: CadProject, issueId: string): { updatedPro
 
   // Fix 11: Phase rebalancing
   else if (issueId === 'fix_phase_unbalance') {
-    const balanceRes = autoBalancePhases(updated.circuits, updated.elements);
+    const allEls = getAggregatedProjectData(updated).allElements;
+    const balanceRes = autoBalancePhases(updated.circuits, allEls);
     updated.circuits = balanceRes.balancedCircuits;
     message = `Лінії збалансовано: несиметрію фаз знижено з ${balanceRes.initialUnbalancePercent}% до ${balanceRes.finalUnbalancePercent}%`;
   }
@@ -709,19 +728,16 @@ export function applyAutoFix(project: CadProject, issueId: string): { updatedPro
   // Fix 13: Wall chase crossing door or window opening
   else if (issueId.startsWith('fix_chase_opening_')) {
     const wireId = issueId.replace('fix_chase_opening_', '');
-    updated.wires = updated.wires.map((w) => {
-      if (w.id === wireId) {
-        return { ...w, conduit: 'ceiling' };
-      }
-      return w;
-    });
+    syncWiresAcrossFloors((wires) =>
+      wires.map((w) => (w.id === wireId ? { ...w, conduit: 'ceiling' } : w))
+    );
     message = 'Спосіб прокладання траси змінено зі штроби на безпечний стельовий у гофротрубі';
   }
 
   // Fix 14a: Remove illegal socket-to-switch wire
   else if (issueId.startsWith('fix_socket_switch_')) {
     const wireId = issueId.replace('fix_socket_switch_', '');
-    updated.wires = updated.wires.filter((w) => w.id !== wireId);
+    syncWiresAcrossFloors((wires) => wires.filter((w) => w.id !== wireId));
     message = 'Неприпустимий кабель між розеткою та вимикачем успішно видалено';
   }
 
@@ -752,12 +768,7 @@ export function applyAutoFix(project: CadProject, issueId: string): { updatedPro
       };
       updated.circuits.push(lightCirc);
     }
-    updated.elements = updated.elements.map((el) => {
-      if (el.id === elId) {
-        return { ...el, circuitId: lightCirc.id };
-      }
-      return el;
-    });
+    syncElementAcrossFloors((el) => (el.id === elId ? { ...el, circuitId: lightCirc!.id } : el));
     message = `Вимикач успішно переведено на групу освітлення «${lightCirc.name}»`;
   }
 

@@ -24,6 +24,11 @@ import {
   parseCustomLibraryJson,
   DEFAULT_CUSTOM_ITEMS,
 } from '../../utils/customLibraryStorage';
+import {
+  parseAndNormalizeSvg,
+  downloadCustomSymbolSvg,
+  importCustomSymbolFromSvg,
+} from '../../utils/svgSymbolUtils';
 
 interface CustomLibraryModalProps {
   isOpen: boolean;
@@ -42,6 +47,8 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
   const [activeTab, setActiveTab] = useState<'all' | 'electrical' | 'furniture' | 'create'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [pendingResetConfirm, setPendingResetConfirm] = useState<boolean>(false);
 
   // Form State for creating / editing an item
   const [formKind, setFormKind] = useState<'electrical' | 'furniture'>('electrical');
@@ -63,6 +70,10 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
   const [formShortDesc, setFormShortDesc] = useState('');
   const [formNotes, setFormNotes] = useState('');
   const [formHints, setFormHints] = useState('');
+  // Custom SVG states
+  const [formCustomSvgPath, setFormCustomSvgPath] = useState<string>('');
+  const [formCustomSvgData, setFormCustomSvgData] = useState<string>('');
+  const [svgFileName, setSvgFileName] = useState<string>('');
 
   if (!isOpen) return null;
 
@@ -112,6 +123,8 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
       shortDesc: formShortDesc.trim() || undefined,
       notes: formNotes.trim() || undefined,
       electricalHints: hintsArray.length > 0 ? hintsArray : undefined,
+      customSvgPath: formCustomSvgPath || undefined,
+      customSvgData: formCustomSvgData || undefined,
       createdAt: new Date().toISOString(),
       ...(formKind === 'electrical'
         ? {
@@ -143,14 +156,16 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
     setFormShortDesc('');
     setFormNotes('');
     setFormHints('');
+    setFormCustomSvgPath('');
+    setFormCustomSvgData('');
+    setSvgFileName('');
   };
 
-  const handleDeleteItem = (id: string, name: string) => {
-    if (confirm(`Видалити «${name}» з бібліотеки?`)) {
-      const updated = items.filter((it) => it.id !== id);
-      persistItems(updated);
-      showNotification(`Елемент «${name}» видалено`);
-    }
+  const confirmDeleteItem = (id: string, name: string) => {
+    const updated = items.filter((it) => it.id !== id);
+    persistItems(updated);
+    setPendingDeleteId(null);
+    showNotification(`Елемент «${name}» видалено`);
   };
 
   const handleDuplicateItem = (item: CustomLibraryItem) => {
@@ -204,11 +219,73 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
     e.target.value = '';
   };
 
-  const handleResetDefaults = () => {
-    if (confirm('Скинути бібліотеку до стандартного інженерного набору?')) {
-      persistItems(DEFAULT_CUSTOM_ITEMS);
-      showNotification('Бібліотеку відновлено до заводських налаштувань');
-    }
+  const handleImportSvg = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const text = event.target?.result as string;
+        const importedItem = importCustomSymbolFromSvg(text, file.name);
+
+        // Merge: avoid duplicates by id
+        const existingIds = new Set(items.map((i) => i.id));
+        if (existingIds.has(importedItem.id)) {
+          importedItem.id = `custom_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        }
+
+        const merged = [importedItem, ...items];
+        persistItems(merged);
+        showNotification(`Успішно імпортовано векторний символ «${importedItem.name}» із SVG!`);
+      } catch (err: any) {
+        showNotification(`Помилка імпорту SVG: ${err.message || 'Некоректний SVG файл'}`);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const handleSvgFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const text = event.target?.result as string;
+        const parsed = parseAndNormalizeSvg(text);
+        if (!parsed.pathData) {
+          showNotification('Не вдалося вилучити векторний контур із SVG');
+          return;
+        }
+
+        setFormCustomSvgPath(parsed.pathData);
+        setFormCustomSvgData(text);
+        setSvgFileName(file.name);
+
+        if (parsed.metadata?.name && !formName.trim()) {
+          setFormName(parsed.metadata.name);
+        }
+        if (parsed.metadata?.powerWatts && formPower === 500) {
+          setFormPower(parsed.metadata.powerWatts);
+        }
+        if (parsed.metadata?.symbolColor) {
+          setFormColor(parsed.metadata.symbolColor);
+        }
+        showNotification(`Векторний контур «${file.name}» успішно завантажено!`);
+      } catch (err: any) {
+        showNotification(`Помилка читання SVG: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const confirmResetDefaults = () => {
+    persistItems(DEFAULT_CUSTOM_ITEMS);
+    setPendingResetConfirm(false);
+    showNotification('Бібліотеку відновлено до заводських налаштувань');
   };
 
   return (
@@ -243,10 +320,16 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
               <span>Експорт JSON</span>
             </button>
 
-            <label className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 flex items-center gap-1.5 cursor-pointer transition-colors">
+            <label className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 flex items-center gap-1.5 cursor-pointer transition-colors" title="Імпортувати символи з файлу .JSON">
               <Upload className="w-3.5 h-3.5 text-emerald-400" />
               <span>Імпорт JSON</span>
               <input type="file" accept=".json" onChange={handleImportJson} className="hidden" />
+            </label>
+
+            <label className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 flex items-center gap-1.5 cursor-pointer transition-colors" title="Імпортувати векторний символ із файлу .SVG (з підтримкою метаданих ПУЕ)">
+              <Upload className="w-3.5 h-3.5 text-amber-400" />
+              <span>Імпорт SVG</span>
+              <input type="file" accept=".svg,image/svg+xml" onChange={handleImportSvg} className="hidden" />
             </label>
 
             <button
@@ -506,10 +589,79 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
                       </div>
                     </div>
 
+                    {/* Custom SVG File Upload & Normalization */}
+                    <div className="p-3.5 rounded-xl bg-neutral-900/80 border border-neutral-800 space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                          <FolderOpen className="w-4 h-4 text-amber-400" />
+                          <span>Власний векторний символ (.SVG)</span>
+                        </label>
+                        {formCustomSvgPath && (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-medium">
+                            ✓ SVG активовано
+                          </span>
+                        )}
+                      </div>
+
+                      {formCustomSvgPath ? (
+                        <div className="flex items-center gap-3.5 p-3 bg-neutral-950 rounded-xl border border-neutral-700">
+                          <div className="w-12 h-12 rounded-lg bg-neutral-900 border border-neutral-700 flex items-center justify-center shrink-0">
+                            <svg viewBox="-14 -14 28 28" className="w-8 h-8">
+                              <path
+                                d={formCustomSvgPath}
+                                fill="rgba(56, 189, 248, 0.2)"
+                                stroke={formColor}
+                                strokeWidth="1.8"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              />
+                            </svg>
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-xs font-bold text-white truncate">
+                              {svgFileName || 'Векторний контур SVG'}
+                            </div>
+                            <div className="text-[10px] text-neutral-400 mt-0.5">
+                              Автоматично відцентровано та нормалізовано до 28×28 мм
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFormCustomSvgPath('');
+                              setFormCustomSvgData('');
+                              setSvgFileName('');
+                            }}
+                            className="px-2.5 py-1 text-xs rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 hover:text-white transition-colors"
+                          >
+                            Скинути
+                          </button>
+                        </div>
+                      ) : (
+                        <label className="flex flex-col items-center justify-center gap-1.5 p-4 border-2 border-dashed border-neutral-800 hover:border-amber-500/60 rounded-xl cursor-pointer bg-neutral-950/40 hover:bg-neutral-900/40 transition-all text-center">
+                          <Upload className="w-5 h-5 text-amber-400" />
+                          <div className="text-xs font-semibold text-neutral-200">
+                            Натисніть для вибору або перетягніть файл <strong className="text-amber-400">.SVG</strong>
+                          </div>
+                          <div className="text-[10px] text-neutral-500">
+                            Будь-які векторні контури (Inkscape, Figma, CAD). Автоматичне центрування та розрахунок геометрії.
+                          </div>
+                          <input
+                            type="file"
+                            accept=".svg,image/svg+xml"
+                            onChange={handleSvgFileUpload}
+                            className="hidden"
+                          />
+                        </label>
+                      )}
+                    </div>
+
                     {/* Vector Symbol Selector */}
                     <div>
                       <label className="block text-[11px] text-neutral-400 mb-1.5">
-                        Умовне графічне позначення (Векторний символ CAD)
+                        {formCustomSvgPath
+                          ? 'Базова форма (запасний варіант при відсутності SVG)'
+                          : 'Умовне графічне позначення (Векторний символ CAD)'}
                       </label>
                       <div className="grid grid-cols-4 sm:grid-cols-7 gap-2">
                         {[
@@ -717,15 +869,30 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
                       <div>
                         {/* Top info badge */}
                         <div className="flex items-start justify-between gap-2 mb-2">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2.5">
                             <span
-                              className={`w-6 h-6 rounded-md flex items-center justify-center text-xs font-bold ${
+                              className={`w-7 h-7 rounded-md flex items-center justify-center text-xs font-bold overflow-hidden shrink-0 ${
                                 item.kind === 'electrical'
                                   ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
                                   : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
                               }`}
                             >
-                              {item.kind === 'electrical' ? '⚡' : '🛋️'}
+                              {item.customSvgPath ? (
+                                <svg viewBox="-14 -14 28 28" className="w-5 h-5">
+                                  <path
+                                    d={item.customSvgPath}
+                                    fill="rgba(56, 189, 248, 0.2)"
+                                    stroke={item.symbolColor || '#38bdf8'}
+                                    strokeWidth="1.8"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              ) : item.kind === 'electrical' ? (
+                                '⚡'
+                              ) : (
+                                '🛋️'
+                              )}
                             </span>
                             <div>
                               <h3 className="text-sm font-bold text-white group-hover:text-amber-300 transition-colors">
@@ -742,19 +909,46 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
                           {/* Quick Actions */}
                           <div className="flex items-center gap-1 opacity-80 group-hover:opacity-100 transition-opacity">
                             <button
+                              onClick={() => {
+                                downloadCustomSymbolSvg(item);
+                                showNotification(`Символ «${item.name}» експортовано у файл SVG`);
+                              }}
+                              title="Експортувати символ у .SVG (з інженерними атрибутами)"
+                              className="w-7 h-7 rounded flex items-center justify-center text-amber-400 hover:text-white hover:bg-neutral-800 transition-colors"
+                            >
+                              <Download className="w-3.5 h-3.5" />
+                            </button>
+                            <button
                               onClick={() => handleDuplicateItem(item)}
                               title="Дублювати елемент"
-                              className="w-7 h-7 rounded flex items-center justify-center text-neutral-400 hover:text-white hover:bg-neutral-800"
+                              className="w-7 h-7 rounded flex items-center justify-center text-neutral-400 hover:text-white hover:bg-neutral-800 transition-colors"
                             >
                               <Copy className="w-3.5 h-3.5" />
                             </button>
-                            <button
-                              onClick={() => handleDeleteItem(item.id, item.name)}
-                              title="Видалити"
-                              className="w-7 h-7 rounded flex items-center justify-center text-neutral-500 hover:text-red-400 hover:bg-neutral-800"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
+                            {pendingDeleteId === item.id ? (
+                              <div className="flex items-center gap-1 bg-rose-950/90 border border-rose-500/40 rounded px-1.5 py-0.5">
+                                <button
+                                  onClick={() => confirmDeleteItem(item.id, item.name)}
+                                  className="text-[10px] font-bold text-rose-300 hover:text-white"
+                                >
+                                  Видалити
+                                </button>
+                                <button
+                                  onClick={() => setPendingDeleteId(null)}
+                                  className="text-[10px] text-neutral-400 hover:text-white ml-1"
+                                >
+                                  Ні
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                onClick={() => setPendingDeleteId(item.id)}
+                                title="Видалити"
+                                className="w-7 h-7 rounded flex items-center justify-center text-neutral-500 hover:text-red-400 hover:bg-neutral-800 transition-colors"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
                           </div>
                         </div>
 
@@ -778,11 +972,23 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
                                   {item.recommendedCable}
                                 </span>
                               )}
+                              {item.customSvgPath && (
+                                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300">
+                                  ⚡ Вектор SVG
+                                </span>
+                              )}
                             </>
                           ) : (
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-sky-400">
-                              Форма: {item.cadShape || 'стандарт'}
-                            </span>
+                            <>
+                              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-sky-400">
+                                Форма: {item.cadShape || 'стандарт'}
+                              </span>
+                              {item.customSvgPath && (
+                                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-sky-300">
+                                  ⚡ Вектор SVG
+                                </span>
+                              )}
+                            </>
                           )}
                         </div>
 
@@ -828,12 +1034,30 @@ export const CustomLibraryModal: React.FC<CustomLibraryModalProps> = ({
           <div className="flex items-center gap-2">
             <span>Збережено локально та у файлі проєкту</span>
             <span className="text-neutral-600">·</span>
-            <button
-              onClick={handleResetDefaults}
-              className="text-neutral-500 hover:text-neutral-300 transition-colors underline"
-            >
-              Скинути до стандартних
-            </button>
+            {pendingResetConfirm ? (
+              <div className="flex items-center gap-2 bg-amber-950/60 border border-amber-500/40 rounded px-2 py-0.5">
+                <span className="text-amber-300 text-[11px]">Скинути бібліотеку?</span>
+                <button
+                  onClick={confirmResetDefaults}
+                  className="text-amber-200 font-bold hover:underline"
+                >
+                  Так
+                </button>
+                <button
+                  onClick={() => setPendingResetConfirm(false)}
+                  className="text-neutral-400 hover:text-white"
+                >
+                  Скасувати
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setPendingResetConfirm(true)}
+                className="text-neutral-500 hover:text-neutral-300 transition-colors underline"
+              >
+                Скинути до стандартних
+              </button>
+            )}
           </div>
 
           <button

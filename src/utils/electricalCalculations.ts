@@ -7,6 +7,7 @@
  */
 
 import { CadProject, CircuitGroup, ElectricalElement, WireRoute } from '../types/cad';
+import { getAggregatedProjectData } from './projectAggregator';
 
 // Стандартні номінальні напруги в Україні та ЄС
 export const VOLTAGE_1PH = 230; // В (фазна напруга)
@@ -78,6 +79,13 @@ export const CABLE_SPECS: Record<string, CableSpec> = {
     recommendedBreakerA: 32,
     typicalApplication: 'Трифазні котли 14-18 кВт, ввідний кабель квартири 3-фазний',
   },
+  'VVGng_5x10': {
+    crossSectionMm2: 10.0,
+    ampacityA: 55,
+    maxBreakerRatingA: 50,
+    recommendedBreakerA: 40,
+    typicalApplication: 'Магістральний стояк до поверхових щитів 3-фазний (до 25-30 кВт)',
+  },
   'KNX_Bus': {
     crossSectionMm2: 0.8, // JY(St)Y 2x2x0.8
     ampacityA: 2.5,
@@ -86,6 +94,31 @@ export const CABLE_SPECS: Record<string, CableSpec> = {
     typicalApplication: 'Слабострумова шина автоматизації KNX/EIB 29-30V DC (зелена вита пара JY(St)Y)',
   },
 };
+
+export function getInstallationMethodFactor(
+  method: CircuitGroup['installationMethod'] = 'flush_plaster'
+): { factor: number; labelUk: string } {
+  switch (method) {
+    case 'open_air':
+      return { factor: 1.0, labelUk: 'Відкрито у повітрі / на лотку (K=1.0)' };
+    case 'conduit_wall':
+      return { factor: 0.88, labelUk: 'У ПВХ-гофрі в стіні / за стелею (K=0.88)' };
+    case 'conduit_insulation':
+      return { factor: 0.72, labelUk: 'У гофрі в теплоізоляції / мінваті (K=0.72)' };
+    case 'flush_plaster':
+    default:
+      return { factor: 0.95, labelUk: 'У штробі під штукатуркою (K=0.95)' };
+  }
+}
+
+export function getTemperatureFactor(ambientTempC = 25): number {
+  if (ambientTempC <= 20) return 1.05;
+  if (ambientTempC <= 25) return 1.0;
+  if (ambientTempC <= 30) return 0.94;
+  if (ambientTempC <= 35) return 0.88;
+  if (ambientTempC <= 40) return 0.82;
+  return 0.75;
+}
 
 export function getCableTitleUk(cableType: string): string {
   switch (cableType) {
@@ -96,6 +129,7 @@ export function getCableTitleUk(cableType: string): string {
     case 'VVGng_5x2.5': return 'ВВГнгд 5х2.5';
     case 'VVGng_5x4': return 'ВВГнгд 5х4';
     case 'VVGng_5x6': return 'ВВГнгд 5х6';
+    case 'VVGng_5x10': return 'ВВГнгд 5х10';
     case 'FTP_Cat5e': return 'FTP Cat5e 4x2x0.51';
     case 'KNX_Bus': return 'KNX Bus JY(St)Y 2x2x0.8';
     default: return cableType;
@@ -263,31 +297,46 @@ export function calculateShortCircuitCheck(
 /**
  * Детальний розрахунок по кожній групі щита
  */
+export interface CircuitCalculationDetails {
+  status: 'calculated' | 'insufficient_data';
+  inputs: string[];
+  formulas: string[];
+  assumptions: string[];
+  resultSummary: string;
+}
+
 export interface CircuitAnalysis {
   circuit: CircuitGroup;
   connectedElements: ElectricalElement[];
   totalInstalledWatts: number;
   averageCosPhi: number;
+  isThreePhaseLine: boolean;
   calculatedCurrentA: number; // Розрахунковий струм Ib
   breakerRatingA: number;
-  cableAmpacityA: number; // Idd кабелю
+  baseCableAmpacityA: number; // Табличний Idd кабелю
+  cableAmpacityA: number; // Скоригований допустимий струм Idd_eff = Idd * K_m * K_g * K_t
+  deratingFactorTotal: number;
   totalCableLengthM: number;
+  isLengthEstimated: boolean;
   voltageDrop: VoltageDropResult;
   shortCircuit: ShortCircuitCheckResult; // Перевірка КЗ та швидкодії за ПУЕ §1.7.79
-  // Координація за ПУЕ: Ib <= In <= Idd
+  // Координація за ПУЕ: Ib <= In <= Idd_eff
   isBreakerOverloaded: boolean; // Ib > In
-  isCableProtectedByBreaker: boolean; // In <= Idd
+  isCableProtectedByBreaker: boolean; // In <= Idd_eff
   isVoltageDropExceeded: boolean; // ΔU% > 4%
   isShortCircuitTrippingUnsafe: boolean; // Ikz < 1.1 * Iinst
-  overallStatus: 'ok' | 'warning' | 'error';
+  isGroundingProtectionMissing: boolean; // TT без ПЗВ
+  overallStatus: 'ok' | 'warning' | 'error' | 'uncalculated';
   statusMessage: string;
+  calculationDetails: CircuitCalculationDetails;
 }
 
 export function analyzeCircuit(
   circuit: CircuitGroup,
   elements: ElectricalElement[],
   wires: WireRoute[],
-  supplyPhase: '1-phase' | '3-phase' = '1-phase'
+  supplyPhase: '1-phase' | '3-phase' = '1-phase',
+  groundingSystem: 'TN-C-S' | 'TN-S' | 'TT' = 'TN-C-S'
 ): CircuitAnalysis {
   const connected = elements.filter((el) => el.circuitId === circuit.id);
   const totalWatts = connected.reduce((sum, el) => sum + (el.powerWatts || 0), 0);
@@ -299,17 +348,32 @@ export function analyzeCircuit(
   });
   const avgCosPhi = totalWatts > 0 ? Number((weightedCosSum / totalWatts).toFixed(2)) : 0.95;
 
-  const isThreePhase = supplyPhase === '3-phase' && (circuit.phase === 'L1' ? false : false); // за замовчуванням однофазна лінія
+  // Коректне визначення 3-фазної лінії (5-жильний кабель, фаза 3P, або 3-фазна силова розетка)
+  const isThreePhase =
+    supplyPhase === '3-phase' &&
+    (circuit.phase === '3P' ||
+      circuit.cableType?.startsWith('VVGng_5x') ||
+      connected.some((el) => el.type === 'socket_3phase'));
+
   const currentA = calculateLineCurrent(totalWatts, isThreePhase, avgCosPhi);
 
   const specKey = circuit.cableType || 'VVGng_3x2.5';
   const cableSpec = CABLE_SPECS[specKey] || CABLE_SPECS['VVGng_3x2.5'];
 
-  // Довжина кабелю групи (сума довжин або орієнтовна за кількістю точок)
+  // Поправочні коефіцієнти прокладання за ПУЕ Табл. 1.3.4 / 1.3.26
+  const methodInfo = getInstallationMethodFactor(circuit.installationMethod);
+  const kGroup = Math.max(0.5, Math.min(1.0, circuit.groupingFactorKg ?? 1.0));
+  const ambientTempC = circuit.ambientTempC ?? 25;
+  const kTemp = getTemperatureFactor(ambientTempC);
+  const deratingFactorTotal = Number((methodInfo.factor * kGroup * kTemp).toFixed(2));
+  const effectiveAmpacityA = Number((cableSpec.ampacityA * deratingFactorTotal).toFixed(1));
+
+  // Довжина кабелю групи (сума фактичних трас або позначка оцінки)
   const circuitWires = wires.filter((w) => w.circuitId === circuit.id);
   let totalLengthM = circuitWires.reduce((sum, w) => sum + (w.calculatedLengthM || 0), 0);
+  let isLengthEstimated = false;
   if (totalLengthM === 0 && connected.length > 0) {
-    // Якщо трасування ще не побудовано, оцінюємо за емпіричною формулою ДБН:
+    isLengthEstimated = true;
     totalLengthM = Math.max(12, connected.length * 4.5);
   }
 
@@ -321,20 +385,28 @@ export function analyzeCircuit(
     circuit.breakerCurve || 'C'
   );
 
-  const isBreakerOverloaded = currentA > circuit.breakerRatingA;
-  const isCableProtected = circuit.breakerRatingA <= cableSpec.ampacityA;
-  const isVoltageDropExceeded = !vDrop.isAcceptable;
+  const hasInsufficientData = connected.length === 0 || totalWatts <= 0;
+  const isBreakerOverloaded = !hasInsufficientData && currentA > circuit.breakerRatingA;
+  const isCableProtected = circuit.breakerRatingA <= effectiveAmpacityA;
+  const isVoltageDropExceeded = !hasInsufficientData && !vDrop.isAcceptable;
   const isShortCircuitTrippingUnsafe = !shortCircuit.isTrippingAssured;
+  const isGroundingProtectionMissing = groundingSystem === 'TT' && circuit.rcdType === 'none';
 
-  let overallStatus: 'ok' | 'warning' | 'error' = 'ok';
+  let overallStatus: CircuitAnalysis['overallStatus'] = 'ok';
   let statusMessage = 'Параметри лінії відповідають нормам ПУЕ';
 
-  if (isBreakerOverloaded) {
+  if (hasInsufficientData) {
+    overallStatus = 'uncalculated';
+    statusMessage = 'Не розраховано: до групи не прив’язано споживачів або потужність = 0 Вт';
+  } else if (isGroundingProtectionMissing) {
+    overallStatus = 'error';
+    statusMessage = `Система заземлення TT вимагає обов’язкового ПЗВ (≤30 мА) для кожної лінії (ПУЕ §1.7.59)`;
+  } else if (isBreakerOverloaded) {
     overallStatus = 'error';
     statusMessage = `Перевантаження: струм навантаження (${currentA} А) перевищує номінал автомата (${circuit.breakerRatingA} А)`;
   } else if (!isCableProtected) {
     overallStatus = 'error';
-    statusMessage = `Порушення захисту кабелю: автомат ${circuit.breakerRatingA} А > Idd кабелю (${cableSpec.ampacityA} А)`;
+    statusMessage = `Порушення захисту кабелю: автомат ${circuit.breakerRatingA} А > скоригованого Idd кабелю (${effectiveAmpacityA} А з коеф. ${deratingFactorTotal})`;
   } else if (isShortCircuitTrippingUnsafe) {
     overallStatus = 'warning';
     statusMessage = `Чутливість КЗ знижена: Ikz=${shortCircuit.ikzCurrentA}A < 1.1·Iinst (${shortCircuit.requiredIkzA}A). Час спрацювання > 0.4с`;
@@ -343,23 +415,61 @@ export function analyzeCircuit(
     statusMessage = `Підвищене падіння напруги: ${vDrop.deltaPercent}% (допустимо до 4%)`;
   }
 
+  const calculationDetails: CircuitCalculationDetails = {
+    status: hasInsufficientData ? 'insufficient_data' : 'calculated',
+    inputs: [
+      `Pвст = ${totalWatts} Вт (${connected.length} точок), cos φ = ${avgCosPhi}`,
+      `Мережа = ${isThreePhase ? '3-фазна 400 В' : '1-фазна 230 В'}, Система заземлення = ${groundingSystem}`,
+      `Кабель = ${getCableTitleUk(specKey)} (S=${cableSpec.crossSectionMm2} мм², Idd_табл=${cableSpec.ampacityA} А)`,
+      `Умови прокладання: ${methodInfo.labelUk}; Kg=${kGroup}; T=${ambientTempC}°C (Kt=${kTemp})`,
+      `Довжина лінії L = ${Math.round(totalLengthM * 10) / 10} м (${isLengthEstimated ? 'оцінка без трас' : 'за трасами на плані'})`,
+    ],
+    formulas: [
+      isThreePhase
+        ? `Ib = P / (√3 · Uл · cos φ) = ${totalWatts} / (1.732 · 400 · ${avgCosPhi}) = ${currentA} А`
+        : `Ib = P / (Uф · cos φ) = ${totalWatts} / (230 · ${avgCosPhi}) = ${currentA} А`,
+      `Idd_еф = Idd_табл · Km · Kg · Kt = ${cableSpec.ampacityA} · ${methodInfo.factor} · ${kGroup} · ${kTemp} = ${effectiveAmpacityA} А`,
+      isThreePhase
+        ? `ΔU% = (√3 · L · Ib · cos φ / (γ · S)) / 400 · 100% = ${vDrop.deltaPercent}% (γ=50 м/(Ом·мм²))`
+        : `ΔU% = (2 · L · Ib · cos φ / (γ · S)) / 230 · 100% = ${vDrop.deltaPercent}% (γ=50 м/(Ом·мм²))`,
+      `Ikz(1) = Uф / (Zджерела + Rконт + 2L/(γ·S)) = 230 / ${shortCircuit.loopImpedanceOhm} = ${shortCircuit.ikzCurrentA} А (поріг 1.1·Iinst = ${shortCircuit.requiredIkzA} А)`,
+    ],
+    assumptions: [
+      'Питома провідність міді при нагріві γ = 50 м/(Ом·мм²).',
+      'Імпеданс зовнішньої мережі до щита Zджерела + Rконт = 0.10 Ом (вимагає заміру петлі фаза-нуль при здачі).',
+      isLengthEstimated
+        ? 'УВАГА: Траси ще не прокладені на плані — використано попередню оцінку 4.5 м на точку.'
+        : 'Довжина кабелю врахована за фактичною ортогональною геометрією трас.',
+      'Остаточну безпеку схеми та селективність повинен підтвердити сертифікований інженер-електрик.',
+    ],
+    resultSummary: hasInsufficientData
+      ? 'Не розраховано — додайте споживачів до групи.'
+      : `Ib=${currentA}А ≤ In=${circuit.breakerRatingA}А ≤ Idd_еф=${effectiveAmpacityA}А | ΔU=${vDrop.deltaPercent}% | Ikz=${shortCircuit.ikzCurrentA}А`,
+  };
+
   return {
     circuit,
     connectedElements: connected,
     totalInstalledWatts: totalWatts,
     averageCosPhi: avgCosPhi,
+    isThreePhaseLine: isThreePhase,
     calculatedCurrentA: currentA,
     breakerRatingA: circuit.breakerRatingA,
-    cableAmpacityA: cableSpec.ampacityA,
+    baseCableAmpacityA: cableSpec.ampacityA,
+    cableAmpacityA: effectiveAmpacityA,
+    deratingFactorTotal,
     totalCableLengthM: Math.round(totalLengthM * 10) / 10,
+    isLengthEstimated,
     voltageDrop: vDrop,
     shortCircuit,
     isBreakerOverloaded,
     isCableProtectedByBreaker: isCableProtected,
     isVoltageDropExceeded,
     isShortCircuitTrippingUnsafe,
+    isGroundingProtectionMissing,
     overallStatus,
     statusMessage,
+    calculationDetails,
   };
 }
 
@@ -391,7 +501,11 @@ export function calculatePhaseBalance(
     const connected = elements.filter((e) => e.circuitId === c.id);
     const watts = connected.reduce((sum, e) => sum + (e.powerWatts || 0), 0);
     const phase = c.phase || 'L1';
-    if (phase === 'L1') l1 += watts;
+    if (phase === '3P') {
+      l1 += watts / 3;
+      l2 += watts / 3;
+      l3 += watts / 3;
+    } else if (phase === 'L1') l1 += watts;
     else if (phase === 'L2') l2 += watts;
     else if (phase === 'L3') l3 += watts;
   });
@@ -410,14 +524,14 @@ export function calculatePhaseBalance(
   }
 
   return {
-    l1Watts: l1,
-    l2Watts: l2,
-    l3Watts: l3,
+    l1Watts: Math.round(l1),
+    l2Watts: Math.round(l2),
+    l3Watts: Math.round(l3),
     l1CurrentA: l1A,
     l2CurrentA: l2A,
     l3CurrentA: l3A,
-    maxPhaseWatts: maxP,
-    minPhaseWatts: minP,
+    maxPhaseWatts: Math.round(maxP),
+    minPhaseWatts: Math.round(minP),
     unbalancePercent,
     isBalanced: unbalancePercent <= 15.0,
   };
@@ -442,22 +556,23 @@ export function autoBalancePhases(
 ): AutoBalanceResult {
   const initialBalance = calculatePhaseBalance(circuits, elements);
 
-  // Обчислюємо підключену потужність для кожної групи
-  const circuitLoads = circuits.map((c) => {
-    const p = elements
-      .filter((e) => e.circuitId === c.id)
-      .reduce((sum, e) => sum + (e.powerWatts || 0), 0);
-    return { circuit: c, watts: p };
-  });
+  // Обчислюємо підключену потужність для кожної групи (трифазні 3P лінії залишаємо без зміни фази)
+  const circuitLoads = circuits
+    .filter((c) => c.phase !== '3P')
+    .map((c) => {
+      const p = elements
+        .filter((e) => e.circuitId === c.id)
+        .reduce((sum, e) => sum + (e.powerWatts || 0), 0);
+      return { circuit: c, watts: p };
+    });
 
-  // Сортуємо лінії за спаданням потужності (класичний евристичний LPT підхід для NP-повної задачі мультипроцесорного розкладу)
+  // Сортуємо лінії за спаданням потужності (класичний евристичний LPT підхід)
   circuitLoads.sort((a, b) => b.watts - a.watts);
 
   const phaseLoads: Record<'L1' | 'L2' | 'L3', number> = { L1: 0, L2: 0, L3: 0 };
   const newPhases: Record<string, 'L1' | 'L2' | 'L3'> = {};
 
   circuitLoads.forEach(({ circuit, watts }) => {
-    // Призначаємо лінію на фазу з найменшим поточним навантаженням
     const phases: Array<'L1' | 'L2' | 'L3'> = ['L1', 'L2', 'L3'];
     const minPhase = phases.reduce((best, curr) =>
       phaseLoads[curr] < phaseLoads[best] ? curr : best, 'L1'
@@ -468,6 +583,7 @@ export function autoBalancePhases(
 
   let movedCount = 0;
   const balancedCircuits = circuits.map((c) => {
+    if (c.phase === '3P') return c;
     const assignedPhase = newPhases[c.id] || c.phase || 'L1';
     if (assignedPhase !== c.phase) {
       movedCount++;
@@ -488,7 +604,7 @@ export function autoBalancePhases(
 }
 
 /**
- * Розрахунок загального навантаження всього проекту
+ * Розрахунок загального навантаження всього багатоповерхового проекту
  */
 export interface ProjectElectricalSummary {
   installedPowerWatts: number;
@@ -499,6 +615,7 @@ export interface ProjectElectricalSummary {
   mainCurrentA: number;
   mainBreakerRatingA: number;
   isMainBreakerOverloaded: boolean;
+  floorsCount: number;
   phaseBalance?: PhaseBalanceResult;
 }
 
@@ -506,11 +623,13 @@ export function calculateProjectElectricalSummary(
   project: CadProject,
   customDemandFactor?: number
 ): ProjectElectricalSummary {
-  // Розрахунок суми потужностей всіх дійсних елементів
-  const installedWatts = project.elements.reduce((sum, el) => sum + (el.powerWatts || 0), 0);
+  const aggregated = getAggregatedProjectData(project);
+  const allElements = aggregated.allElements;
 
-  // Коефіцієнт попиту за ДБН В.2.5-23:2010 (Табл. 3.1 для квартир з електроплитами)
-  // Якщо проект понад 10 кВт - Kp ~ 0.70; до 10 кВт - 0.80
+  // Розрахунок суми потужностей всіх дійсних елементів по всіх поверхах
+  const installedWatts = allElements.reduce((sum, el) => sum + (el.powerWatts || 0), 0);
+
+  // Коефіцієнт попиту за ДБН В.2.5-23:2010 (Табл. 3.1 для квартир/будинків)
   const demandFactor =
     customDemandFactor !== undefined
       ? customDemandFactor
@@ -522,7 +641,7 @@ export function calculateProjectElectricalSummary(
   const is3Ph = project.supplyPhase === '3-phase';
   const mainCurrent = calculateLineCurrent(designWatts, is3Ph, 0.95);
 
-  const phaseBalance = is3Ph ? calculatePhaseBalance(project.circuits, project.elements) : undefined;
+  const phaseBalance = is3Ph ? calculatePhaseBalance(project.circuits, allElements) : undefined;
   const isMainOverloaded = mainCurrent > project.mainBreakerRatingA;
 
   return {
@@ -534,6 +653,7 @@ export function calculateProjectElectricalSummary(
     mainCurrentA: mainCurrent,
     mainBreakerRatingA: project.mainBreakerRatingA,
     isMainBreakerOverloaded: isMainOverloaded,
+    floorsCount: aggregated.syncedFloors.length,
     phaseBalance,
   };
 }

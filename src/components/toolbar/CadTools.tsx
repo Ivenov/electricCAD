@@ -24,6 +24,9 @@ import {
   Layers,
   Sparkles,
   Plus,
+  Split,
+  Crosshair,
+  MessageSquarePlus,
 } from 'lucide-react';
 import { CadTool, ViewFilterMode, ElectricalCategory, Room, FurnitureCategory, CustomLibraryItem } from '../../types/cad';
 import { CatalogItem, ELECTRICAL_CATALOG } from '../../data/electricalCatalog';
@@ -83,6 +86,15 @@ interface CadToolsProps {
   autoRoutingEnabled?: boolean;
   onToggleAutoRouting?: () => void;
   onOpenLayersModal?: () => void;
+  onOptimizeParallelWires?: () => void;
+  wallPresetThickness?: number;
+  onChangeWallPresetThickness?: (thickness: number) => void;
+  onOpenAutoSocketsModal?: () => void;
+  onOpenAutoLightingModal?: () => void;
+  onOpenWallElevationModal?: () => void;
+  onOpenCableScheduleModal?: () => void;
+  onOpenPanelLabelsModal?: () => void;
+  onOpenBlockStampsModal?: () => void;
 }
 
 export const CadTools: React.FC<CadToolsProps> = ({
@@ -119,6 +131,15 @@ export const CadTools: React.FC<CadToolsProps> = ({
   onAutoRoute,
   autoRoutingEnabled = true,
   onToggleAutoRouting,
+  onOptimizeParallelWires,
+  wallPresetThickness = 150,
+  onChangeWallPresetThickness,
+  onOpenAutoSocketsModal,
+  onOpenAutoLightingModal,
+  onOpenWallElevationModal,
+  onOpenCableScheduleModal,
+  onOpenPanelLabelsModal,
+  onOpenBlockStampsModal,
 }) => {
   const [selectedFurnitureCategory, setSelectedFurnitureCategory] = useState<FurnitureCategory | 'all'>('all');
 
@@ -132,7 +153,7 @@ export const CadTools: React.FC<CadToolsProps> = ({
     return ELECTRICAL_CATALOG.filter((item) => item.category === category);
   };
 
-  const isDrawerOpen = ['socket', 'switch', 'light', 'panel', 'junction', 'door', 'window', 'room', 'furniture'].includes(activeTool);
+  const isDrawerOpen = ['socket', 'switch', 'light', 'panel', 'junction', 'door', 'window', 'room', 'furniture', 'wire', 'wall'].includes(activeTool);
 
   return (
     <div className="flex h-full select-none z-20">
@@ -402,6 +423,32 @@ export const CadTools: React.FC<CadToolsProps> = ({
             <Ruler className="w-4 h-4" />
           </button>
 
+          {/* Scale Calibration Tool */}
+          <button
+            onClick={() => onSelectTool('calibrate')}
+            title="Калібрування масштабу за підкладкою БТІ (клікніть 2 точки з відомою відстанню)"
+            className={`w-10 h-10 rounded-lg flex items-center justify-center transition-colors ${
+              activeTool === 'calibrate'
+                ? 'bg-sky-500 text-neutral-950 font-bold ring-2 ring-sky-400/50'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+            }`}
+          >
+            <Crosshair className="w-4 h-4" />
+          </button>
+
+          {/* Client Note Pin Tool */}
+          <button
+            onClick={() => onSelectTool('client_note')}
+            title="Додати зауваження / коментар клієнта на план (клікніть у будь-яке місце)"
+            className={`w-10 h-10 rounded-lg flex items-center justify-center transition-colors ${
+              activeTool === 'client_note'
+                ? 'bg-amber-400 text-neutral-950 font-bold ring-2 ring-amber-400/50'
+                : 'text-amber-400/80 hover:text-amber-300 hover:bg-neutral-800'
+            }`}
+          >
+            <MessageSquarePlus className="w-4 h-4" />
+          </button>
+
           {/* Custom Library Creator Tool */}
           {onOpenCustomLibraryModal && (
             <button
@@ -522,18 +569,160 @@ export const CadTools: React.FC<CadToolsProps> = ({
               {activeTool === 'window' && 'Каталог вікон'}
               {activeTool === 'room' && 'Створення кімнати'}
               {activeTool === 'furniture' && 'Меблі та сантехніка'}
+              {activeTool === 'wall' && 'Креслення та розміри стін'}
+              {activeTool === 'wire' && 'Трасування кабельних ліній'}
             </span>
             <span className="text-[11px] text-neutral-500">
               {activeTool === 'door' || activeTool === 'window'
                 ? 'Клік на стіну'
                 : activeTool === 'room'
                 ? 'Клікніть кути полігону'
+                : activeTool === 'wall'
+                ? 'Введення мм + Enter'
+                : activeTool === 'wire'
+                ? 'Оптимальні 90° траси'
                 : 'Клікніть на план'}
             </span>
           </div>
 
           <div className="flex flex-col gap-1.5">
-            {activeTool === 'furniture' ? (
+            {/* 1. WALL PARAMETERS & DIMENSIONS DRAWER */}
+            {activeTool === 'wall' ? (
+              <div className="space-y-3">
+                <div className="p-2.5 rounded-lg bg-sky-950/40 border border-sky-800/50 text-xs text-sky-200 space-y-1">
+                  <div className="font-semibold flex items-center gap-1.5 text-sky-300">
+                    <Ruler className="w-3.5 h-3.5" />
+                    <span>Задання точних розмірів стін</span>
+                  </div>
+                  <p className="text-[11px] text-neutral-300 leading-snug">
+                    Клікніть першу точку. Під час ведення курсору введіть довжину на клавіатурі (наприклад, <strong>3500</strong>) і натисніть <strong>Enter</strong> для побудови стіни точного розміру.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="text-[11px] text-neutral-400 font-medium block mb-1">Товщина стін для нових ліній:</label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {[
+                      { th: 100, label: '100 мм (ГКЛ)' },
+                      { th: 150, label: '150 мм (Блок)' },
+                      { th: 200, label: '200 мм (Кв.)' },
+                      { th: 250, label: '250 мм (Цегла)' },
+                    ].map((item) => (
+                      <button
+                        key={item.th}
+                        onClick={() => onChangeWallPresetThickness?.(item.th)}
+                        className={`py-1.5 px-2 rounded text-[11px] font-mono border transition-colors ${
+                          wallPresetThickness === item.th
+                            ? 'bg-sky-950/70 border-sky-500 text-sky-300 font-bold'
+                            : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="p-2 bg-neutral-950 border border-neutral-800 rounded-lg text-[10.5px] text-neutral-400 space-y-1">
+                  <div className="text-neutral-300 font-medium">Швидкі довжини стін (мм):</div>
+                  <div className="grid grid-cols-3 gap-1 pt-0.5">
+                    {[1500, 2000, 2500, 3000, 3500, 4000, 5000, 6000].map((len) => (
+                      <div
+                        key={len}
+                        className="py-1 text-center bg-neutral-900 border border-neutral-800/80 rounded font-mono text-neutral-300 text-[10px]"
+                      >
+                        {len}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <p className="text-[10px] text-neutral-500 leading-tight">
+                  Виберіть будь-яку побудовану стіну, щоб змінити її точний розмір у мм або перетягувати круглі маркери на кінцях.
+                </p>
+
+                {/* Wall Elevation & Chasing button */}
+                {onOpenWallElevationModal && (
+                  <button
+                    onClick={onOpenWallElevationModal}
+                    className="w-full p-2.5 rounded-xl bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/50 text-blue-300 text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-blue-950/30"
+                  >
+                    <Sparkles className="w-4 h-4 text-blue-400" />
+                    <span>📐 Розгортка стіни & Штроби (ПУЕ)</span>
+                  </button>
+                )}
+              </div>
+            ) : activeTool === 'wire' ? (
+              /* 2. WIRE ROUTING & PARALLEL BUNDLE DRAWER */
+              <div className="space-y-3">
+                <div className="p-2.5 rounded-lg bg-sky-950/40 border border-sky-800/50 text-xs text-sky-200 space-y-1">
+                  <div className="font-semibold flex items-center gap-1.5 text-sky-300">
+                    <Split className="w-3.5 h-3.5" />
+                    <span>Ортогональні паралельні траси</span>
+                  </div>
+                  <p className="text-[11px] text-neutral-300 leading-snug">
+                    Кабелі одного напрямку прокладаються паралельними коліями з відступом 80 мм за ПУЕ §2.1.43, уникаючи накладання ліній одна на одну.
+                  </p>
+                </div>
+
+                {/* Parallel optimization action */}
+                {onOptimizeParallelWires && (
+                  <button
+                    onClick={onOptimizeParallelWires}
+                    className="w-full py-2 px-3 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center justify-center gap-2 shadow-md transition-all active:scale-95"
+                  >
+                    <Split className="w-3.5 h-3.5" />
+                    <span>⚡ Оптимізувати всі паралельні траси</span>
+                  </button>
+                )}
+
+                {/* Auto-route button */}
+                {onAutoRoute && (
+                  <button
+                    onClick={onAutoRoute}
+                    className="w-full py-2 px-3 rounded-lg bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-neutral-200 font-semibold text-xs flex items-center justify-center gap-2 transition-colors"
+                  >
+                    <Zap className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Автотрасування ПУЕ (Всі групи)</span>
+                  </button>
+                )}
+
+                {/* Auto-routing toggle */}
+                {onToggleAutoRouting && (
+                  <div className="p-2.5 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-between">
+                    <span className="text-[11px] text-neutral-300 font-medium">Автотрасування:</span>
+                    <button
+                      onClick={onToggleAutoRouting}
+                      className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                        autoRoutingEnabled
+                          ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
+                          : 'bg-neutral-900 text-neutral-400 border border-neutral-800'
+                      }`}
+                    >
+                      {autoRoutingEnabled ? 'УВІМКНЕНО' : 'ВИМКНЕНО'}
+                    </button>
+                  </div>
+                )}
+
+                <div className="text-[10px] text-neutral-500 leading-tight space-y-1 pt-1">
+                  <div>• <strong>Клік по приладу:</strong> початок траси (або розподільчої коробки).</div>
+                  <div>• <strong>Клік по полотну:</strong> точка повороту під прямим кутом (90°).</div>
+                  <div>• <strong>Enter / Подвійний клік:</strong> завершення лінії.</div>
+                  <div>• <strong>Захист прорізів:</strong> штроби не перетинають дверні та віконні отвори за ПУЕ §2.1.52.</div>
+                </div>
+
+                {/* Cable Schedule button */}
+                {onOpenCableScheduleModal && (
+                  <button
+                    onClick={onOpenCableScheduleModal}
+                    className="w-full p-2.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 text-emerald-300 text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-emerald-950/30"
+                  >
+                    <Sparkles className="w-4 h-4 text-emerald-400" />
+                    <span>📋 Кабельний журнал ДСТУ</span>
+                  </button>
+                )}
+              </div>
+            ) : activeTool === 'furniture' ? (
               <div className="space-y-2">
                 {/* Furniture Category Filters */}
                 <div className="flex flex-wrap gap-1 pb-1 border-b border-neutral-800">
@@ -738,6 +927,50 @@ export const CadTools: React.FC<CadToolsProps> = ({
               })
             ) : (
               <>
+                {/* Auto socket placement action button */}
+                {activeTool === 'socket' && onOpenAutoSocketsModal && (
+                  <button
+                    onClick={onOpenAutoSocketsModal}
+                    className="w-full p-2.5 mb-2 rounded-xl bg-gradient-to-r from-amber-500/20 to-sky-500/20 hover:from-amber-500/30 hover:to-sky-500/30 border border-amber-500/50 text-amber-300 text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-amber-950/30"
+                  >
+                    <Sparkles className="w-4 h-4 text-amber-400" />
+                    <span>⚡ Авторозстановка розеток (ДБН)</span>
+                  </button>
+                )}
+
+                {/* Block stamps quick trigger button */}
+                {(activeTool === 'socket' || activeTool === 'switch') && onOpenBlockStampsModal && (
+                  <button
+                    onClick={onOpenBlockStampsModal}
+                    className="w-full p-2.5 mb-2 rounded-xl bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/50 text-purple-300 text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-purple-950/30"
+                  >
+                    <Sparkles className="w-4 h-4 text-purple-400" />
+                    <span>🔲 Штампи блоків постів (71мм)</span>
+                  </button>
+                )}
+
+                {/* Auto lighting placement action button */}
+                {activeTool === 'light' && onOpenAutoLightingModal && (
+                  <button
+                    onClick={onOpenAutoLightingModal}
+                    className="w-full p-2.5 mb-2 rounded-xl bg-gradient-to-r from-amber-500/20 to-yellow-500/20 hover:from-amber-500/30 hover:to-yellow-500/30 border border-amber-500/50 text-amber-300 text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-amber-950/30"
+                  >
+                    <Sparkles className="w-4 h-4 text-amber-400" />
+                    <span>💡 Авторозстановка світла (ДБН)</span>
+                  </button>
+                )}
+
+                {/* Panel Label Maker button */}
+                {activeTool === 'panel' && onOpenPanelLabelsModal && (
+                  <button
+                    onClick={onOpenPanelLabelsModal}
+                    className="w-full p-2.5 mb-2 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300 text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-amber-950/30"
+                  >
+                    <Sparkles className="w-4 h-4 text-amber-400" />
+                    <span>🏷️ Наліпки на пластрон щита</span>
+                  </button>
+                )}
+
                 {/* Custom Library quick trigger button */}
                 {onOpenCustomLibraryModal && (
                   <button

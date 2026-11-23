@@ -1,4 +1,4 @@
-import { Point, Wall, ElectricalElement, WireRoute, WallOpening } from '../types/cad';
+import { Point, Wall, ElectricalElement, WireRoute, WallOpening, WallDatumReference, ElementDatumInfo, CircuitGroup, Room } from '../types/cad';
 
 export const MM_PER_PX = 10; // 1 pixel in viewport = 10 millimeters in world (100px = 1 meter)
 
@@ -71,17 +71,96 @@ export function closestPointOnSegment(point: Point, start: Point, end: Point): {
 }
 
 /**
- * Finds if a point is close to any wall, and returns snap info including wall angle
+ * Robust Point-in-Polygon check (Ray-Casting Algorithm)
+ */
+export function isPointInsidePolygon(point: Point, polygon: Point[]): boolean {
+  if (!polygon || polygon.length < 3) return false;
+  let inside = false;
+  const n = polygon.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = polygon[i].x;
+    const yi = polygon[i].y;
+    const xj = polygon[j].x;
+    const yj = polygon[j].y;
+    const intersect =
+      yi > point.y !== yj > point.y &&
+      point.x < ((xj - xi) * (point.y - yi)) / (yj - yi) + xi;
+    if (intersect) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * Calculates the unit inward normal vector pointing into the room from a wall segment.
+ * If the wall is between rooms or no room contains either side, selects the side facing
+ * the reference point (e.g. cursor location), or the canonical perpendicular.
+ */
+export function getWallInwardNormal(
+  wall: Wall,
+  projPoint: Point,
+  rooms: Room[] = [],
+  referencePoint?: Point
+): Point {
+  const dx = wall.end.x - wall.start.x;
+  const dy = wall.end.y - wall.start.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-4) return { x: 0, y: -1 };
+
+  const ux = dx / len;
+  const uy = dy / len;
+
+  // Two candidate unit normals perpendicular to wall
+  const n1 = { x: -uy, y: ux };
+  const n2 = { x: uy, y: -ux };
+
+  if (rooms && rooms.length > 0) {
+    const sampleDist = 20; // ~200mm into the room
+    const p1 = { x: projPoint.x + n1.x * sampleDist, y: projPoint.y + n1.y * sampleDist };
+    const p2 = { x: projPoint.x + n2.x * sampleDist, y: projPoint.y + n2.y * sampleDist };
+
+    const inRoom1 = rooms.some((r) => isPointInsidePolygon(p1, r.points));
+    const inRoom2 = rooms.some((r) => isPointInsidePolygon(p2, r.points));
+
+    if (inRoom1 && !inRoom2) return n1;
+    if (inRoom2 && !inRoom1) return n2;
+  }
+
+  // If both or neither in rooms, fallback to cursor side if referencePoint provided
+  if (referencePoint) {
+    const vx = referencePoint.x - projPoint.x;
+    const vy = referencePoint.y - projPoint.y;
+    const dot1 = vx * n1.x + vy * n1.y;
+    return dot1 >= 0 ? n1 : n2;
+  }
+
+  return n1;
+}
+
+/**
+ * Calculates standard symbol rotation (in degrees, 0..360) so that the symbol's face
+ * (semicircle/switch toggle pointing in local -Y direction) points in the direction
+ * of the inward normal vector into the room.
+ */
+export function getRotationForInwardNormal(normal: Point, isOrthogonal: boolean = true): number {
+  const rawDeg = (Math.atan2(normal.x, -normal.y) * 180) / Math.PI;
+  const normDeg = ((rawDeg % 360) + 360) % 360;
+  return isOrthogonal ? (Math.round(normDeg / 90) * 90) % 360 : Math.round(normDeg);
+}
+
+/**
+ * Finds if a point is close to any wall, and returns snap info with inward rotation into the room
  */
 export function snapToNearestWall(
   point: Point,
   walls: Wall[],
-  thresholdPx: number = 25
-): { snappedPoint: Point; rotation: number; wallId: string } | null {
+  thresholdPx: number = 25,
+  rooms: Room[] = []
+): { snappedPoint: Point; rotation: number; wallId: string; inwardNormal: Point } | null {
   let closestWall: Wall | null = null;
   let minDistance = Infinity;
   let bestPoint = point;
-  let bestAngle = 0;
 
   for (const wall of walls) {
     const { point: projPoint, dist } = closestPointOnSegment(point, wall.start, wall.end);
@@ -89,26 +168,162 @@ export function snapToNearestWall(
       minDistance = dist;
       closestWall = wall;
       bestPoint = projPoint;
-
-      // Calculate wall angle in degrees
-      const angleRad = Math.atan2(wall.end.y - wall.start.y, wall.end.x - wall.start.x);
-      let angleDeg = (angleRad * 180) / Math.PI;
-
-      // Wall normal angle (pointing away from wall)
-      const normalAngle = angleDeg + 90;
-      bestAngle = (normalAngle + 360) % 360;
     }
   }
 
   if (closestWall) {
+    const inwardNormal = getWallInwardNormal(closestWall, bestPoint, rooms, point);
+    const isOrtho =
+      Math.abs(closestWall.end.x - closestWall.start.x) < 2 ||
+      Math.abs(closestWall.end.y - closestWall.start.y) < 2;
+    const rotation = getRotationForInwardNormal(inwardNormal, isOrtho);
+
     return {
       snappedPoint: bestPoint,
-      rotation: Math.round(bestAngle / 90) * 90, // Snap to 90 deg steps or exact
+      rotation,
       wallId: closestWall.id,
+      inwardNormal,
     };
   }
 
   return null;
+}
+
+/**
+ * Calculates real-world wall length in millimeters
+ */
+export function calculateWallLengthMm(wall: Wall): number {
+  return pxToMm(distance(wall.start, wall.end));
+}
+
+/**
+ * Calculates wall orientation angle in degrees (0..360)
+ */
+export function calculateWallAngleDeg(wall: Wall): number {
+  const dx = wall.end.x - wall.start.x;
+  const dy = wall.end.y - wall.start.y;
+  const angleRad = Math.atan2(dy, dx);
+  const angleDeg = (angleRad * 180) / Math.PI;
+  return Math.round(((angleDeg % 360) + 360) % 360 * 10) / 10;
+}
+
+/**
+ * Resizes a wall to an exact target length in millimeters.
+ * Supports anchor point:
+ * - 'start': start point stays fixed, end point moves along current angle
+ * - 'end': end point stays fixed, start point moves
+ * - 'center': wall expands/shrinks symmetrically around its midpoint
+ */
+export function setWallLengthMm(
+  wall: Wall,
+  targetLengthMm: number,
+  anchor: 'start' | 'center' | 'end' = 'start'
+): Wall {
+  const targetPx = mmToPx(Math.max(100, targetLengthMm)); // Minimum 100mm
+  const dx = wall.end.x - wall.start.x;
+  const dy = wall.end.y - wall.start.y;
+  const currentLen = Math.hypot(dx, dy);
+
+  // If wall has zero length, default to horizontal right direction
+  let ux = 1;
+  let uy = 0;
+  if (currentLen > 0.001) {
+    ux = dx / currentLen;
+    uy = dy / currentLen;
+  }
+
+  let newStart = { ...wall.start };
+  let newEnd = { ...wall.end };
+
+  if (anchor === 'start') {
+    newEnd = {
+      x: Math.round((newStart.x + ux * targetPx) * 10) / 10,
+      y: Math.round((newStart.y + uy * targetPx) * 10) / 10,
+    };
+  } else if (anchor === 'end') {
+    newStart = {
+      x: Math.round((newEnd.x - ux * targetPx) * 10) / 10,
+      y: Math.round((newEnd.y - uy * targetPx) * 10) / 10,
+    };
+  } else {
+    // center anchor
+    const midX = (wall.start.x + wall.end.x) / 2;
+    const midY = (wall.start.y + wall.end.y) / 2;
+    const halfLen = targetPx / 2;
+    newStart = {
+      x: Math.round((midX - ux * halfLen) * 10) / 10,
+      y: Math.round((midY - uy * halfLen) * 10) / 10,
+    };
+    newEnd = {
+      x: Math.round((midX + ux * halfLen) * 10) / 10,
+      y: Math.round((midY + uy * halfLen) * 10) / 10,
+    };
+  }
+
+  return {
+    ...wall,
+    start: newStart,
+    end: newEnd,
+  };
+}
+
+/**
+ * Sets wall angle in degrees while preserving its current length.
+ */
+export function setWallAngleDeg(
+  wall: Wall,
+  targetAngleDeg: number,
+  anchor: 'start' | 'center' = 'start'
+): Wall {
+  const lenPx = distance(wall.start, wall.end) || mmToPx(3000);
+  const rad = (targetAngleDeg * Math.PI) / 180;
+  const ux = Math.cos(rad);
+  const uy = Math.sin(rad);
+
+  if (anchor === 'center') {
+    const midX = (wall.start.x + wall.end.x) / 2;
+    const midY = (wall.start.y + wall.end.y) / 2;
+    const halfLen = lenPx / 2;
+    return {
+      ...wall,
+      start: {
+        x: Math.round((midX - ux * halfLen) * 10) / 10,
+        y: Math.round((midY - uy * halfLen) * 10) / 10,
+      },
+      end: {
+        x: Math.round((midX + ux * halfLen) * 10) / 10,
+        y: Math.round((midY + uy * halfLen) * 10) / 10,
+      },
+    };
+  }
+
+  return {
+    ...wall,
+    end: {
+      x: Math.round((wall.start.x + ux * lenPx) * 10) / 10,
+      y: Math.round((wall.start.y + uy * lenPx) * 10) / 10,
+    },
+  };
+}
+
+/**
+ * Snaps a wall to the nearest strict orthogonal angle (0°, 90°, 180°, 270°)
+ */
+export function alignWallOrtho(wall: Wall): Wall {
+  const currentAngle = calculateWallAngleDeg(wall);
+  const nearestAngle = Math.round(currentAngle / 90) * 90;
+  return setWallAngleDeg(wall, nearestAngle, 'start');
+}
+
+/**
+ * Reverses wall direction (swaps start and end points)
+ */
+export function reverseWall(wall: Wall): Wall {
+  return {
+    ...wall,
+    start: { ...wall.end },
+    end: { ...wall.start },
+  };
 }
 
 /**
@@ -459,52 +674,54 @@ export function doLineSegmentsIntersect(p1: Point, p2: Point, p3: Point, p4: Poi
 }
 
 /**
- * Checks if a 2D line segment (u1, v1) to (u2, v2) intersects an axis-aligned box [-hw, hw] x [-ht, ht].
+ * Checks if a 2D line segment (u1, v1) to (u2, v2) intersects an axis-aligned box [-hw, hw] x [-ht, ht]
+ * using the Liang-Barsky parametric line-clipping algorithm.
  */
-function segmentIntersectsBox2D(u1: number, v1: number, u2: number, v2: number, hw: number, ht: number): boolean {
-  // Check if either endpoint is inside the box
+export function segmentIntersectsBox2D(
+  u1: number,
+  v1: number,
+  u2: number,
+  v2: number,
+  hw: number,
+  ht: number
+): boolean {
+  // 1. Quick check: if either endpoint is inside the box
   if (Math.abs(u1) <= hw && Math.abs(v1) <= ht) return true;
   if (Math.abs(u2) <= hw && Math.abs(v2) <= ht) return true;
 
-  // If both endpoints are on the same side outside the box, no intersection
-  if ((u1 < -hw && u2 < -hw) || (u1 > hw && u2 > hw)) return false;
-  if ((v1 < -ht && v2 < -ht) || (v1 > ht && v2 > ht)) return false;
-
+  // 2. Liang-Barsky parametric line clipping
   const du = u2 - u1;
   const dv = v2 - v1;
-  if (Math.abs(du) < 1e-6 && Math.abs(dv) < 1e-6) {
-    return Math.abs(u1) <= hw && Math.abs(v1) <= ht;
-  }
 
-  // Parameter t in [0, 1] for crossing u = -hw or u = +hw
-  if (Math.abs(du) > 1e-6) {
-    const tLeft = (-hw - u1) / du;
-    if (tLeft >= 0 && tLeft <= 1) {
-      const v = v1 + tLeft * dv;
-      if (v >= -ht && v <= ht) return true;
-    }
-    const tRight = (hw - u1) / du;
-    if (tRight >= 0 && tRight <= 1) {
-      const v = v1 + tRight * du;
-      if (v >= -ht && v <= ht) return true;
-    }
-  }
+  let t0 = 0.0;
+  let t1 = 1.0;
 
-  // Parameter t in [0, 1] for crossing v = -ht or v = +ht
-  if (Math.abs(dv) > 1e-6) {
-    const tBottom = (-ht - v1) / dv;
-    if (tBottom >= 0 && tBottom <= 1) {
-      const u = u1 + tBottom * du;
-      if (u >= -hw && u <= hw) return true;
-    }
-    const tTop = (ht - v1) / dv;
-    if (tTop >= 0 && tTop <= 1) {
-      const u = u1 + tTop * du;
-      if (u >= -hw && u <= hw) return true;
+  // 4 boundaries: Left, Right, Bottom, Top
+  const p = [-du, du, -dv, dv];
+  const q = [u1 + hw, hw - u1, v1 + ht, ht - v1];
+
+  for (let i = 0; i < 4; i++) {
+    const pi = p[i];
+    const qi = q[i];
+
+    if (Math.abs(pi) < 1e-9) {
+      // Parallel to this boundary
+      if (qi < 0) return false; // Parallel and outside
+    } else {
+      const t = qi / pi;
+      if (pi < 0) {
+        // Line entering boundary
+        if (t > t1) return false;
+        if (t > t0) t0 = t;
+      } else {
+        // Line leaving boundary
+        if (t < t0) return false;
+        if (t < t1) t1 = t;
+      }
     }
   }
 
-  return false;
+  return t0 <= t1;
 }
 
 /**
@@ -619,6 +836,325 @@ export function getLongestSegmentMidpoint(points: Point[]): {
 }
 
 /**
+ * Helper to remove redundant collinear points from a polyline.
+ */
+export function simplifyOrthogonalPolyline(pts: Point[]): Point[] {
+  if (pts.length <= 2) return pts;
+  const result: Point[] = [pts[0]];
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = result[result.length - 1];
+    const curr = pts[i];
+    const next = pts[i + 1];
+
+    // Skip duplicate points
+    if (Math.hypot(curr.x - prev.x, curr.y - prev.y) < 1) continue;
+
+    // Check if curr is collinear between prev and next
+    const isCollinearH = Math.abs(prev.y - curr.y) < 1 && Math.abs(curr.y - next.y) < 1;
+    const isCollinearV = Math.abs(prev.x - curr.x) < 1 && Math.abs(curr.x - next.x) < 1;
+
+    if (!isCollinearH && !isCollinearV) {
+      result.push(curr);
+    }
+  }
+
+  const last = pts[pts.length - 1];
+  if (Math.hypot(last.x - result[result.length - 1].x, last.y - result[result.length - 1].y) > 0.5) {
+    result.push(last);
+  }
+
+  return result;
+}
+
+/**
+ * Calculates polyline length in pixels
+ */
+export function calculatePolylineLengthPx(pts: Point[]): number {
+  let len = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    len += Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+  }
+  return len;
+}
+
+/**
+ * Computes an orthogonal 90-degree rectilinear path between two points,
+ * favoring wall alignment, Manhattan corridors, and strictly avoiding door/window openings
+ * according to Ukrainian PUE §2.1.52.
+ */
+export function computeOrthogonalPath(
+  start: Point,
+  end: Point,
+  walls: Wall[] = [],
+  openings: WallOpening[] = []
+): Point[] {
+  // If no walls or openings are provided, return simple orthogonal path
+  if (!walls || walls.length === 0 || !openings || openings.length === 0) {
+    if (Math.abs(start.x - end.x) < 5 || Math.abs(start.y - end.y) < 5) {
+      return [start, end];
+    }
+    const dx = Math.abs(end.x - start.x);
+    const dy = Math.abs(end.y - start.y);
+    return dx > dy
+      ? [start, { x: end.x, y: start.y }, end]
+      : [start, { x: start.x, y: end.y }, end];
+  }
+
+  // 1. Direct straight path check (when points are horizontally or vertically aligned)
+  const isCollinear = Math.abs(start.x - end.x) < 5 || Math.abs(start.y - end.y) < 5;
+  if (isCollinear) {
+    const directPath = [start, end];
+    const directColl = checkChaseIntersectsOpening(directPath, walls, openings);
+    if (!directColl.hasCollision) {
+      return directPath;
+    }
+  }
+
+  const dx = Math.abs(end.x - start.x);
+  const dy = Math.abs(end.y - start.y);
+
+  // Strategy A: Horizontal then Vertical
+  const midA: Point = { x: end.x, y: start.y };
+  const pathA = simplifyOrthogonalPolyline([start, midA, end]);
+
+  // Strategy B: Vertical then Horizontal
+  const midB: Point = { x: start.x, y: end.y };
+  const pathB = simplifyOrthogonalPolyline([start, midB, end]);
+
+  const collA = checkChaseIntersectsOpening(pathA, walls, openings);
+  const collB = checkChaseIntersectsOpening(pathB, walls, openings);
+
+  if (!collA.hasCollision && collB.hasCollision) {
+    return pathA;
+  }
+  if (collA.hasCollision && !collB.hasCollision) {
+    return pathB;
+  }
+  if (!collA.hasCollision && !collB.hasCollision && !isCollinear) {
+    return dx > dy ? pathA : pathB;
+  }
+
+  // 2. Simple paths collide with openings (or collinear segment collides).
+  // Generate multi-candidate bypass detours around the opening(s) (ПУЕ §2.1.52).
+  const wallMap = new Map<string, Wall>();
+  walls.forEach((w) => wallMap.set(w.id, w));
+
+  const candidateDetours: Point[][] = [];
+
+  // Generate specific geometry-based bypasses for any opening that was hit
+  const hitOpenings = [collA.opening, collB.opening].filter(
+    (op): op is WallOpening => Boolean(op)
+  );
+
+  // Also include any opening close to the bounding box of start/end
+  const minX = Math.min(start.x, end.x) - 40;
+  const maxX = Math.max(start.x, end.x) + 40;
+  const minY = Math.min(start.y, end.y) - 40;
+  const maxY = Math.max(start.y, end.y) + 40;
+
+  openings.forEach((op) => {
+    if (hitOpenings.some((h) => h.id === op.id)) return;
+    const wall = wallMap.get(op.wallId);
+    if (!wall) return;
+    const cx = wall.start.x + (wall.end.x - wall.start.x) * op.positionRatio;
+    const cy = wall.start.y + (wall.end.y - wall.start.y) * op.positionRatio;
+    if (cx >= minX && cx <= maxX && cy >= minY && cy <= maxY) {
+      hitOpenings.push(op);
+    }
+  });
+
+  hitOpenings.forEach((op) => {
+    const wall = wallMap.get(op.wallId);
+    if (!wall) return;
+
+    const wdx = wall.end.x - wall.start.x;
+    const wdy = wall.end.y - wall.start.y;
+    const isWallHorizontal = Math.abs(wdx) >= Math.abs(wdy);
+    const halfWidthPx = mmToPx(op.width) / 2 + 15; // opening half width + clearance
+    const halfThickPx = mmToPx(wall.thickness || 150) / 2 + 10;
+    const cx = wall.start.x + wdx * op.positionRatio;
+    const cy = wall.start.y + wdy * op.positionRatio;
+
+    if (isWallHorizontal) {
+      // For horizontal walls, detour perpendicular in Y (above or below the opening)
+      const yOffsets = [
+        halfThickPx + 20,
+        -(halfThickPx + 20),
+        halfThickPx + 45,
+        -(halfThickPx + 45),
+        halfThickPx + 70,
+        -(halfThickPx + 70),
+      ];
+      yOffsets.forEach((yOff) => {
+        const detourY = cy + yOff;
+        if (start.x < end.x) {
+          candidateDetours.push(
+            simplifyOrthogonalPolyline([
+              start,
+              { x: cx - halfWidthPx - 15, y: start.y },
+              { x: cx - halfWidthPx - 15, y: detourY },
+              { x: cx + halfWidthPx + 15, y: detourY },
+              { x: cx + halfWidthPx + 15, y: end.y },
+              end,
+            ])
+          );
+        } else {
+          candidateDetours.push(
+            simplifyOrthogonalPolyline([
+              start,
+              { x: cx + halfWidthPx + 15, y: start.y },
+              { x: cx + halfWidthPx + 15, y: detourY },
+              { x: cx - halfWidthPx - 15, y: detourY },
+              { x: cx - halfWidthPx - 15, y: end.y },
+              end,
+            ])
+          );
+        }
+        candidateDetours.push(
+          simplifyOrthogonalPolyline([
+            start,
+            { x: start.x, y: detourY },
+            { x: end.x, y: detourY },
+            end,
+          ])
+        );
+      });
+
+      // When wire crosses the wall across the opening, step along X past jambs
+      const xOffsets = [halfWidthPx + 20, -(halfWidthPx + 20), halfWidthPx + 45, -(halfWidthPx + 45)];
+      xOffsets.forEach((xOff) => {
+        const detourX = cx + xOff;
+        candidateDetours.push(
+          simplifyOrthogonalPolyline([
+            start,
+            { x: detourX, y: start.y },
+            { x: detourX, y: end.y },
+            end,
+          ])
+        );
+      });
+    } else {
+      // For vertical walls, detour perpendicular in X (left or right of opening)
+      const xOffsets = [
+        halfThickPx + 20,
+        -(halfThickPx + 20),
+        halfThickPx + 45,
+        -(halfThickPx + 45),
+        halfThickPx + 70,
+        -(halfThickPx + 70),
+      ];
+      xOffsets.forEach((xOff) => {
+        const detourX = cx + xOff;
+        if (start.y < end.y) {
+          candidateDetours.push(
+            simplifyOrthogonalPolyline([
+              start,
+              { x: start.x, y: cy - halfWidthPx - 15 },
+              { x: detourX, y: cy - halfWidthPx - 15 },
+              { x: detourX, y: cy + halfWidthPx + 15 },
+              { x: end.x, y: cy + halfWidthPx + 15 },
+              end,
+            ])
+          );
+        } else {
+          candidateDetours.push(
+            simplifyOrthogonalPolyline([
+              start,
+              { x: start.x, y: cy + halfWidthPx + 15 },
+              { x: detourX, y: cy + halfWidthPx + 15 },
+              { x: detourX, y: cy - halfWidthPx - 15 },
+              { x: end.x, y: cy - halfWidthPx - 15 },
+              end,
+            ])
+          );
+        }
+        candidateDetours.push(
+          simplifyOrthogonalPolyline([
+            start,
+            { x: detourX, y: start.y },
+            { x: detourX, y: end.y },
+            end,
+          ])
+        );
+      });
+
+      // When wire crosses the wall across opening, step along Y past jambs
+      const yOffsets = [halfWidthPx + 20, -(halfWidthPx + 20), halfWidthPx + 45, -(halfWidthPx + 45)];
+      yOffsets.forEach((yOff) => {
+        const detourY = cy + yOff;
+        candidateDetours.push(
+          simplifyOrthogonalPolyline([
+            start,
+            { x: start.x, y: detourY },
+            { x: end.x, y: detourY },
+            end,
+          ])
+        );
+      });
+    }
+  });
+
+  // Standard progressive corridor offsets
+  const standardOffsets = [35, -35, 55, -55, 85, -85, 120, -120];
+  standardOffsets.forEach((offset) => {
+    candidateDetours.push(
+      simplifyOrthogonalPolyline([
+        start,
+        { x: start.x + offset, y: start.y },
+        { x: start.x + offset, y: end.y },
+        end,
+      ])
+    );
+    candidateDetours.push(
+      simplifyOrthogonalPolyline([
+        start,
+        { x: start.x, y: start.y + offset },
+        { x: end.x, y: start.y + offset },
+        end,
+      ])
+    );
+    candidateDetours.push(
+      simplifyOrthogonalPolyline([
+        start,
+        { x: (start.x + end.x) / 2 + offset, y: start.y },
+        { x: (start.x + end.x) / 2 + offset, y: end.y },
+        end,
+      ])
+    );
+    candidateDetours.push(
+      simplifyOrthogonalPolyline([
+        start,
+        { x: start.x, y: (start.y + end.y) / 2 + offset },
+        { x: end.x, y: (start.y + end.y) / 2 + offset },
+        end,
+      ])
+    );
+  });
+
+  // Evaluate candidate detours: find all collision-free detours and pick the shortest
+  let bestCandidate: Point[] | null = null;
+  let minLength = Infinity;
+
+  for (const cand of candidateDetours) {
+    const testColl = checkChaseIntersectsOpening(cand, walls, openings);
+    if (!testColl.hasCollision) {
+      const len = calculatePolylineLengthPx(cand);
+      if (len < minLength) {
+        minLength = len;
+        bestCandidate = cand;
+      }
+    }
+  }
+
+  if (bestCandidate) {
+    return bestCandidate;
+  }
+
+  return dx > dy ? pathA : pathB;
+}
+
+/**
  * Resolves overlapping parallel wire segments.
  * When multiple cables traverse the same wall corridor or segment, applies a perpendicular
  * lateral shift (spacing 6px) so all cables in the bundle run visibly side-by-side.
@@ -628,33 +1164,32 @@ export function computeParallelBundleOffsets(
   wires: WireRoute[],
   elements: ElectricalElement[],
   walls: Wall[] = [],
-  openings: WallOpening[] = []
+  openings: WallOpening[] = [],
+  bundleSpacingPx: number = 8
 ): Map<string, Point[]> {
   const result = new Map<string, Point[]>();
   const elMap = new Map<string, ElectricalElement>();
   elements.forEach((e) => elMap.set(e.id, e));
 
-  // 1. Get raw points for all wires
+  // 1. Get raw points for all wires (re-route any non-manual wires that collide with openings)
   const wirePoints = new Map<string, Point[]>();
   wires.forEach((wire) => {
+    const fromEl = elMap.get(wire.fromId);
+    const toEl = elMap.get(wire.toId);
+
+    let pts: Point[] | undefined = undefined;
     if (wire.points && wire.points.length >= 2) {
-      wirePoints.set(wire.id, [...wire.points]);
-    } else {
-      const fromEl = elMap.get(wire.fromId);
-      const toEl = elMap.get(wire.toId);
-      if (fromEl && toEl) {
-        const dx = Math.abs(toEl.position.x - fromEl.position.x);
-        const dy = Math.abs(toEl.position.y - fromEl.position.y);
-        let path: Point[];
-        if (dx < 5 || dy < 5) {
-          path = [fromEl.position, toEl.position];
-        } else if (dx > dy) {
-          path = [fromEl.position, { x: toEl.position.x, y: fromEl.position.y }, toEl.position];
-        } else {
-          path = [fromEl.position, { x: fromEl.position.x, y: toEl.position.y }, toEl.position];
-        }
-        wirePoints.set(wire.id, path);
+      if (wire.isManual || !checkChaseIntersectsOpening(wire.points, walls, openings).hasCollision) {
+        pts = [...wire.points];
       }
+    }
+
+    if (!pts && fromEl && toEl) {
+      pts = computeOrthogonalPath(fromEl.position, toEl.position, walls, openings);
+    }
+
+    if (pts && pts.length >= 2) {
+      wirePoints.set(wire.id, pts);
     }
   });
 
@@ -681,7 +1216,7 @@ export function computeParallelBundleOffsets(
       const dx = Math.abs(p2.x - p1.x);
       const dy = Math.abs(p2.y - p1.y);
 
-      if (dy < 4) {
+      if (dy < 6) {
         allSegments.push({
           wireId: w.id,
           segIndex: i,
@@ -692,7 +1227,7 @@ export function computeParallelBundleOffsets(
           spanMin: Math.min(p1.x, p2.x),
           spanMax: Math.max(p1.x, p2.x),
         });
-      } else if (dx < 4) {
+      } else if (dx < 6) {
         allSegments.push({
           wireId: w.id,
           segIndex: i,
@@ -716,9 +1251,9 @@ export function computeParallelBundleOffsets(
     for (const cluster of list) {
       const ref = cluster[0];
       if (
-        Math.abs(ref.coord - seg.coord) <= 6 &&
-        seg.spanMax > ref.spanMin + 15 &&
-        seg.spanMin < ref.spanMax - 15
+        Math.abs(ref.coord - seg.coord) <= 8 &&
+        seg.spanMax > ref.spanMin + 12 &&
+        seg.spanMin < ref.spanMax - 12
       ) {
         cluster.push(seg);
         found = true;
@@ -736,7 +1271,7 @@ export function computeParallelBundleOffsets(
       if (cluster.length <= 1) return;
       const count = cluster.length;
       cluster.forEach((seg, idx) => {
-        const lateralOffset = (idx - (count - 1) / 2) * 6; // 6px perpendicular spacing
+        const lateralOffset = Math.round((idx - (count - 1) / 2) * bundleSpacingPx);
         segOffsets.set(`${seg.wireId}_${seg.segIndex}`, lateralOffset);
       });
     });
@@ -758,7 +1293,7 @@ export function computeParallelBundleOffsets(
     for (let i = 0; i < pts.length - 1; i++) {
       const offset = segOffsets.get(`${w.id}_${i}`);
       if (offset && Math.abs(offset) > 0.1) {
-        const isHoriz = Math.abs(pts[i + 1].y - pts[i].y) < 4;
+        const isHoriz = Math.abs(pts[i + 1].y - pts[i].y) < 6;
         if (isHoriz) {
           if (i > 0) newPts[i].y += offset;
           if (i + 1 < pts.length - 1) newPts[i + 1].y += offset;
@@ -783,4 +1318,495 @@ export function computeParallelBundleOffsets(
 
   return result;
 }
+
+// ============================================================================
+// WALL & DOOR JAMB DATUM (CENTERLINE / FACE / JAMB REFERENCE LIKE ELECTRO-PLANNER)
+// ============================================================================
+
+export interface WallDatumAnalysis {
+  wall: Wall;
+  wallLengthMm: number;
+  wallThicknessMm: number;
+  distanceToCenterlineMm: number;
+  offsetFromCenterMm: number; // signed: + on normal side, - on opposite side
+  distanceToInnerFaceMm: number; // distance to face 1 (+halfThick)
+  distanceToOuterFaceMm: number; // distance to face 2 (-halfThick)
+  closestFace: 'face_inner' | 'face_outer' | 'centerline';
+  normalAngleDeg: number;
+  openingsOnWall: {
+    opening: WallOpening;
+    distanceFromLeftJambMm: number;
+    distanceFromRightJambMm: number;
+    closestJamb: 'left' | 'right';
+    distanceFromClosestJambMm: number;
+    isInsideOpening: boolean;
+    isPueCompliantSwitchZone: boolean; // 100-150 mm
+    isTooCloseToJamb: boolean; // < 80 mm (architrave risk)
+  }[];
+  closestOpening?: {
+    opening: WallOpening;
+    distanceFromLeftJambMm: number;
+    distanceFromRightJambMm: number;
+    closestJamb: 'left' | 'right';
+    distanceFromClosestJambMm: number;
+    isInsideOpening: boolean;
+    isPueCompliantSwitchZone: boolean;
+    isTooCloseToJamb: boolean;
+  };
+}
+
+/**
+ * Evaluates the geometric datum relationship of an electrical point relative to walls and doors.
+ * Computes exact distances to centerline, inner/outer plaster faces, and door jambs.
+ */
+export function analyzeElementWallDatum(
+  elementPos: Point,
+  walls: Wall[],
+  openings: WallOpening[] = [],
+  maxDistancePx: number = 85
+): WallDatumAnalysis | null {
+  if (walls.length === 0) return null;
+
+  let bestWall: Wall | null = null;
+  let bestDist = Infinity;
+  let bestProj: Point = elementPos;
+
+  for (const wall of walls) {
+    const { point: proj, dist } = closestPointOnSegment(elementPos, wall.start, wall.end);
+    if (dist < bestDist && dist <= maxDistancePx) {
+      bestDist = dist;
+      bestWall = wall;
+      bestProj = proj;
+    }
+  }
+
+  if (!bestWall) return null;
+
+  const dx = bestWall.end.x - bestWall.start.x;
+  const dy = bestWall.end.y - bestWall.start.y;
+  const wallLenPx = Math.hypot(dx, dy) || 1;
+  const ux = dx / wallLenPx;
+  const uy = dy / wallLenPx;
+  // Normal pointing to side 1
+  const nx = -uy;
+  const ny = ux;
+
+  // Signed normal distance from centerline
+  const deltaX = elementPos.x - bestProj.x;
+  const deltaY = elementPos.y - bestProj.y;
+  const signedDistPx = deltaX * nx + deltaY * ny;
+  const offsetFromCenterMm = Math.round(pxToMm(signedDistPx));
+  const distanceToCenterlineMm = Math.abs(offsetFromCenterMm);
+
+  const wallThicknessMm = bestWall.thickness || 150;
+  const halfThickMm = Math.round(wallThicknessMm / 2);
+
+  const distanceToInnerFaceMm = Math.round(Math.abs(offsetFromCenterMm - halfThickMm));
+  const distanceToOuterFaceMm = Math.round(Math.abs(offsetFromCenterMm - -halfThickMm));
+
+  let closestFace: 'face_inner' | 'face_outer' | 'centerline' = 'centerline';
+  if (distanceToCenterlineMm < 20) {
+    closestFace = 'centerline';
+  } else if (distanceToInnerFaceMm <= distanceToOuterFaceMm) {
+    closestFace = 'face_inner';
+  } else {
+    closestFace = 'face_outer';
+  }
+
+  const normalAngleDeg = Math.round(((Math.atan2(ny, nx) * 180) / Math.PI + 360) % 360);
+
+  // Analyze openings on this wall
+  const wallOpenings = openings.filter((o) => o.wallId === bestWall!.id);
+  const analyzedOpenings = wallOpenings.map((op) => {
+    const opCenterPx: Point = {
+      x: bestWall!.start.x + op.positionRatio * dx,
+      y: bestWall!.start.y + op.positionRatio * dy,
+    };
+    const halfWidthPx = mmToPx(op.width || (op.type === 'door' ? 900 : 1200)) / 2;
+    const leftJambPx: Point = {
+      x: opCenterPx.x - ux * halfWidthPx,
+      y: opCenterPx.y - uy * halfWidthPx,
+    };
+    const rightJambPx: Point = {
+      x: opCenterPx.x + ux * halfWidthPx,
+      y: opCenterPx.y + uy * halfWidthPx,
+    };
+
+    // Vector from left jamb to element along wall direction
+    const fromLeftPx = (bestProj.x - leftJambPx.x) * ux + (bestProj.y - leftJambPx.y) * uy;
+    // Vector from right jamb to element along wall direction
+    const fromRightPx = (bestProj.x - rightJambPx.x) * ux + (bestProj.y - rightJambPx.y) * uy;
+
+    const isInsideOpening = fromLeftPx >= -1 && fromRightPx <= 1;
+
+    const distLeftMm = Math.round(pxToMm(Math.abs(fromLeftPx)));
+    const distRightMm = Math.round(pxToMm(Math.abs(fromRightPx)));
+
+    const closestJamb: 'left' | 'right' = distLeftMm <= distRightMm ? 'left' : 'right';
+    const distClosestMm = Math.min(distLeftMm, distRightMm);
+
+    const isPueCompliantSwitchZone = distClosestMm >= 90 && distClosestMm <= 200 && !isInsideOpening;
+    const isTooCloseToJamb = distClosestMm < 80 || isInsideOpening;
+
+    return {
+      opening: op,
+      distanceFromLeftJambMm: distLeftMm,
+      distanceFromRightJambMm: distRightMm,
+      closestJamb,
+      distanceFromClosestJambMm: distClosestMm,
+      isInsideOpening,
+      isPueCompliantSwitchZone,
+      isTooCloseToJamb,
+    };
+  });
+
+  // Sort by closest distance
+  analyzedOpenings.sort((a, b) => a.distanceFromClosestJambMm - b.distanceFromClosestJambMm);
+  const closestOpening = analyzedOpenings[0];
+
+  return {
+    wall: bestWall,
+    wallLengthMm: Math.round(pxToMm(wallLenPx)),
+    wallThicknessMm,
+    distanceToCenterlineMm,
+    offsetFromCenterMm,
+    distanceToInnerFaceMm,
+    distanceToOuterFaceMm,
+    closestFace,
+    normalAngleDeg,
+    openingsOnWall: analyzedOpenings,
+    closestOpening,
+  };
+}
+
+/**
+ * Calculates the exact new coordinates and orientation for an element placed according
+ * to wall datum options (Centerline, Plaster Face, or Door Jamb offset).
+ */
+export function positionElementByWallDatum(
+  currentPos: Point,
+  wall: Wall,
+  options: {
+    reference: 'centerline' | 'face_inner' | 'face_outer' | 'door_jamb';
+    customOffsetMm?: number;
+    doorOpening?: WallOpening;
+    jambSide?: 'left' | 'right';
+    distanceFromJambMm?: number;
+    targetFace?: 'face_inner' | 'face_outer' | 'centerline';
+  }
+): { newPos: Point; newRotation: number } {
+  const dx = wall.end.x - wall.start.x;
+  const dy = wall.end.y - wall.start.y;
+  const wallLenPx = Math.hypot(dx, dy) || 1;
+  const ux = dx / wallLenPx;
+  const uy = dy / wallLenPx;
+  const nx = -uy;
+  const ny = ux;
+
+  const wallThicknessMm = wall.thickness || 150;
+  const halfThickPx = mmToPx(wallThicknessMm / 2);
+
+  let targetAlongWallPx: Point;
+  const targetFace =
+    options.targetFace ||
+    (options.reference === 'face_outer'
+      ? 'face_outer'
+      : options.reference === 'face_inner'
+      ? 'face_inner'
+      : 'centerline');
+
+  if (options.reference === 'door_jamb' && options.doorOpening) {
+    const op = options.doorOpening;
+    const opCenterPx: Point = {
+      x: wall.start.x + op.positionRatio * dx,
+      y: wall.start.y + op.positionRatio * dy,
+    };
+    const halfWidthPx = mmToPx(op.width || 900) / 2;
+    const jambSide = options.jambSide || 'right';
+    const distMm = options.distanceFromJambMm ?? 150;
+    const distPx = mmToPx(distMm);
+
+    const jambPx: Point =
+      jambSide === 'left'
+        ? { x: opCenterPx.x - ux * halfWidthPx, y: opCenterPx.y - uy * halfWidthPx }
+        : { x: opCenterPx.x + ux * halfWidthPx, y: opCenterPx.y + uy * halfWidthPx };
+
+    // Step away from door: if left jamb, go towards wall.start (-u), if right jamb go towards wall.end (+u)
+    const stepDir = jambSide === 'left' ? -1 : 1;
+    targetAlongWallPx = {
+      x: jambPx.x + ux * stepDir * distPx,
+      y: jambPx.y + uy * stepDir * distPx,
+    };
+  } else {
+    // Keep current projection along wall
+    const { point: proj } = closestPointOnSegment(currentPos, wall.start, wall.end);
+    targetAlongWallPx = proj;
+  }
+
+  // Calculate face offset
+  let normalShiftPx = 0;
+  if (targetFace === 'face_inner') {
+    normalShiftPx = halfThickPx;
+  } else if (targetFace === 'face_outer') {
+    normalShiftPx = -halfThickPx;
+  }
+
+  if (options.customOffsetMm) {
+    normalShiftPx += mmToPx(options.customOffsetMm);
+  }
+
+  const newPos: Point = {
+    x: Math.round((targetAlongWallPx.x + nx * normalShiftPx) * 10) / 10,
+    y: Math.round((targetAlongWallPx.y + ny * normalShiftPx) * 10) / 10,
+  };
+
+  // Rotation: perpendicular to wall facing room
+  let angleDeg = Math.round(((Math.atan2(ny, nx) * 180) / Math.PI + 360) % 360);
+  if (targetFace === 'face_outer') {
+    angleDeg = (angleDeg + 180) % 360;
+  }
+
+  return { newPos, newRotation: angleDeg };
+}
+
+export interface JambSnapResult {
+  snappedPoint: Point;
+  rotation: number;
+  wallId: string;
+  doorOpeningId: string;
+  distanceFromJambMm: number;
+  jambSide: 'left' | 'right';
+  guideLine: [number, number, number, number];
+  badgeLabel: string;
+  isPueCompliant: boolean;
+}
+
+/**
+ * Intelligent magnetic snap to PUE/DBN door jamb zones (100mm & 150mm from door opening edges).
+ * Triggers when dragging or placing switches / wall sockets near doors.
+ */
+export function snapElementToDoorJambPue(
+  point: Point,
+  walls: Wall[],
+  openings: WallOpening[],
+  magnetThresholdPx: number = 24,
+  rooms: Room[] = []
+): JambSnapResult | null {
+  const doors = openings.filter((o) => o.type === 'door');
+  if (doors.length === 0 || walls.length === 0) return null;
+
+  for (const door of doors) {
+    const wall = walls.find((w) => w.id === door.wallId);
+    if (!wall) continue;
+
+    const dx = wall.end.x - wall.start.x;
+    const dy = wall.end.y - wall.start.y;
+    const wallLenPx = Math.hypot(dx, dy) || 1;
+    const ux = dx / wallLenPx;
+    const uy = dy / wallLenPx;
+
+    const opCenterPx: Point = {
+      x: wall.start.x + door.positionRatio * dx,
+      y: wall.start.y + door.positionRatio * dy,
+    };
+    const halfWidthPx = mmToPx(door.width || 900) / 2;
+
+    const leftJambPx: Point = {
+      x: opCenterPx.x - ux * halfWidthPx,
+      y: opCenterPx.y - uy * halfWidthPx,
+    };
+    const rightJambPx: Point = {
+      x: opCenterPx.x + ux * halfWidthPx,
+      y: opCenterPx.y + uy * halfWidthPx,
+    };
+
+    // Candidates: 100mm and 150mm away from left jamb and right jamb
+    const candidates: { distMm: number; jambSide: 'left' | 'right'; jambPt: Point; pos: Point }[] = [];
+    [100, 150].forEach((dMm) => {
+      const dPx = mmToPx(dMm);
+      // Left jamb: step -u
+      candidates.push({
+        distMm: dMm,
+        jambSide: 'left',
+        jambPt: leftJambPx,
+        pos: { x: leftJambPx.x - ux * dPx, y: leftJambPx.y - uy * dPx },
+      });
+      // Right jamb: step +u
+      candidates.push({
+        distMm: dMm,
+        jambSide: 'right',
+        jambPt: rightJambPx,
+        pos: { x: rightJambPx.x + ux * dPx, y: rightJambPx.y + uy * dPx },
+      });
+    });
+
+    for (const cand of candidates) {
+      // Check distance from cursor to candidate point along wall
+      const d = distance(point, cand.pos);
+      if (d <= magnetThresholdPx) {
+        // Project onto inner surface of room wall
+        const inwardNormal = getWallInwardNormal(wall, cand.pos, rooms, point);
+        const halfThickPx = mmToPx((wall.thickness || 150) / 2);
+
+        const finalSnappedPoint: Point = {
+          x: Math.round((cand.pos.x + inwardNormal.x * halfThickPx) * 10) / 10,
+          y: Math.round((cand.pos.y + inwardNormal.y * halfThickPx) * 10) / 10,
+        };
+
+        const rotation = getRotationForInwardNormal(inwardNormal, true);
+
+        return {
+          snappedPoint: finalSnappedPoint,
+          rotation,
+          wallId: wall.id,
+          doorOpeningId: door.id,
+          distanceFromJambMm: cand.distMm,
+          jambSide: cand.jambSide,
+          guideLine: [cand.jambPt.x, cand.jambPt.y, finalSnappedPoint.x, finalSnappedPoint.y],
+          badgeLabel: `🚪 ${cand.distMm} мм від укосу дверей (Норматив ПУЕ/ДБН)`,
+          isPueCompliant: true,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================================
+// CIRCUIT BADGES & LEADERS (ANTI-COLLISION LAYOUT FOR ELECTRICIANS)
+// ============================================================================
+
+export interface CircuitBadgeLayout {
+  elementId: string;
+  circuitId?: string;
+  circuitNumber?: number;
+  circuitColor: string;
+  badgeText: string;
+  breakerText: string;
+  elementPos: Point;
+  badgePos: Point;
+  badgeWidth: number;
+  badgeHeight: number;
+  leaderPoints: number[]; // [startX, startY, elbowX, elbowY, endX, endY]
+  hasLeader: boolean;
+}
+
+/**
+ * Computes non-overlapping circuit badges with leader lines for electrical elements.
+ * Groups tight clusters (e.g. 2-5 sockets in one wall block) and fans out leader lines.
+ */
+export function computeCircuitBadgesLayout(
+  elements: ElectricalElement[],
+  circuits: CircuitGroup[],
+  compactMode: boolean = false
+): CircuitBadgeLayout[] {
+  const circuitMap = new Map<string, CircuitGroup>();
+  circuits.forEach((c) => circuitMap.set(c.id, c));
+
+  // Only label elements that have an assigned circuit or switch group ID
+  const targetElements = elements.filter(
+    (el) => el.circuitId || el.switchGroupId
+  );
+
+  if (targetElements.length === 0) return [];
+
+  // Group elements into spatial clusters (within 38px of each other) to prevent badge collision
+  const clusters: ElectricalElement[][] = [];
+  const visited = new Set<string>();
+
+  targetElements.forEach((el) => {
+    if (visited.has(el.id)) return;
+    const cluster: ElectricalElement[] = [el];
+    visited.add(el.id);
+
+    targetElements.forEach((other) => {
+      if (visited.has(other.id)) return;
+      if (distance(el.position, other.position) < 38) {
+        cluster.push(other);
+        visited.add(other.id);
+      }
+    });
+
+    // Sort cluster elements horizontally or vertically
+    cluster.sort((a, b) => a.position.x - b.position.x || a.position.y - b.position.y);
+    clusters.push(cluster);
+  });
+
+  const layouts: CircuitBadgeLayout[] = [];
+
+  clusters.forEach((cluster) => {
+    const isClustered = cluster.length > 1;
+
+    cluster.forEach((el, idx) => {
+      const c = el.circuitId ? circuitMap.get(el.circuitId) : undefined;
+      const circuitColor = c?.color || '#38bdf8';
+      const switchKey = el.switchGroupId ? `[${el.switchGroupId}]` : '';
+
+      let badgeText = '';
+      if (c) {
+        badgeText = `ЩР/Гр.${c.number}${switchKey ? ` ${switchKey}` : ''}`;
+      } else if (switchKey) {
+        badgeText = `Клавіша ${switchKey}`;
+      }
+
+      const breakerText = c ? `${c.breakerRatingA}A` : '';
+
+      // Estimate width based on text
+      const charCount = badgeText.length;
+      const badgeWidth = compactMode ? Math.max(48, charCount * 6.5 + 10) : Math.max(56, charCount * 7.5 + 12);
+      const badgeHeight = compactMode ? 16 : 19;
+
+      let offsetX = 18;
+      let offsetY = -24;
+
+      if (isClustered) {
+        // Fan out badges in cluster to avoid overlapping
+        const total = cluster.length;
+        const centerIndex = (total - 1) / 2;
+        const spreadOffset = (idx - centerIndex) * 32;
+        const verticalStagger = idx % 2 === 0 ? 0 : 16;
+
+        offsetX = spreadOffset;
+        offsetY = -34 - verticalStagger;
+      }
+
+      const badgeCenter: Point = {
+        x: Math.round(el.position.x + offsetX),
+        y: Math.round(el.position.y + offsetY),
+      };
+
+      // Leader line from element to badge bottom center
+      const startX = el.position.x;
+      const startY = el.position.y;
+      const endX = badgeCenter.x;
+      const endY = badgeCenter.y + badgeHeight / 2;
+
+      // Elbow point for crisp CAD drafting look
+      const elbowX = Math.round((startX + endX) / 2);
+      const elbowY = Math.round((startY + endY) / 2);
+
+      const leaderPoints = [startX, startY, elbowX, elbowY, endX, endY];
+
+      layouts.push({
+        elementId: el.id,
+        circuitId: el.circuitId,
+        circuitNumber: c?.number,
+        circuitColor,
+        badgeText,
+        breakerText,
+        elementPos: el.position,
+        badgePos: badgeCenter,
+        badgeWidth: Math.round(badgeWidth),
+        badgeHeight,
+        leaderPoints,
+        hasLeader: Math.hypot(offsetX, offsetY) > 16,
+      });
+    });
+  });
+
+  return layouts;
+}
+
+
 

@@ -10,6 +10,9 @@ interface SymbolProps {
   label?: string;
   mountingHeightMm?: number;
   showHeightTag?: boolean;
+  customSvgPath?: string;
+  customSymbolShape?: string;
+  customSymbolColor?: string;
 }
 
 export const ElectricalSymbol: React.FC<SymbolProps> = ({
@@ -21,6 +24,9 @@ export const ElectricalSymbol: React.FC<SymbolProps> = ({
   label,
   mountingHeightMm,
   showHeightTag = true,
+  customSvgPath,
+  customSymbolShape,
+  customSymbolColor,
 }) => {
   const half = size / 2;
 
@@ -588,6 +594,94 @@ export const ElectricalSymbol: React.FC<SymbolProps> = ({
             </text>
           </g>
         );
+
+      case 'cctv_camera':
+        return (
+          <g>
+            <rect
+              x={-half * 0.75}
+              y={-half * 0.4}
+              width={size * 0.65}
+              height={size * 0.4}
+              rx="2"
+              fill="rgba(6, 182, 212, 0.25)"
+              stroke="#06b6d4"
+              strokeWidth="1.8"
+            />
+            <circle cx={half * 0.15} cy="0" r={half * 0.25} fill="#06b6d4" />
+            <polygon points={`${half * 0.15},${-half * 0.3} ${half * 0.45},${-half * 0.45} ${half * 0.45},${half * 0.45} ${half * 0.15},${half * 0.3}`} fill="#0891b2" />
+            <text x={-6} y={1.5} fontSize="5.5" fill="#06b6d4" textAnchor="middle" fontWeight="bold">CAM</text>
+          </g>
+        );
+
+      case 'wifi_ap':
+        return (
+          <g>
+            <circle cx="0" cy="0" r="3" fill="#10b981" />
+            <path d={`M ${-half * 0.3} ${-half * 0.15} A ${half * 0.35} ${half * 0.35} 0 0 1 ${half * 0.3} ${-half * 0.15}`} fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round" />
+            <path d={`M ${-half * 0.55} ${-half * 0.35} A ${half * 0.65} ${half * 0.65} 0 0 1 ${half * 0.55} ${-half * 0.35}`} fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round" />
+            <path d={`M ${-half * 0.8} ${-half * 0.55} A ${half * 0.95} ${half * 0.95} 0 0 1 ${half * 0.8} ${-half * 0.55}`} fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round" />
+            <text x="0" y={half * 0.45} fontSize="6" fill="#10b981" textAnchor="middle" fontWeight="bold">WIFI</text>
+          </g>
+        );
+
+      case 'intercom':
+        return (
+          <g>
+            <rect
+              x={-half * 0.55}
+              y={-half * 0.85}
+              width={size * 0.55}
+              height={size * 0.85}
+              rx="3"
+              fill="rgba(99, 102, 241, 0.25)"
+              stroke="#6366f1"
+              strokeWidth="2"
+            />
+            <rect x={-half * 0.4} y={-half * 0.7} width={size * 0.4} height={size * 0.35} fill="#1e1b4b" stroke="#818cf8" strokeWidth="1" rx="1" />
+            <circle cx="0" cy={half * 0.2} r="2.5" fill="#6366f1" />
+          </g>
+        );
+
+      case 'custom_element': {
+        const c = customSymbolColor || color;
+        if (customSvgPath) {
+          return (
+            <path
+              d={customSvgPath}
+              fill="rgba(56, 189, 248, 0.15)"
+              stroke={c}
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          );
+        }
+        if (customSymbolShape === 'ev_charger') {
+          return (
+            <g>
+              <rect x={-half * 0.7} y={-half * 0.8} width={size * 0.7} height={size * 0.8} rx="3" fill="rgba(16, 185, 129, 0.2)" stroke={c} strokeWidth="1.8" />
+              <text x="0" y="2" fontSize="7" fill={c} textAnchor="middle" fontWeight="bold">EV</text>
+            </g>
+          );
+        }
+        if (customSymbolShape === 'rack') {
+          return (
+            <g>
+              <rect x={-half * 0.8} y={-half * 0.8} width={size * 0.8} height={size * 0.8} fill="rgba(99, 102, 241, 0.2)" stroke={c} strokeWidth="1.8" />
+              <line x1={-half * 0.6} y1={-half * 0.3} x2={half * 0.6} y2={-half * 0.3} stroke={c} strokeWidth="1" />
+              <line x1={-half * 0.6} y1={0} x2={half * 0.6} y2={0} stroke={c} strokeWidth="1" />
+              <line x1={-half * 0.6} y1={half * 0.3} x2={half * 0.6} y2={half * 0.3} stroke={c} strokeWidth="1" />
+            </g>
+          );
+        }
+        return (
+          <g>
+            <circle cx="0" cy="0" r={half * 0.65} fill="rgba(56, 189, 248, 0.2)" stroke={c} strokeWidth="1.8" />
+            <text x="0" y="3" fontSize="8" fill={c} textAnchor="middle" fontWeight="bold">★</text>
+          </g>
+        );
+      }
 
       default:
         return <circle cx="0" cy="0" r={half * 0.5} fill="currentColor" />;

@@ -14,6 +14,7 @@ interface KonvaSymbolProps {
   isBackupPriority?: boolean;
   customSymbolShape?: CustomSymbolShape;
   customSymbolColor?: string;
+  customSvgPath?: string;
 }
 
 export const KonvaElectricalSymbol: React.FC<KonvaSymbolProps> = ({
@@ -28,6 +29,7 @@ export const KonvaElectricalSymbol: React.FC<KonvaSymbolProps> = ({
   isBackupPriority = false,
   customSymbolShape,
   customSymbolColor,
+  customSvgPath,
 }) => {
   const activeColor = customSymbolColor || color;
   const half = size / 2;
@@ -811,8 +813,84 @@ export const KonvaElectricalSymbol: React.FC<KonvaSymbolProps> = ({
           </Group>
         );
 
+      // ------------------------------------------------
+      // LOW-VOLTAGE & SECURITY / СЛАБКОСТРУМОВІ МЕРЕЖІ
+      // ------------------------------------------------
+      case 'cctv_camera':
+        return (
+          <Group>
+            {/* Camera Body and Lens */}
+            <Rect
+              x={-half * 0.75}
+              y={-half * 0.4}
+              width={size * 0.65}
+              height={size * 0.4}
+              cornerRadius={2}
+              fill="rgba(6, 182, 212, 0.25)"
+              stroke="#06b6d4"
+              strokeWidth={1.8}
+            />
+            {/* Camera Lens */}
+            <Circle x={half * 0.15} y={0} radius={half * 0.25} fill="#06b6d4" />
+            <Line points={[half * 0.15, -half * 0.3, half * 0.45, -half * 0.45, half * 0.45, half * 0.45, half * 0.15, half * 0.3]} closed fill="#0891b2" />
+            <Text x={-10} y={-half * 0.3} text="CAM" fontSize={5.5} fill="#06b6d4" fontStyle="bold" />
+          </Group>
+        );
+
+      case 'wifi_ap':
+        return (
+          <Group>
+            {/* Wi-Fi Access Point Central dot & radiating arcs */}
+            <Circle radius={3} fill="#10b981" />
+            <Arc innerRadius={half * 0.3} outerRadius={half * 0.35} angle={120} rotation={-150} fill="#10b981" />
+            <Arc innerRadius={half * 0.55} outerRadius={half * 0.6} angle={120} rotation={-150} fill="#10b981" />
+            <Arc innerRadius={half * 0.8} outerRadius={half * 0.85} angle={120} rotation={-150} fill="#10b981" />
+            <Text x={-8} y={half * 0.3} text="WIFI" fontSize={6} fill="#10b981" fontStyle="bold" />
+          </Group>
+        );
+
+      case 'intercom':
+        return (
+          <Group>
+            {/* Handset/Monitor panel */}
+            <Rect
+              x={-half * 0.55}
+              y={-half * 0.85}
+              width={size * 0.55}
+              height={size * 0.85}
+              cornerRadius={3}
+              fill="rgba(99, 102, 241, 0.25)"
+              stroke="#6366f1"
+              strokeWidth={2}
+            />
+            {/* Screen */}
+            <Rect x={-half * 0.4} y={-half * 0.7} width={size * 0.4} height={size * 0.35} fill="#1e1b4b" stroke="#818cf8" strokeWidth={1} />
+            <Circle x={0} y={half * 0.2} radius={2.5} fill="#6366f1" />
+          </Group>
+        );
+
       case 'custom_element': {
         const c = activeColor || '#f59e0b';
+        // If item has a custom imported SVG path vector
+        if (customSvgPath) {
+          return (
+            <Group>
+              <Circle radius={half * 0.9} fill="rgba(56, 189, 248, 0.1)" stroke={c} strokeWidth={1} dash={[2, 2]} />
+              <Group scaleX={0.65} scaleY={0.65} x={-half * 0.65} y={-half * 0.65}>
+                <Path
+                  data={customSvgPath}
+                  fill="none"
+                  stroke={c}
+                  strokeWidth={2}
+                  lineCap="round"
+                  lineJoin="round"
+                />
+              </Group>
+              <Circle radius={2} fill={c} />
+            </Group>
+          );
+        }
+
         switch (customSymbolShape) {
           case 'ev_charger':
             return (

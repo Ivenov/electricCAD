@@ -153,6 +153,14 @@ const LAYER_DEFINITIONS: LayerDefinition[] = [
     category: 'anno',
   },
   {
+    key: 'circuitBadges',
+    cadCode: 'E-CRCT-TAG',
+    name: 'Маркування груп та щитів (Бірки)',
+    description: 'Компактні мітки груп щита (наприклад «ЩР/Гр.3 [a]») із виносними лініями для монтажників',
+    color: '#38bdf8',
+    category: 'anno',
+  },
+  {
     key: 'dimensions',
     cadCode: 'A-DIMS',
     name: 'Розміри та довжини стін',
@@ -166,6 +174,22 @@ const LAYER_DEFINITIONS: LayerDefinition[] = [
     name: 'Висотні позначки монтажу',
     description: 'Висоти установки обладнання від чистової підлоги (h=300, h=900, h=2500)',
     color: '#2dd4bf',
+    category: 'anno',
+  },
+  {
+    key: 'wifiHeatmap',
+    cadCode: 'E-COMM-WIFI',
+    name: 'Теплова карта Wi-Fi покриття',
+    description: 'Симуляція поширення радіосигналу 2.4/5 ГГц з урахуванням згасання в стінах (дБм)',
+    color: '#22c55e',
+    category: 'anno',
+  },
+  {
+    key: 'cctvFov',
+    cadCode: 'E-SEC-FOV',
+    name: 'Зони огляду CCTV та датчиків',
+    description: 'Конуси видимості камер відеоспостереження (FOV) та радіуси детекції датчиків руху',
+    color: '#06b6d4',
     category: 'anno',
   },
 ];

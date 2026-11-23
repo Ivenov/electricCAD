@@ -1,17 +1,25 @@
 import React from 'react';
-import { Download, Layers, Cpu, FileText, CheckCircle2, BatteryCharging, BookOpen, Box, FileCode, SlidersHorizontal, Sparkles } from 'lucide-react';
+import { Download, Layers, Cpu, FileText, CheckCircle2, BatteryCharging, BookOpen, Box, FileCode, SlidersHorizontal, Sparkles, Calculator, MessageSquare, Eye, Wand2 } from 'lucide-react';
 
 interface CadHeaderProps {
-  currentTab: 'canvas' | 'circuits' | 'bom' | 'audit';
-  onChangeTab: (tab: 'canvas' | 'circuits' | 'bom' | 'audit') => void;
+  currentTab: 'canvas' | 'circuits' | 'enclosure' | 'bom' | 'audit';
+  onChangeTab: (tab: 'canvas' | 'circuits' | 'enclosure' | 'bom' | 'audit') => void;
   onOpenTemplates: () => void;
   onOpenExportModal: () => void;
   onOpenBackupModal: () => void;
   onOpenDstuAlbum: () => void;
+  onOpenQuotationModal?: () => void;
+  onOpenCableSchedule?: () => void;
+  onOpenPanelLabels?: () => void;
   onOpen3DView: () => void;
   onOpenLayersModal?: () => void;
   onOpenDxfImport?: () => void;
   onOpenCustomLibrary?: () => void;
+  onOpenQuickWizard?: () => void;
+  onOpenClientPresentation?: () => void;
+  presentationMode?: boolean;
+  onTogglePresentationMode?: () => void;
+  pendingClientNotesCount?: number;
   onNewProject?: () => void;
   auditIssueCount: number;
   autosaveStatus?: 'saved' | 'saving' | 'unsaved';
@@ -25,10 +33,18 @@ export const CadHeader: React.FC<CadHeaderProps> = ({
   onOpenExportModal,
   onOpenBackupModal,
   onOpenDstuAlbum,
+  onOpenQuotationModal,
+  onOpenCableSchedule,
+  onOpenPanelLabels,
   onOpen3DView,
   onOpenLayersModal,
   onOpenDxfImport,
   onOpenCustomLibrary,
+  onOpenQuickWizard,
+  onOpenClientPresentation,
+  presentationMode = false,
+  onTogglePresentationMode,
+  pendingClientNotesCount = 0,
   onNewProject,
   auditIssueCount,
   autosaveStatus = 'saved',
@@ -115,6 +131,19 @@ export const CadHeader: React.FC<CadHeaderProps> = ({
         </button>
 
         <button
+          onClick={() => onChangeTab('enclosure')}
+          className={`flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+            currentTab === 'enclosure'
+              ? 'bg-neutral-800 text-amber-400 font-semibold shadow-sm ring-1 ring-amber-500/30'
+              : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50'
+          }`}
+          title="Візуальний конфігуратор розподільчого щита на DIN-рейку (Hager Volta, Schneider Resi9, 18мм TE)"
+        >
+          <span className="text-amber-400 font-mono text-xs">⚡</span>
+          <span>Розподільчий щит</span>
+        </button>
+
+        <button
           onClick={onOpenBackupModal}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:text-emerald-300 hover:bg-emerald-950/40 rounded-md transition-colors whitespace-nowrap shrink-0 border border-emerald-500/30 bg-emerald-950/20"
         >
@@ -129,6 +158,38 @@ export const CadHeader: React.FC<CadHeaderProps> = ({
           <BookOpen className="w-3.5 h-3.5 text-sky-400" />
           <span>Альбом ДСТУ</span>
         </button>
+
+        {onOpenQuotationModal && (
+          <button
+            onClick={onOpenQuotationModal}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-300 hover:text-amber-200 hover:bg-amber-950/40 rounded-md transition-colors whitespace-nowrap shrink-0 border border-amber-500/30 bg-amber-950/20"
+            title="Комерційна пропозиція та кошторис для клієнта"
+          >
+            <Calculator className="w-3.5 h-3.5 text-amber-400" />
+            <span>Кошторис (КП)</span>
+          </button>
+        )}
+
+        {onOpenCableSchedule && (
+          <button
+            onClick={onOpenCableSchedule}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:text-emerald-100 hover:bg-emerald-950/40 rounded-md transition-colors whitespace-nowrap shrink-0 border border-emerald-500/30 bg-emerald-950/20"
+            title="Кабельний журнал за формою ДСТУ 21.608"
+          >
+            <FileText className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Кабельний журнал</span>
+          </button>
+        )}
+
+        {onOpenPanelLabels && (
+          <button
+            onClick={onOpenPanelLabels}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-300 hover:text-amber-100 hover:bg-amber-950/40 rounded-md transition-colors whitespace-nowrap shrink-0 border border-amber-500/30 bg-amber-950/20"
+            title="Маркувальні наліпки на пластрон щита 18мм"
+          >
+            <span>🏷️ Наліпки щита</span>
+          </button>
+        )}
 
         <button
           onClick={() => onChangeTab('bom')}
@@ -159,12 +220,43 @@ export const CadHeader: React.FC<CadHeaderProps> = ({
           )}
         </button>
 
+        {onOpenQuickWizard && (
+          <button
+            onClick={onOpenQuickWizard}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-sky-300 hover:text-white bg-sky-950/60 hover:bg-sky-900/80 rounded-md transition-colors whitespace-nowrap shrink-0 border border-sky-500/50 shadow-sm shadow-sky-950/50"
+            title="Майстер швидкого старту проєкту (30 секунд - вибір типу об'єкта, ввідного щита та ДБЖ)"
+          >
+            <Wand2 className="w-3.5 h-3.5 text-sky-400 animate-pulse" />
+            <span>Майстер 30с</span>
+          </button>
+        )}
+
         <button
           onClick={onOpenTemplates}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50 rounded-md transition-colors whitespace-nowrap shrink-0"
         >
           <span>Шаблони</span>
         </button>
+
+        {onOpenClientPresentation && (
+          <button
+            onClick={onOpenClientPresentation}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 border ${
+              presentationMode
+                ? 'bg-emerald-950/50 text-emerald-300 border-emerald-500/60 shadow-sm'
+                : 'bg-amber-950/30 text-amber-300 hover:text-amber-100 border-amber-500/40 hover:bg-amber-900/50'
+            }`}
+            title="Режим узгодження з клієнтом: чистий план без штроб, висоти, зауваження та побажання"
+          >
+            <MessageSquare className="w-3.5 h-3.5 text-amber-400" />
+            <span>Правки & Клієнт</span>
+            {pendingClientNotesCount > 0 && (
+              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-amber-500 text-neutral-950 font-bold">
+                {pendingClientNotesCount}
+              </span>
+            )}
+          </button>
+        )}
 
         {onOpenCustomLibrary && (
           <button

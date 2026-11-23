@@ -1,5 +1,6 @@
 import { CadProject } from '../types/cad';
-import { pxToMm } from './cadMath';
+import { computeCircuitBadgesLayout, MM_PER_PX, pxToMm } from './cadMath';
+import { computeOrthogonalPath } from './autoRouting';
 
 /**
  * Pure TypeScript AutoCAD ASCII DXF (Release 12 / 2000) generator.
@@ -29,17 +30,20 @@ export function generateProjectDxf(project: CadProject): string {
   addCode(2, 'TABLES');
   addCode(0, 'TABLE');
   addCode(2, 'LAYER');
-  addCode(70, 7);
+  addCode(70, 12);
 
   const layers = [
     { name: '0', color: 7 }, // White/black
     { name: 'A-WALLS', color: 7 }, // Architectural walls (white)
     { name: 'A-OPENINGS', color: 4 }, // Cyan
+    { name: 'A-ROOMS', color: 8 }, // Gray room boundaries
+    { name: 'A-FURNITURE', color: 9 }, // Light gray furniture
     { name: 'E-PANELS', color: 1 }, // Red
     { name: 'E-SOCKETS', color: 5 }, // Blue
     { name: 'E-LIGHTING', color: 2 }, // Yellow
     { name: 'E-BACKUP', color: 3 }, // Green (Emergency / Backup)
     { name: 'E-WIRING', color: 6 }, // Magenta
+    { name: 'E-CIRC-TAGS', color: 4 }, // Cyan circuit leader tags
     { name: 'TITLE-BLOCK', color: 7 }, // DSTU border
   ];
 
@@ -57,6 +61,64 @@ export function generateProjectDxf(project: CadProject): string {
   // 3. ENTITIES SECTION
   addCode(0, 'SECTION');
   addCode(2, 'ENTITIES');
+
+  // Draw Rooms (Closed LWPOLYLINE on A-ROOMS)
+  (project.rooms || []).forEach((room) => {
+    if (!room.points || room.points.length < 3) return;
+    addCode(0, 'LWPOLYLINE');
+    addCode(8, 'A-ROOMS');
+    addCode(90, room.points.length);
+    addCode(70, 1); // Closed polyline
+    room.points.forEach((pt) => {
+      addCode(10, pxToMm(pt.x));
+      addCode(20, -pxToMm(pt.y));
+    });
+
+    const avgX = pxToMm(room.points.reduce((s, p) => s + p.x, 0) / room.points.length);
+    const avgY = -pxToMm(room.points.reduce((s, p) => s + p.y, 0) / room.points.length);
+    addCode(0, 'TEXT');
+    addCode(8, 'A-ROOMS');
+    addCode(10, avgX);
+    addCode(20, avgY);
+    addCode(30, 0.0);
+    addCode(40, 120.0);
+    addCode(1, `${room.name} (${room.areaM2} м2)`);
+  });
+
+  // Draw Furniture (Closed LWPOLYLINE on A-FURNITURE)
+  (project.furniture || []).forEach((furn) => {
+    const cx = pxToMm(furn.position.x);
+    const cy = -pxToMm(furn.position.y);
+    const hw = furn.width / 2;
+    const hh = furn.height / 2;
+    const rad = ((furn.rotation || 0) * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(-rad); // Inverted Y
+
+    const corners = [
+      { dx: -hw, dy: -hh },
+      { dx: hw, dy: -hh },
+      { dx: hw, dy: hh },
+      { dx: -hw, dy: hh },
+    ];
+
+    addCode(0, 'LWPOLYLINE');
+    addCode(8, 'A-FURNITURE');
+    addCode(90, 4);
+    addCode(70, 1);
+    corners.forEach((c) => {
+      addCode(10, Math.round(cx + c.dx * cos - c.dy * sin));
+      addCode(20, Math.round(cy + c.dx * sin + c.dy * cos));
+    });
+
+    addCode(0, 'TEXT');
+    addCode(8, 'A-FURNITURE');
+    addCode(10, cx - hw * 0.4);
+    addCode(20, cy);
+    addCode(30, 0.0);
+    addCode(40, 65.0);
+    addCode(1, furn.name);
+  });
 
   // Draw Walls (A-WALLS)
   project.walls.forEach((wall) => {
@@ -185,6 +247,12 @@ export function generateProjectDxf(project: CadProject): string {
     // Switch group identifier if bound (a, b, S1, S2)
     const switchTag = el.switchGroupId ? ` [${el.switchGroupId}]` : '';
 
+    // Circuit badge tag for electricians
+    const circuit = project.circuits.find((c) => c.id === el.circuitId);
+    const circuitTag = circuit
+      ? ` [ЩР/Гр.${circuit.number || 1}${el.switchGroupId ? `-${el.switchGroupId}` : ''}]`
+      : '';
+
     // Element Label Text
     addCode(0, 'TEXT');
     addCode(8, layer);
@@ -192,7 +260,7 @@ export function generateProjectDxf(project: CadProject): string {
     addCode(20, cy - 80.0);
     addCode(30, 0.0);
     addCode(40, 90.0); // 90mm text height
-    addCode(1, `${el.name}${switchTag} [h=+${el.mountingHeightMm}]`);
+    addCode(1, `${el.name}${switchTag}${circuitTag} [h=+${el.mountingHeightMm}]`);
 
     // Backup Indicator Text
     if (isBackup) {
@@ -206,61 +274,34 @@ export function generateProjectDxf(project: CadProject): string {
     }
   });
 
-  // Draw Cable Traces (E-WIRING)
+  // Draw Cable Traces (E-WIRING) using orthogonal bypass routing
   project.wires.forEach((wire) => {
     const fromEl = project.elements.find((e) => e.id === wire.fromId);
     const toEl = project.elements.find((e) => e.id === wire.toId);
     if (!fromEl || !toEl) return;
 
-    let midPointX = 0;
-    let midPointY = 0;
+    const tracePoints =
+      wire.points && wire.points.length >= 2
+        ? wire.points
+        : computeOrthogonalPath(fromEl.position, toEl.position, project.walls, project.openings);
 
-    if (wire.points && wire.points.length >= 2) {
-      for (let i = 0; i < wire.points.length - 1; i++) {
-        const p1 = wire.points[i];
-        const p2 = wire.points[i + 1];
-
-        addCode(0, 'LINE');
-        addCode(8, 'E-WIRING');
-        addCode(10, pxToMm(p1.x));
-        addCode(20, -pxToMm(p1.y));
-        addCode(30, 0.0);
-        addCode(11, pxToMm(p2.x));
-        addCode(21, -pxToMm(p2.y));
-        addCode(31, 0.0);
-      }
-      const midIdx = Math.floor(wire.points.length / 2);
-      midPointX = pxToMm(wire.points[midIdx].x);
-      midPointY = -pxToMm(wire.points[midIdx].y);
-    } else {
-      // Orthogonal Manhattan line between fromEl and toEl
-      const x1 = pxToMm(fromEl.position.x);
-      const y1 = -pxToMm(fromEl.position.y);
-      const x2 = pxToMm(toEl.position.x);
-      const y2 = -pxToMm(toEl.position.y);
-
-      // Corner bend
-      addCode(0, 'LINE');
-      addCode(8, 'E-WIRING');
-      addCode(10, x1);
-      addCode(20, y1);
-      addCode(30, 0.0);
-      addCode(11, x2);
-      addCode(21, y1);
-      addCode(31, 0.0);
+    for (let i = 0; i < tracePoints.length - 1; i++) {
+      const p1 = tracePoints[i];
+      const p2 = tracePoints[i + 1];
 
       addCode(0, 'LINE');
       addCode(8, 'E-WIRING');
-      addCode(10, x2);
-      addCode(20, y1);
+      addCode(10, pxToMm(p1.x));
+      addCode(20, -pxToMm(p1.y));
       addCode(30, 0.0);
-      addCode(11, x2);
-      addCode(21, y2);
+      addCode(11, pxToMm(p2.x));
+      addCode(21, -pxToMm(p2.y));
       addCode(31, 0.0);
-
-      midPointX = (x1 + x2) / 2;
-      midPointY = (y1 + y2) / 2;
     }
+
+    const midIdx = Math.floor(tracePoints.length / 2);
+    const midPointX = pxToMm(tracePoints[midIdx].x);
+    const midPointY = -pxToMm(tracePoints[midIdx].y);
 
     // Add cable tag annotation in CAD
     const wireTagText = `${wire.cableTag ? `[${wire.cableTag}] ` : ''}${wire.calculatedLengthM}m`;
@@ -271,6 +312,38 @@ export function generateProjectDxf(project: CadProject): string {
     addCode(30, 0.0);
     addCode(40, 70.0);
     addCode(1, wireTagText);
+  });
+
+  // Draw Circuit Leader Badges (E-CIRC-TAGS)
+  const badges = computeCircuitBadgesLayout(project.elements, project.circuits, false);
+  badges.forEach((badge) => {
+    if (badge.hasLeader && badge.leaderPoints.length >= 6) {
+      addCode(0, 'LINE');
+      addCode(8, 'E-CIRC-TAGS');
+      addCode(10, pxToMm(badge.leaderPoints[0]));
+      addCode(20, -pxToMm(badge.leaderPoints[1]));
+      addCode(30, 0.0);
+      addCode(11, pxToMm(badge.leaderPoints[2]));
+      addCode(21, -pxToMm(badge.leaderPoints[3]));
+      addCode(31, 0.0);
+
+      addCode(0, 'LINE');
+      addCode(8, 'E-CIRC-TAGS');
+      addCode(10, pxToMm(badge.leaderPoints[2]));
+      addCode(20, -pxToMm(badge.leaderPoints[3]));
+      addCode(30, 0.0);
+      addCode(11, pxToMm(badge.leaderPoints[4]));
+      addCode(21, -pxToMm(badge.leaderPoints[5]));
+      addCode(31, 0.0);
+    }
+
+    addCode(0, 'TEXT');
+    addCode(8, 'E-CIRC-TAGS');
+    addCode(10, pxToMm(badge.badgePos.x) - (badge.badgeWidth * MM_PER_PX) / 2);
+    addCode(20, -pxToMm(badge.badgePos.y));
+    addCode(30, 0.0);
+    addCode(40, 75.0);
+    addCode(1, badge.badgeText);
   });
 
   // Draw DSTU Title Block Frame (Border)
@@ -331,7 +404,10 @@ export function generateProjectDxf(project: CadProject): string {
   addCode(20, stampY - 1100);
   addCode(30, 0);
   addCode(40, 180);
-  addCode(1, `Розробив: ${project.author || 'Інженер-електрик'} | Масштаб 1:50 | ДСТУ Б А.2.4-4:2009`);
+  addCode(
+    1,
+    `Розробив: ${project.author || 'Інженер-електрик'} | ${project.groundingSystem || 'TN-C-S'} | Масштаб 1:50 | ДСТУ Б А.2.4-4:2009`
+  );
 
   addCode(0, 'ENDSEC');
   addCode(0, 'EOF');

@@ -15,6 +15,7 @@ import {
   calculateProjectElectricalSummary,
   CircuitAnalysis,
 } from '../../utils/electricalCalculations';
+import { getAggregatedProjectData } from '../../utils/projectAggregator';
 
 interface SingleLineSchematicSvgProps {
   project: CadProject;
@@ -30,6 +31,7 @@ export const SingleLineSchematicSvg: React.FC<SingleLineSchematicSvgProps> = ({
   demandFactor,
 }) => {
   const is3Ph = project.supplyPhase === '3-phase';
+  const agg = useMemo(() => getAggregatedProjectData(project), [project]);
   const summary = useMemo(
     () => calculateProjectElectricalSummary(project, demandFactor),
     [project, demandFactor]
@@ -37,9 +39,15 @@ export const SingleLineSchematicSvg: React.FC<SingleLineSchematicSvgProps> = ({
 
   const circuitAnalyses: CircuitAnalysis[] = useMemo(() => {
     return project.circuits.map((c) =>
-      analyzeCircuit(c, project.elements, project.wires, project.supplyPhase)
+      analyzeCircuit(
+        c,
+        agg.allElements,
+        agg.allWires,
+        project.supplyPhase,
+        project.groundingSystem || 'TN-C-S'
+      )
     );
-  }, [project]);
+  }, [project, agg]);
 
   const numCircuits = Math.max(1, project.circuits.length);
   // Геометрична сітка схеми
@@ -77,7 +85,7 @@ export const SingleLineSchematicSvg: React.FC<SingleLineSchematicSvgProps> = ({
           ПРИНЦИПОВА ОДНОЛІНІЙНА РОЗРАХУНКОВА СХЕМА ЩИТА ({project.title || 'ВРП-1'})
         </text>
         <text x="30" y="45" fontSize="10" fill="#475569" fontFamily="monospace">
-          Система заземлення: TN-C-S | Напруга: {is3Ph ? '3~ 400 В / 50 Гц' : '1~ 230 В / 50 Гц'} | Рвст: {summary.installedPowerKw} кВт | Ррозр: {summary.designPowerKw} кВт (Kп={summary.demandFactor})
+          Система заземлення: {project.groundingSystem || 'TN-C-S'} | Напруга: {is3Ph ? '3~ 400 В / 50 Гц' : '1~ 230 В / 50 Гц'} | Рвст: {summary.installedPowerKw} кВт | Ррозр: {summary.designPowerKw} кВт (Kп={summary.demandFactor})
         </text>
 
         {/* INPUT FEED (Ввідна лінія) */}

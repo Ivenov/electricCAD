@@ -25,7 +25,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { CadProject, CircuitGroup, DinModuleItem, DinRailRow, EnclosureConfig } from '../../types/cad';
-import { analyzeCircuit, CABLE_SPECS } from '../../utils/electricalCalculations';
+import { getAggregatedProjectData } from '../../utils/projectAggregator';
 
 interface EnclosureBuilderModalProps {
   project: CadProject;
@@ -51,20 +51,20 @@ export const ENCLOSURE_PRESETS: Array<{
     description: '3 ряди по 12 модулів (розширюється до 42 TE). Стандарт для 2-3 кімнатних квартир',
   },
   {
+    id: 'hager_volta_24',
+    brand: 'Hager',
+    model: 'Hager Volta VU24NE (24 TE)',
+    rows: 2,
+    rowCapacityTe: 12,
+    description: '2 ряди по 12 модулів (24 TE). Компактний навісний або вбудований щит для 1-2 кімнатних квартир',
+  },
+  {
     id: 'schneider_resi9_36',
     brand: 'Schneider',
     model: 'Schneider Electric Resi9 36M (36 TE)',
     rows: 2,
     rowCapacityTe: 18,
     description: '2 широких ряди по 18 модулів. Зручно для встановлення довгих 3-фазних гребінок',
-  },
-  {
-    id: 'schneider_resi9_54',
-    brand: 'Schneider',
-    model: 'Schneider Electric Resi9 54M (54 TE)',
-    rows: 3,
-    rowCapacityTe: 18,
-    description: '3 ряди по 18 модулів (54 TE). Для будинків та котеджів з резервним живленням',
   },
   {
     id: 'hager_volta_48',
@@ -75,12 +75,36 @@ export const ENCLOSURE_PRESETS: Array<{
     description: '4 ряди по 12 модулів (48 TE). Преміум серія Hager з додатковим простором для кабелів',
   },
   {
+    id: 'schneider_resi9_54',
+    brand: 'Schneider',
+    model: 'Schneider Electric Resi9 54M (54 TE)',
+    rows: 3,
+    rowCapacityTe: 18,
+    description: '3 ряди по 18 модулів (54 TE). Для будинків та котеджів з резервним живленням',
+  },
+  {
+    id: 'iek_titan_72',
+    brand: 'IEK',
+    model: 'IEK TITAN 72M / ABB Mistral 72 (72 TE)',
+    rows: 4,
+    rowCapacityTe: 18,
+    description: '4 широких ряди по 18 модулів (72 TE). Повнорозмірна шафа для великих приватних будинків та розумного дому',
+  },
+  {
     id: 'hager_golf_18',
     brand: 'Hager',
     model: 'Hager Golf VS118 (18 TE)',
     rows: 1,
     rowCapacityTe: 18,
     description: '1 ряд на 18 модулів. Для компактних 1-кімнатних квартир або щитів освітлення',
+  },
+  {
+    id: 'schneider_mini_12',
+    brand: 'Schneider',
+    model: 'Schneider Mini Pragma (12 TE)',
+    rows: 1,
+    rowCapacityTe: 12,
+    description: '1 ряд на 12 модулів. Малий локальний щиток гаража, майстерні чи котельні',
   },
 ];
 
@@ -190,7 +214,7 @@ function buildDefaultEnclosureRows(project: CadProject, rowCount: number, capaci
         rcdCurrentMa: c.rcdType === 'rcbo_10ma' ? 10 : 30,
         circuitId: c.id,
         color: c.color || '#38bdf8',
-        busbarConnection: c.phase || 'L1',
+        busbarConnection: c.phase === '3P' ? 'L1' : (c.phase || 'L1'),
       });
     } else {
       circuitModules.push({
@@ -204,7 +228,7 @@ function buildDefaultEnclosureRows(project: CadProject, rowCount: number, capaci
         curve: c.breakerCurve || 'C',
         circuitId: c.id,
         color: c.color || '#38bdf8',
-        busbarConnection: c.phase || 'L1',
+        busbarConnection: c.phase === '3P' ? 'L1' : (c.phase || 'L1'),
       });
     }
   });
@@ -277,21 +301,74 @@ export const EnclosureBuilderModal: React.FC<EnclosureBuilderModalProps> = ({
   onClose,
   embedded = false,
 }) => {
-  const [selectedPresetId, setSelectedPresetId] = useState<string>('hager_volta_36');
+  const aggregated = useMemo(() => getAggregatedProjectData(project), [project]);
+  const [selectedBoardKey, setSelectedBoardKey] = useState<string>(() => aggregated.syncedFloors[0]?.id || 'main');
+
+  const savedConfig: EnclosureConfig | undefined = project.enclosureConfigs?.[selectedBoardKey];
+
+  const [selectedPresetId, setSelectedPresetId] = useState<string>(() => {
+    if (savedConfig?.model) {
+      return ENCLOSURE_PRESETS.find((p) => p.model === savedConfig.model)?.id || 'hager_volta_36';
+    }
+    return 'hager_volta_36';
+  });
   const selectedPreset = ENCLOSURE_PRESETS.find((p) => p.id === selectedPresetId) || ENCLOSURE_PRESETS[0];
 
   const [rows, setRows] = useState<DinRailRow[]>(() =>
-    buildDefaultEnclosureRows(project, selectedPreset.rows, selectedPreset.rowCapacityTe)
+    savedConfig?.rows && savedConfig.rows.length > 0
+      ? savedConfig.rows
+      : buildDefaultEnclosureRows(project, selectedPreset.rows, selectedPreset.rowCapacityTe)
   );
 
   const [activeModuleId, setActiveModuleId] = useState<string | null>(null);
+  const [railError, setRailError] = useState<string | null>(null);
 
-  // When changing preset, recalculate rows
+  const persistEnclosure = (nextPresetId: string, nextRows: DinRailRow[]) => {
+    if (!onUpdateProject) return;
+    const preset = ENCLOSURE_PRESETS.find((p) => p.id === nextPresetId) || ENCLOSURE_PRESETS[0];
+    const totalTe = nextRows.reduce((s, r) => s + r.capacityTe, 0);
+    const nextConfig: EnclosureConfig = {
+      brand: preset.brand,
+      model: preset.model,
+      totalRows: nextRows.length,
+      rowCapacityTe: preset.rowCapacityTe,
+      totalTe,
+      mounting: savedConfig?.mounting || 'flush',
+      rows: nextRows,
+    };
+    onUpdateProject({
+      ...project,
+      enclosureConfigs: {
+        ...(project.enclosureConfigs || {}),
+        [selectedBoardKey]: nextConfig,
+      },
+    });
+  };
+
+  const handleSelectBoard = (boardKey: string) => {
+    setSelectedBoardKey(boardKey);
+    const existing = project.enclosureConfigs?.[boardKey];
+    if (existing?.rows && existing.rows.length > 0) {
+      const matchedPreset = ENCLOSURE_PRESETS.find((p) => p.model === existing.model)?.id || 'hager_volta_36';
+      setSelectedPresetId(matchedPreset);
+      setRows(existing.rows);
+    } else {
+      const preset = ENCLOSURE_PRESETS.find((p) => p.id === selectedPresetId) || ENCLOSURE_PRESETS[0];
+      setRows(buildDefaultEnclosureRows(project, preset.rows, preset.rowCapacityTe));
+    }
+    setActiveModuleId(null);
+    setRailError(null);
+  };
+
+  // When changing preset, recalculate rows & persist
   const handleSelectPreset = (presetId: string) => {
     setSelectedPresetId(presetId);
     const preset = ENCLOSURE_PRESETS.find((p) => p.id === presetId) || ENCLOSURE_PRESETS[0];
-    setRows(buildDefaultEnclosureRows(project, preset.rows, preset.rowCapacityTe));
+    const nextRows = buildDefaultEnclosureRows(project, preset.rows, preset.rowCapacityTe);
+    setRows(nextRows);
     setActiveModuleId(null);
+    setRailError(null);
+    persistEnclosure(presetId, nextRows);
   };
 
   // Enclosure metrics
@@ -302,7 +379,7 @@ export const EnclosureBuilderModal: React.FC<EnclosureBuilderModalProps> = ({
   );
   const reserveTe = totalCapacityTe - totalOccupiedTe;
   const reservePercent = totalCapacityTe > 0 ? Math.round((reserveTe / totalCapacityTe) * 100) : 0;
-  const isReserveAdequate = reservePercent >= 20; // ПУЕ та ДБН В.2.5-23:2010 рекомендують reserve >= 20%
+  const isReserveAdequate = reservePercent >= 20;
 
   // Move module Left / Right within row
   const handleMoveModuleHoriz = (rowIdx: number, modIdx: number, direction: 'left' | 'right') => {
@@ -316,6 +393,8 @@ export const EnclosureBuilderModal: React.FC<EnclosureBuilderModalProps> = ({
     newMods.splice(targetIdx, 0, moved);
     cloneRows[rowIdx] = { ...row, modules: newMods };
     setRows(cloneRows);
+    setRailError(null);
+    persistEnclosure(selectedPresetId, cloneRows);
   };
 
   // Move module to row Above / Below
@@ -330,7 +409,8 @@ export const EnclosureBuilderModal: React.FC<EnclosureBuilderModalProps> = ({
     // Check capacity
     const currentToOccupied = toRow.modules.reduce((sum, m) => sum + m.widthTe, 0);
     if (currentToOccupied + mod.widthTe > toRow.capacityTe + 4) {
-      alert(`Недостатньо місця на DIN-рейці Ряду ${targetRowIdx + 1} (${toRow.capacityTe} TE)`);
+      setRailError(`Недостатньо місця на DIN-рейці Ряду ${targetRowIdx + 1} (${toRow.capacityTe} TE)`);
+      setTimeout(() => setRailError(null), 4000);
       return;
     }
 
@@ -343,6 +423,8 @@ export const EnclosureBuilderModal: React.FC<EnclosureBuilderModalProps> = ({
     cloneRows[fromRowIdx] = { ...fromRow, modules: newFromMods };
     cloneRows[targetRowIdx] = { ...toRow, modules: newToMods };
     setRows(cloneRows);
+    setRailError(null);
+    persistEnclosure(selectedPresetId, cloneRows);
   };
 
   // Add blank spacer / modular socket
@@ -381,6 +463,7 @@ export const EnclosureBuilderModal: React.FC<EnclosureBuilderModalProps> = ({
     const cloneRows = [...rows];
     cloneRows[rowIdx] = { ...row, modules: [...row.modules, newItem] };
     setRows(cloneRows);
+    persistEnclosure(selectedPresetId, cloneRows);
   };
 
   // Delete module
@@ -392,6 +475,7 @@ export const EnclosureBuilderModal: React.FC<EnclosureBuilderModalProps> = ({
     };
     setRows(cloneRows);
     if (activeModuleId === modId) setActiveModuleId(null);
+    persistEnclosure(selectedPresetId, cloneRows);
   };
 
   // Export Enclosure BOM CSV
@@ -436,6 +520,33 @@ export const EnclosureBuilderModal: React.FC<EnclosureBuilderModalProps> = ({
 
   const content = (
     <div className="space-y-5">
+      {/* Multi-floor board selector if > 1 floor */}
+      {aggregated.syncedFloors.length > 1 && (
+        <div className="flex flex-wrap items-center gap-2 p-2.5 rounded-xl bg-neutral-950 border border-neutral-800 text-xs">
+          <span className="text-[11px] font-semibold text-neutral-400 mr-1">Щит об’єкта:</span>
+          {aggregated.syncedFloors.map((fl, idx) => (
+            <button
+              key={fl.id}
+              onClick={() => handleSelectBoard(fl.id)}
+              className={`px-2.5 py-1 rounded-lg font-medium transition-colors ${
+                selectedBoardKey === fl.id
+                  ? 'bg-sky-500 text-neutral-950 font-semibold'
+                  : 'bg-neutral-900 text-neutral-300 hover:bg-neutral-800'
+              }`}
+            >
+              {fl.distributionBoardName || (idx === 0 ? 'ВРП' : `ЩР-${idx + 1}`)} ({fl.name})
+            </button>
+          ))}
+        </div>
+      )}
+
+      {railError && (
+        <div className="p-2.5 rounded-lg bg-rose-500/15 border border-rose-500/40 text-rose-300 text-xs flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+          <span>{railError}</span>
+        </div>
+      )}
+
       {/* Top Toolbar: Enclosure Selector & Metrics */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {/* Enclosure Model Selector */}

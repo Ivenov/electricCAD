@@ -12,7 +12,9 @@ export type CadTool =
   | 'junction'
   | 'wire'
   | 'furniture'
-  | 'measure';
+  | 'measure'
+  | 'calibrate'
+  | 'client_note';
 
 export type ViewFilterMode = 
   | 'all' 
@@ -97,6 +99,10 @@ export type ElectricalElementType =
   | 'knx_actuator'
   | 'knx_power_supply'
   | 'leak_sensor'
+  // Low-voltage & Security Systems
+  | 'cctv_camera'
+  | 'wifi_ap'
+  | 'intercom'
   // Custom Library Elements
   | 'custom_element';
 
@@ -153,7 +159,27 @@ export interface ElectricalElement {
   isCustom?: boolean;
   customSymbolShape?: CustomSymbolShape;
   customSymbolColor?: string;
+  customSvgPath?: string; // Raw SVG path 'd' or path string
+  customSvgData?: string; // Full SVG source / data URL
   customLibraryId?: string;
+  datumBinding?: ElementDatumInfo;
+  // Low-voltage & Security properties
+  wifiTxPowerDbm?: number; // default e.g. 20 dBm
+  wifiFrequencyGhz?: 2.4 | 5;
+  cctvFovAngleDeg?: number; // default 90 deg (60-120)
+  cctvRangeM?: number; // default 10m
+  blockStampId?: string; // Grouped post identifier
+}
+
+export type WallDatumReference = 'centerline' | 'face_inner' | 'face_outer' | 'door_jamb';
+
+export interface ElementDatumInfo {
+  wallId: string;
+  reference: WallDatumReference;
+  offsetFromWallMm: number; // 0 for centerline, +thickness/2 or -thickness/2 for face
+  doorOpeningId?: string;
+  doorJambSide?: 'left' | 'right';
+  distanceFromJambMm?: number; // e.g. 100, 150 mm
 }
 
 export interface WireRoute {
@@ -163,7 +189,16 @@ export interface WireRoute {
   points?: Point[]; // custom path vertices if manually routed
   mode: 'ortho' | 'curve' | 'direct';
   conduit: 'ceiling' | 'floor' | 'wall_chase';
-  cableType: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6' | 'FTP_Cat5e' | 'KNX_Bus';
+  cableType:
+    | 'VVGng_3x1.5'
+    | 'VVGng_3x2.5'
+    | 'VVGng_3x4'
+    | 'VVGng_3x6'
+    | 'VVGng_5x2.5'
+    | 'VVGng_5x4'
+    | 'VVGng_5x6'
+    | 'FTP_Cat5e'
+    | 'KNX_Bus';
   busType?: 'power' | 'knx' | 'ethernet';
   circuitId?: string;
   switchGroupId?: string;
@@ -177,14 +212,30 @@ export interface CircuitGroup {
   id: string;
   number: number;
   name: string;
-  breakerRatingA: 10 | 16 | 20 | 25 | 32 | 40;
-  breakerCurve: 'B' | 'C';
+  breakerRatingA: 10 | 16 | 20 | 25 | 32 | 40 | 50 | 63;
+  breakerCurve: 'B' | 'C' | 'D';
   rcdType: 'none' | 'rcd_30ma' | 'rcd_10ma' | 'rcbo_30ma' | 'rcbo_10ma';
-  cableType: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6' | 'KNX_Bus';
-  phase: 'L1' | 'L2' | 'L3';
+  cableType:
+    | 'VVGng_3x1.5'
+    | 'VVGng_3x2.5'
+    | 'VVGng_3x4'
+    | 'VVGng_3x6'
+    | 'VVGng_5x2.5'
+    | 'VVGng_5x4'
+    | 'VVGng_5x6'
+    | 'FTP_Cat5e'
+    | 'KNX_Bus';
+  phase: 'L1' | 'L2' | 'L3' | '3P';
   color: string;
   description?: string;
   isBackupPriority?: boolean; // Marked as non-interruptible emergency line
+  // PUE derating & installation parameters
+  installationMethod?: 'flush_plaster' | 'conduit_wall' | 'conduit_insulation' | 'open_air';
+  groupingFactorKg?: number; // e.g. 1.0 (1 cable), 0.8 (2-3 cables), 0.7 (4+ cables)
+  ambientTempC?: number; // default 25°C
+  // Multi-floor distribution board assignment
+  floorId?: string;
+  boardName?: string; // e.g. "ВРП", "ЩР-1", "ЩР-2"
 }
 
 export interface BackupSystemConfig {
@@ -249,6 +300,8 @@ export interface CustomLibraryItem {
   recommendedCable?: 'VVGng_3x1.5' | 'VVGng_3x2.5' | 'VVGng_3x4' | 'VVGng_3x6' | 'FTP_Cat5e' | 'KNX_Bus';
   symbolShape?: CustomSymbolShape;
   symbolColor?: string;
+  customSvgPath?: string; // Raw SVG path 'd' command for rendering
+  customSvgData?: string; // Full SVG source code or data URL
   // Furniture properties
   furnitureType?: FurnitureItem['type'] | string;
   widthMm?: number;
@@ -275,15 +328,87 @@ export interface BackgroundBlueprint {
   locked: boolean;
 }
 
+export interface FloorLevel {
+  id: string;
+  name: string; // e.g. "Поверх 1", "Поверх 2", "Мансарда", "Підвал / Гараж"
+  levelNumber: number; // e.g. 0, 1, 2, -1
+  elevationMm: number; // e.g. 0, 3000, 6000, -2800
+  ceilingHeightMm: number; // e.g. 2700
+  distributionBoardName?: string; // e.g. "ЩР-1", "ЩР-2", "ЩР-Гараж"
+  backgroundImage?: BackgroundBlueprint;
+  rooms: Room[];
+  walls: Wall[];
+  openings: WallOpening[];
+  elements: ElectricalElement[];
+  wires: WireRoute[];
+  furniture: FurnitureItem[];
+}
+
+export interface RiserFeeder {
+  id: string;
+  fromBoard: string; // e.g. 'ВРП'
+  toBoard: string; // e.g. 'ЩР-2'
+  floorId: string;
+  cableType: 'VVGng_3x6' | 'VVGng_5x4' | 'VVGng_5x6' | 'VVGng_5x10';
+  breakerRatingA: number;
+  lengthM: number;
+}
+
+export interface ProjectSnapshot {
+  id: string;
+  createdAt: string;
+  label: string;
+  elementCount: number;
+  wireCount: number;
+  circuitCount: number;
+  data: CadProject;
+}
+
+export interface GangBlock {
+  id: string;
+  elementIds: string[];
+  wallId?: string;
+  position: Point;
+  rotation: number;
+  count: number; // 1 to 5
+  mountingHeightMm: number;
+  orientation: 'horizontal' | 'vertical';
+  frameModel?: string;
+  bbox?: { x: number; y: number; width: number; height: number };
+}
+
+export interface ClientNote {
+  id: string;
+  position: Point;
+  author: string; // e.g. "Замовник", "Дизайнер", "Монтажник"
+  text: string;
+  category?: 'socket' | 'switch' | 'light' | 'furniture' | 'general' | 'change_request';
+  status: 'pending' | 'approved' | 'rejected' | 'resolved';
+  createdAt: string;
+  replyText?: string;
+  floorId?: string;
+}
+
+export interface ScaleCalibrationData {
+  pointA: Point;
+  pointB: Point;
+  pixelDistance: number;
+  realDistanceMm: number;
+  calibratedAt: string;
+  target: 'blueprint' | 'project';
+}
+
 export interface CadProject {
   id: string;
   title: string;
   author: string;
   date: string;
   scale: number; // e.g. 1px = 10mm (0.1 scale)
+  displayUnit?: 'mm' | 'cm' | 'm'; // Display & input units
   ceilingHeightMm: number; // standard 2700mm
   gridStepMm: number; // snap grid 100mm
   supplyPhase: '1-phase' | '3-phase';
+  groundingSystem?: 'TN-C-S' | 'TN-S' | 'TT';
   mainBreakerRatingA: number;
   backupSystem?: BackupSystemConfig;
   backgroundImage?: BackgroundBlueprint;
@@ -296,6 +421,70 @@ export interface CadProject {
   furniture: FurnitureItem[];
   customLibrary?: CustomLibraryItem[];
   autoRoutingEnabled?: boolean;
+  contractorProfile?: ContractorProfile;
+  quotationConfig?: ClientQuotationConfig;
+  enclosureConfigs?: Record<string, EnclosureConfig>; // Keyed by board/floor id (e.g. 'main', 'floor_1')
+  // Smart Gang Grouping & Frames
+  gangBlocks?: GangBlock[];
+  // Client Collaboration Layer
+  clientNotes?: ClientNote[];
+  presentationMode?: boolean;
+  // Scale Calibration
+  scaleCalibration?: ScaleCalibrationData;
+  // Multi-floor extension (Багатоповерховість)
+  floors?: FloorLevel[];
+  activeFloorId?: string;
+  riserFeeders?: RiserFeeder[];
+}
+
+export interface ContractorProfile {
+  companyName: string; // e.g. "ТОВ «ЕлектроМонтаж Сервіс»" або "ФОП Петренко І.В."
+  contractorName?: string;
+  edrpou?: string; // ЄДРПОУ / ІПН
+  taxId?: string; // Аліас для ЄДРПОУ/ІПН
+  phone: string;
+  email: string;
+  iban: string;
+  bankName: string;
+  address: string;
+  logoUrl?: string; // base64 or logo URL
+  expertEngineer?: string;
+}
+
+export interface ClientQuotationConfig {
+  clientName?: string;
+  clientPhone?: string;
+  projectAddress?: string;
+  validUntilDays: number;
+  dateCreated?: string;
+  materialMarkupPercent: number; // e.g. 15%
+  clientDiscountPercent: number; // e.g. 5%
+  taxRatePercent?: number; // e.g. 5% (Єдиний податок) або 20% (ПДВ)
+  taxPercent?: number; // Аліас для податкової ставки
+  difficultyFactor?: number; // e.g. 1.0 (стандарт), 1.25 (моноліт/бетон), 0.9 (гіпсокартон)
+  difficultyMultiplier?: number; // Аліас для коефіцієнта складності
+  currency?: string;
+  warrantyMonths?: number; // e.g. 36 або 60
+  notes: string;
+}
+
+export interface QuotationLineItem {
+  id: string;
+  section: 'rough' | 'finishing' | 'panels' | 'labor' | 'rough_materials' | 'finish_materials' | 'modular_gear' | 'labor_works';
+  name: string;
+  spec?: string;
+  unit: 'м' | 'шт' | 'компл' | 'точ' | 'рейс' | 'м.п.' | 'послуга';
+  quantity?: number;
+  designQty?: number;
+  procurementQty?: number;
+  baseUnitPrice?: number;
+  unitPrice?: number;
+  totalPrice?: number;
+  unitPriceMaterial?: number;
+  unitPriceLabor?: number;
+  totalMaterial?: number;
+  totalLabor?: number;
+  totalSum?: number;
 }
 
 export interface BomItem {
@@ -332,10 +521,13 @@ export interface LayerVisibilityConfig {
   conduitFloor: boolean;     // Траси у стяжці підлоги (E-FLOR)
   wiresKnx?: boolean;        // Шина автоматизації KNX / Smart Home (E-KNX-BUS)
   annotations: boolean;      // Виноски, бірки та примітки (E-ANNO)
+  circuitBadges?: boolean;   // Маркування кіл та груп на плані (E-CIRC-TAGS)
   dimensions: boolean;       // Розміри стін (A-DIMS)
   heights: boolean;          // Висотні позначки (E-HGHT)
   furniture: boolean;        // Меблі та сантехніка (A-FURN)
   blueprint: boolean;        // Підкладка креслення БТІ (A-BLPR)
+  wifiHeatmap?: boolean;     // Теплова карта покриття Wi-Fi (E-COMM-WIFI)
+  cctvFov?: boolean;         // Зони огляду камер CCTV та датчиків (E-SEC-FOV)
 }
 
 export const DEFAULT_LAYER_VISIBILITY: LayerVisibilityConfig = {
@@ -352,10 +544,13 @@ export const DEFAULT_LAYER_VISIBILITY: LayerVisibilityConfig = {
   conduitFloor: true,
   wiresKnx: true,
   annotations: true,
+  circuitBadges: true,
   dimensions: true,
   heights: true,
   furniture: true,
   blueprint: true,
+  wifiHeatmap: false,
+  cctvFov: true,
 };
 
 /**
@@ -398,7 +593,7 @@ export interface DinRailRow {
 }
 
 export interface EnclosureConfig {
-  brand: 'Hager' | 'Schneider' | 'ABB' | 'General';
+  brand: 'Hager' | 'Schneider' | 'ABB' | 'IEK' | 'General';
   model: string; // e.g. "Hager Volta VU36NE", "Schneider Resi9 36M"
   totalRows: number;
   rowCapacityTe: number;

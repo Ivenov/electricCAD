@@ -1050,6 +1050,9 @@ export const CadCanvas: React.FC<CadCanvasProps> = ({
                   label={el.switchGroupId || el.label}
                   mountingHeightMm={el.mountingHeightMm}
                   showHeightTag={showHeights}
+                  customSvgPath={el.customSvgPath}
+                  customSymbolShape={el.customSymbolShape}
+                  customSymbolColor={el.customSymbolColor}
                 />
 
                 {/* Circuit badge (e.g. Гр.3) */}

@@ -7,6 +7,9 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { Download, Copy, Check, FileSpreadsheet, RotateCcw, Cable } from 'lucide-react';
 import { CadProject, BomItem } from '../../types/cad';
 import { getCableDisplayName, getCableCrossSection } from '../../utils/cadMath';
+import { getAggregatedProjectData } from '../../utils/projectAggregator';
+import { generateCableSchedule } from '../../utils/cableSchedule';
+import { calculateFrameQuantities } from '../../utils/gangGrouping';
 
 interface BillOfMaterialsModalProps {
   project: CadProject;
@@ -18,6 +21,7 @@ const STORAGE_KEY_PRICES = 'ELECTROPLAN_BOM_CUSTOM_PRICES';
 export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ project, onClose }) => {
   const [copied, setCopied] = useState(false);
   const [currency, setCurrency] = useState<'UAH' | 'USD' | 'EUR'>('UAH');
+  const [reservePercent, setReservePercent] = useState<number>(10);
   
   // Custom user-defined unit price overrides
   const [customPrices, setCustomPrices] = useState<Record<string, number>>(() => {
@@ -52,28 +56,28 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
     localStorage.removeItem(STORAGE_KEY_PRICES);
   };
 
-  // Calculate takeoff items dynamically from project
+  const aggregated = useMemo(() => getAggregatedProjectData(project), [project]);
+  const cableSchedule = useMemo(() => generateCableSchedule(project), [project]);
+
+  // Calculate takeoff items dynamically from ALL floors + riser feeders
   const bomItems: BomItem[] = useMemo(() => {
     const items: BomItem[] = [];
+    const reserveFactor = 1 + reservePercent / 100;
 
-    // 1. CABLES & CONDUIT (Кабельна продукція)
-    const cableLengths: Record<string, number> = {
-      'VVGng_3x1.5': 0,
-      'VVGng_3x2.5': 0,
-      'VVGng_3x4': 0,
-      'VVGng_3x6': 0,
-      'FTP_Cat5e': 0,
-    };
-
-    project.wires.forEach((w) => {
-      cableLengths[w.cableType] = (cableLengths[w.cableType] || 0) + (w.calculatedLengthM || 0);
+    // 1. CABLES & CONDUIT (Кабельна продукція за трасами всіх поверхів + стояками)
+    const rawCableLengths: Record<string, number> = {};
+    aggregated.allWires.forEach((w) => {
+      rawCableLengths[w.cableType] = (rawCableLengths[w.cableType] || 0) + (w.calculatedLengthM || 0);
+    });
+    aggregated.riserFeeders.forEach((r) => {
+      rawCableLengths[r.cableType] = (rawCableLengths[r.cableType] || 0) + (r.lengthM || 0);
     });
 
-    const lightCount = project.elements.filter((e) => e.category === 'light' || e.category === 'switch').length;
-    const socketCount = project.elements.filter((e) => e.category === 'socket').length;
+    const lightCount = aggregated.allElements.filter((e) => e.category === 'light' || e.category === 'switch').length;
+    const socketCount = aggregated.allElements.filter((e) => e.category === 'socket').length;
 
-    const projectedLightingCableM = Math.max(cableLengths['VVGng_3x1.5'], Math.round(lightCount * 4.5));
-    const projectedSocketCableM = Math.max(cableLengths['VVGng_3x2.5'], Math.round(socketCount * 5.2));
+    const designLightingM = rawCableLengths['VVGng_3x1.5'] || Math.round(lightCount * 4.5);
+    const designSocketM = rawCableLengths['VVGng_3x2.5'] || Math.round(socketCount * 5.2);
 
     const addItem = (
       category: string,
@@ -96,37 +100,39 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
       });
     };
 
-    addItem(
-      '1. Кабельна продукція',
-      'Кабель силовий ВВГнгд 3x1.5 (Освітлення)',
-      'Мідний негорючий із низьким виділенням диму (ДСТУ)',
-      'м',
-      projectedLightingCableM,
-      32
-    );
-
-    addItem(
-      '1. Кабельна продукція',
-      'Кабель силовий ВВГнгд 3x2.5 (Розетки 16А)',
-      'Мідний трижильний моноліт (ДСТУ)',
-      'м',
-      projectedSocketCableM,
-      52
-    );
-
-    if (cableLengths['VVGng_3x6'] > 0 || project.elements.some((e) => e.type === 'socket_cooker')) {
-      const cookerCableM = Math.max(cableLengths['VVGng_3x6'], 18);
+    const addCableRow = (cableKey: string, title: string, baseSpec: string, designLenM: number, pricePerM: number) => {
+      if (designLenM <= 0) return;
+      const procurementM = Math.ceil(designLenM * reserveFactor);
       addItem(
         '1. Кабельна продукція',
-        'Кабель силовий ВВГнгд 3x6 (Плита 32А)',
-        'Для індукційної варильної поверхні 7-8 кВт',
+        title,
+        `${baseSpec} (Розрах.: ${designLenM.toFixed(1)} м, запас +${reservePercent}% = ${procurementM} м)`,
         'м',
-        cookerCableM,
-        118
+        procurementM,
+        pricePerM
       );
-    }
+    };
 
-    const totalConduitM = Math.round((projectedLightingCableM + projectedSocketCableM) * 0.9);
+    addCableRow('VVGng_3x1.5', 'Кабель силовий ВВГнгд 3x1.5 (Освітлення)', 'Мідний негорючий ДСТУ', designLightingM, 32);
+    addCableRow('VVGng_3x2.5', 'Кабель силовий ВВГнгд 3x2.5 (Розетки 16А)', 'Мідний трижильний моноліт ДСТУ', designSocketM, 52);
+    addCableRow('VVGng_3x4', 'Кабель силовий ВВГнгд 3x4 (Бойлер / СПЗ)', 'Мідний посилений 3х4 мм²', rawCableLengths['VVGng_3x4'] || 0, 82);
+
+    const cookerDesignM =
+      rawCableLengths['VVGng_3x6'] ||
+      (aggregated.allElements.some((e) => e.type === 'socket_cooker' || e.type === 'hob_induction') && project.supplyPhase !== '3-phase' ? 18 : 0);
+    addCableRow('VVGng_3x6', 'Кабель силовий ВВГнгд 3x6 (Плита 32А)', 'Для варильної поверхні до 8.5 кВт', cookerDesignM, 118);
+
+    addCableRow('VVGng_5x2.5', 'Кабель силовий ВВГнгд 5x2.5 (3-фазний)', 'Для 3P споживачів 16А', rawCableLengths['VVGng_5x2.5'] || 0, 86);
+    addCableRow('VVGng_5x4', 'Кабель силовий ВВГнгд 5x4 (3-фазний / Стояк)', 'Для 3P котлів / поверхових ЩР', rawCableLengths['VVGng_5x4'] || 0, 132);
+    addCableRow('VVGng_5x6', 'Кабель силовий ВВГнгд 5x6 (Магістраль 3P)', 'Магістральний стояк / 3P ввід', rawCableLengths['VVGng_5x6'] || 0, 195);
+    addCableRow('VVGng_5x10', 'Кабель силовий ВВГнгд 5x10 (Стояк ВРП➔ЩР)', 'Посилений магістральний кабель', rawCableLengths['VVGng_5x10'] || 0, 310);
+    addCableRow('FTP_Cat5e', 'Кабель інформаційний FTP Cat5e / Cat6', 'Екранована вита пара 4x2x0.51', rawCableLengths['FTP_Cat5e'] || 0, 22);
+    addCableRow('KNX_Bus', 'Кабель шини KNX JY(St)Y 2x2x0.8', 'Шина автоматизації (зелена вита пара)', rawCableLengths['KNX_Bus'] || 0, 38);
+
+    const totalCableProcurementM = items
+      .filter((i) => i.category === '1. Кабельна продукція')
+      .reduce((s, i) => s + i.quantity, 0);
+    const totalConduitM = Math.round(totalCableProcurementM * 0.85);
     addItem(
       '1. Кабельна продукція',
       'Труба гофрована ПВХ d20 із зондом',
@@ -136,9 +142,9 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
       11
     );
 
-    // 2. SOCKETS & SWITCHES (Установочні вироби)
+    // 2. SOCKETS & SWITCHES (Установочні вироби по всіх поверхах)
     const countByType: Record<string, number> = {};
-    project.elements.forEach((el) => {
+    aggregated.allElements.forEach((el) => {
       countByType[el.type] = (countByType[el.type] || 0) + 1;
     });
 
@@ -150,6 +156,9 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
     }
     if (countByType['socket_triple']) {
       addItem('2. Розетки та вимикачі', 'Блок розеток 3x230В (фартух)', '3 механізми під єдину рамку', 'шт', countByType['socket_triple'] * 3, 140);
+    }
+    if (countByType['socket_quad']) {
+      addItem('2. Розетки та вимикачі', 'Блок розеток 4x230В', '4 механізми під єдину рамку', 'шт', countByType['socket_quad'] * 4, 140);
     }
     if (countByType['socket_ip44']) {
       addItem('2. Розетки та вимикачі', 'Розетка вологозахищена IP44 з кришкою', 'Для ванних кімнат та санвузлів', 'шт', countByType['socket_ip44'], 220);
@@ -176,34 +185,62 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
       addItem('2. Розетки та вимикачі', 'Вимикач прохідний (перемикач)', 'Для коридорів та сходів', 'шт', countByType['switch_pass'], 180);
     }
 
-    // Підрозетники
-    const totalFlushBoxes = Object.entries(countByType).reduce((sum, [type, count]) => {
-      if (type.startsWith('socket_') || type.startsWith('switch_') || type === 'thermostat') {
-        const mul = type === 'socket_double' ? 2 : type === 'socket_triple' ? 3 : type === 'socket_quad' ? 4 : 1;
-        return sum + count * mul;
-      }
-      return sum;
-    }, 0);
-
-    if (totalFlushBoxes > 0) {
-      addItem('2. Розетки та вимикачі', 'Коробка монтажна (підрозетник) d68', 'Поглиблена з можливістю набору в блоки', 'шт', totalFlushBoxes, 18);
+    // 2.2 ДЕКОРАТИВНІ РАМКИ ТА МОНТАЖНІ БЛОКИ (Smart Gang Frames за стандартом 71 мм)
+    const frameStats = calculateFrameQuantities(aggregated.allElements);
+    if (frameStats.gang1 > 0) {
+      addItem('2. Розетки, вимикачі та рамки', 'Рамка 1-постова одинарна', 'Для одиночних розеток/вимикачів (Schneider/Legrand)', 'шт', frameStats.gang1, 45);
+    }
+    if (frameStats.gang2 > 0) {
+      addItem('2. Розетки, вимикачі та рамки', 'Рамка 2-постова подвійна (блок)', 'Міжосьова відстань 71 мм під 2 механізми', 'шт', frameStats.gang2, 85);
+    }
+    if (frameStats.gang3 > 0) {
+      addItem('2. Розетки, вимикачі та рамки', 'Рамка 3-постова потрійна (блок)', 'Для фартуха кухні та ТБ-зони (71 мм)', 'шт', frameStats.gang3, 145);
+    }
+    if (frameStats.gang4 > 0) {
+      addItem('2. Розетки, вимикачі та рамки', 'Рамка 4-постова четвірна (блок)', 'Горизонтальний/вертикальний монтаж 71 мм', 'шт', frameStats.gang4, 210);
+    }
+    if (frameStats.gang5 > 0) {
+      addItem('2. Розетки, вимикачі та рамки', 'Рамка 5-постова п’ятипостова (блок)', 'Максимальний монтажний пост (71 мм)', 'шт', frameStats.gang5, 290);
     }
 
-    // 3. PANELS & AUTOMATION (Щитове обладнання)
-    addItem('3. Щитове обладнання', 'Корпус щита вбудований (ЩРН 24-36 модулів)', 'Металевий або негорючий пластик із дверцятами', 'шт', 1, 1650);
+    if (frameStats.totalFlushBoxes > 0) {
+      addItem('2. Розетки, вимикачі та рамки', 'Коробка монтажна (підрозетник) d68 набірна', 'Поглиблена з замками для блоків 71 мм (Kopos/Schneider)', 'шт', frameStats.totalFlushBoxes, 18);
+    }
+
+    // 3. PANELS & AUTOMATION (Щитове обладнання по всіх поверхах)
+    const boardsCount = Math.max(1, aggregated.syncedFloors.length);
+    addItem(
+      '3. Щитове обладнання',
+      'Корпус щита вбудований (ЩРН 24-36 модулів)',
+      boardsCount > 1 ? `ВРП + ${boardsCount - 1} поверхових ЩР (всі поверхи)` : 'Металопластиковий корпус із дверцятами',
+      'шт',
+      boardsCount,
+      1650
+    );
     addItem('3. Щитове обладнання', `Ввідний автоматичний вимикач C${project.mainBreakerRatingA || 40}A 6кА`, '2-полюсний або 3-полюсний ввідний автомат', 'шт', 1, 480);
     addItem('3. Щитове обладнання', 'Реле захисту від перепадів напруги (Zubr / Welrok)', 'Цифровий вольтметр із регулюванням відсічки', 'шт', 1, 1450);
+
+    if (aggregated.riserFeeders.length > 0) {
+      addItem(
+        '3. Щитове обладнання',
+        'Автоматичний вимикач захисту стояка (2P/3P 25-40А)',
+        'Для відхідних магістралей ВРП ➔ поверхові ЩР',
+        'шт',
+        aggregated.riserFeeders.length,
+        420
+      );
+    }
 
     const rcdCount = project.circuits.filter((c) => c.rcdType && c.rcdType !== 'none').length;
     if (rcdCount > 0) {
       addItem('3. Щитове обладнання', 'Пристрій захисного відключення (ПЗВ) 30мА / 10мА тип A', 'Захист людини від ураження струмом за ПУЕ', 'шт', rcdCount, 1250);
     }
 
-    addItem('3. Щитове обладнання', 'Автоматичні вимикачі групові 10А / 16А / 32А (Hager/Schneider)', 'Однополюсні автомати 6кА тип B/C', 'шт', project.circuits.length, 210);
+    addItem('3. Щитове обладнання', 'Автоматичні вимикачі групові 10А / 16А / 32А (Hager/Schneider)', 'Одно/триполюсні автомати 6кА тип B/C', 'шт', project.circuits.length, 210);
 
-    // 4. CUSTOM & SPECIAL ELECTRICAL EQUIPMENT (Власне та нестандартне обладнання)
-    const customElements = project.elements.filter((e) => e.isCustom || e.type === 'custom_element');
-    const customMap: Record<string, { count: number; el: typeof project.elements[0] }> = {};
+    // 4. CUSTOM & SPECIAL ELECTRICAL EQUIPMENT
+    const customElements = aggregated.allElements.filter((e) => e.isCustom || e.type === 'custom_element');
+    const customMap: Record<string, { count: number; el: typeof aggregated.allElements[0] }> = {};
     customElements.forEach((el) => {
       if (!customMap[el.name]) customMap[el.name] = { count: 0, el };
       customMap[el.name].count++;
@@ -219,10 +256,10 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
       );
     });
 
-    // 5. ARCHITECTURAL FURNITURE & SANITARY WARE (Меблі та сантехніка для прив'язки)
-    if (project.furniture && project.furniture.length > 0) {
-      const furnMap: Record<string, { count: number; item: typeof project.furniture[0] }> = {};
-      project.furniture.forEach((f) => {
+    // 5. ARCHITECTURAL FURNITURE & SANITARY WARE
+    if (aggregated.allFurniture.length > 0) {
+      const furnMap: Record<string, { count: number; item: typeof aggregated.allFurniture[0] }> = {};
+      aggregated.allFurniture.forEach((f) => {
         if (!furnMap[f.name]) furnMap[f.name] = { count: 0, item: f };
         furnMap[f.name].count++;
       });
@@ -239,7 +276,7 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
     }
 
     return items;
-  }, [project, customPrices]);
+  }, [aggregated, project.supplyPhase, project.mainBreakerRatingA, project.circuits, customPrices, reservePercent]);
 
   const grandTotal = useMemo(() => {
     return bomItems.reduce((sum, item) => sum + item.totalPrice, 0);
@@ -274,25 +311,20 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
     URL.revokeObjectURL(url);
   };
 
-  // Export Cable Schedule (Журнал кабельних трас) to CSV
+  // Export Cable Schedule (Журнал кабельних трас по всіх поверхах + стояках) to CSV
   const handleExportCableScheduleCsv = () => {
-    const headers = ['№ кабелю', 'Номер групи', 'Марка кабелю', 'Переріз (мм²)', 'Спосіб прокладання', 'Розрахункова довжина (м)', 'Від точки', 'До точки'];
-    const rows = project.wires.map((w, idx) => {
-      const fromEl = project.elements.find((e) => e.id === w.fromId);
-      const toEl = project.elements.find((e) => e.id === w.toId);
-      const circuit = project.circuits.find((c) => c.id === w.circuitId);
-      const crossSec = getCableCrossSection(w.cableType);
-      return [
-        `"${w.cableTag || `W-${idx + 1}`}"`,
-        `"${circuit ? `Гр.${circuit.number}` : '—'}"`,
-        `"${getCableDisplayName(w.cableType)}"`,
-        crossSec,
-        `"${w.conduit === 'ceiling' ? 'По стелі в гофрі' : w.conduit === 'floor' ? 'У стяжці підлоги' : 'Штроба у стіні'}"`,
-        w.calculatedLengthM,
-        `"${fromEl?.name || w.fromId}"`,
-        `"${toEl?.name || w.toId}"`,
-      ];
-    });
+    const headers = ['№ кабелю', 'Номер групи', 'Марка кабелю', 'Переріз (мм²)', 'Спосіб прокладання', 'Розрахункова довжина (м)', 'Закупівельна довжина (м)', 'Звідки', 'Куди'];
+    const rows = cableSchedule.entries.map((entry) => [
+      `"${entry.cableTag}"`,
+      `"Гр.${entry.circuitNumber}"`,
+      `"${entry.cableSpec}"`,
+      `"${entry.coresAndSize}"`,
+      `"${entry.conduitType}"`,
+      entry.totalDesignLengthM.toFixed(1),
+      entry.procurementLengthM,
+      `"${entry.sourceName}"`,
+      `"${entry.destinationName}"`,
+    ]);
 
     const csvContent = '\uFEFF' + [headers.join(';'), ...rows.map((r) => r.join(';'))].join('\r\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -337,6 +369,20 @@ export const BillOfMaterialsModal: React.FC<BillOfMaterialsModalProps> = ({ proj
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Cable Reserve Selector */}
+            <div className="flex items-center bg-neutral-950 border border-neutral-800 rounded-lg px-2 py-1 text-xs gap-1.5" title="Налаштовуваний монтажний запас кабелю">
+              <span className="text-[11px] text-neutral-400">Запас:</span>
+              <select
+                value={reservePercent}
+                onChange={(e) => setReservePercent(Number(e.target.value))}
+                className="bg-transparent text-sky-400 font-mono font-bold outline-none cursor-pointer"
+              >
+                <option value={0} className="bg-neutral-900">0%</option>
+                <option value={10} className="bg-neutral-900">+10%</option>
+                <option value={15} className="bg-neutral-900">+15%</option>
+              </select>
+            </div>
+
             {/* Currency selector */}
             <div className="flex items-center bg-neutral-950 border border-neutral-800 rounded-lg p-0.5 text-xs">
               {(['UAH', 'USD', 'EUR'] as const).map((curr) => (
